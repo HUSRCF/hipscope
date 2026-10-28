@@ -65,7 +65,15 @@
 //!   reason on stderr and in `emu_gate.reason`): any access outside a mapped buffer, LDS access beyond static +
 //!   dynamic LDS, a read of an LDS byte never written in the workgroup, a write into an input buffer or the
 //!   kernarg segment, a barrier deadlock, the instruction limit, an opcode without emulator semantics (named),
-//!   an emulator panic, or output bytes not bit-identical to the emulated incumbent. The receipt `emu_gate` has
+//!   an emulator panic, or output bytes not bit-identical to the emulated incumbent. EVERY arm runs under the
+//!   emulator's gate model (`Emulator::hw_model`, no opt-out; `peacemaker-ir` `emu/hw.rs`): loads write their
+//!   destination registers only when the matching `s_waitcnt` retires them (a read/write of a register still owed
+//!   by a load is an `[in-flight]` failure naming both instructions); every LDS access is checked for cross-wave
+//!   happens-before through retired accesses and `s_barrier` epochs (`[race]`); each workgroup runs under
+//!   round-robin, run-ahead-until-blocked for every wave and seeded-random wave orders (the first 16 workgroups of an
+//!   arm run all of them, later ones round-robin + a rotating run-ahead + one random) and its stores must be
+//!   bit-identical across them (`[schedule]`). The receipt arms carry `schedules`. The gate model does NOT predict
+//!   card safety for hardware-level events (R3Mq6Wp-02 passes it and still dropped the card). The receipt `emu_gate` has
 //!   `pass, reason, shape, seed, instructions{baseline,candidate}, workgroups{..}, output_sha256{..},
 //!   identical_to_baseline, guard_bytes, strict_lds, numerics_model, arms{..}`. The numerics are the gfx1151
 //!   model (`Emulator::gfx1100_as_gfx1151`) for both arms: it proves memory safety and arm-vs-arm identity at
@@ -1621,5 +1629,36 @@ mod emu_tests {
             assert!(rec["reason"].as_str().unwrap().contains("differs"), "{rec}");
             assert_eq!(rec["identical_to_baseline"], false);
         }
+    }
+}
+
+/// R3Mq6Wp-02-lag-w4n128 passed the pre-0.4.3 gate and then dropped the XTX during ABBA timing. Offline root-cause
+/// work (gpu/rounds/r3/fault-0952/ROOT-CAUSE.md) found no ordering, race or address mechanism: the gate model (in-flight
+/// memory, LDS happens-before, every schedule) also passes it. The one thing the strict gfx11 store-source reading sees
+/// is the stub's `buffer_load_b128 v72:75` right after the `ds_store_b128 v72:75` (value-only; stock hipcc emits the
+/// same shape, so no gate uses that reading). This test pins that fact: it must not be mistaken for a card-safety proof.
+#[cfg(test)]
+mod race_gate_tests {
+    use super::*;
+
+    const IMAGE: &[u8] = include_bytes!("hip_loop/fixtures/R3Mq6Wp-02-lag-w4n128.co");
+    const SYMBOL: &str = "gemm_mq6g256v2_residual_wmma_gfx11_mw8_lds";
+
+    fn arm(model: emu::Model) -> std::result::Result<emu::ArmRun, emu::ArmFail> {
+        let n = build_node("mq6_res", Some("emu")).unwrap();
+        let mut h = Header::parse_list("tile_m=64 tile_n=128 block=128").unwrap();
+        let geo = n.geometry_with(&mut h).unwrap();
+        let mut case = n.emu_case(1).unwrap();
+        emu::run_arm_model("cand", IMAGE, SYMBOL, &geo, &mut case, &emu::WgSel::All, model)
+    }
+
+    #[test]
+    fn r3mq6wp_02_passes_the_old_and_the_gate_model_and_only_the_strict_store_reading_names_the_stub() {
+        arm(emu::Model::Legacy).unwrap_or_else(|e| panic!("the pre-0.4.3 gate passes it: {}", e.reason));
+        let rep = arm(emu::Model::Gate).unwrap_or_else(|e| panic!("the gate model finds no defect in it: {}", e.reason));
+        let sched = rep.json["schedules"].as_array().unwrap();
+        assert!(sched.len() >= 7, "{sched:?}");
+        let e = arm(emu::Model::StrictStoreSources).err().expect("the strict reading names the stub WAR");
+        assert!(e.reason.contains("[in-flight]") && e.reason.contains("ds_store_b128"), "{}", e.reason);
     }
 }

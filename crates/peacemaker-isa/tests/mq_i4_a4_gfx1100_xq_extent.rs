@@ -121,7 +121,9 @@ fn program(swap_xq_site: bool) -> peacemaker_ir::Program {
 }
 
 fn run(program: &peacemaker_ir::Program, sorted: &[i32], h: &[u16]) -> Result<Memory, String> {
-    let emu = Emulator::new(program, "mq_i4_a4_r128_k640_gfx1100")?.gfx1100_as_gfx1151();
+    let emu = Emulator::new(program, "mq_i4_a4_r128_k640_gfx1100")?
+        .hw_model()
+        .gfx1100_as_gfx1151();
     let mut karg = Vec::new();
     for ptr in [H, SORTED, XQ, S1, S2] {
         karg.extend(ptr.to_le_bytes());

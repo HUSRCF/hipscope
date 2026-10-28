@@ -48,9 +48,13 @@
 //!    **Pre-card emulator gate** (`--emu`, with or without `--offline`; `--kernel qwen4_moe_sym` today): before any
 //!    device is opened the candidate AND the shipped incumbent object run their whole grid on the emulator at
 //!    tiny shapes (aligned and ragged `T`), each buffer an exact-size region with >= 128 KiB unmapped guard gaps,
-//!    LDS definedness tracked per workgroup. The record's `emu_gate` is `pass` only if there is no access outside a
-//!    mapped buffer, no LDS access out of bounds or read of an LDS byte the workgroup never wrote, no barrier
-//!    deadlock or instruction-limit stop, every opcode is executable (a refusal names it), the candidate output is
+//!    LDS definedness tracked per workgroup, under the emulator's gate model (`Emulator::hw_model`, no opt-out):
+//!    loads retire only at their `s_waitcnt` (`[in-flight]`), cross-wave LDS accesses need a retired access and a
+//!    barrier epoch between them (`[race]`), every workgroup runs under round-robin, run-ahead-per-wave and
+//!    seeded-random wave orders with bit-identical stores (`[schedule]`). The record's `emu_gate` is `pass` only if
+//!    there is no access outside a mapped buffer, no LDS access out of bounds or read of an LDS byte the workgroup
+//!    never wrote, no barrier deadlock or instruction-limit stop, every opcode is executable (a refusal names it),
+//!    none of those hazards, the candidate output is
 //!    bit-identical to the emulated incumbent's and both pass the CPU reference. A failed gate is stage
 //!    `emu_gate` (exit 3) and the card is never touched. gfx1100 runs use the gfx1151 WMMA/transcendental model
 //!    (`Emulator::gfx1100_as_gfx1151`; recorded in `emu_gate.numeric_model`) with narrowed weight scales.

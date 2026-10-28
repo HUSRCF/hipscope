@@ -2108,7 +2108,7 @@ impl Moe {
         )
         .map_err(|e| format!("lift: {e}"))?
         .program;
-        let emu = Emulator::new(&program, &object.launch_symbol)?;
+        let emu = Emulator::new(&program, &object.launch_symbol)?.hw_model();
 
         let mut mem = Memory::default();
         let mut table = Vec::with_capacity(geo.experts * 8);
@@ -2210,7 +2210,7 @@ impl Moe {
                 _ => None,
             });
         let emu = Emulator::new(&program, &object.launch_symbol)?
-            .strict_lds()
+            .hw_model()
             .gfx1100_as_gfx1151();
         let geo = &p.geo;
         let mut mem = Memory::default();

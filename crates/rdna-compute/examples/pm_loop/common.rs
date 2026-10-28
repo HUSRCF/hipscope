@@ -464,7 +464,7 @@ pub fn emu_run(
     )
     .map_err(|e| format!("lift: {e:?}"))?;
     // Reports the first opcode without semantics, if any.
-    let emu = Emulator::new(&lifted.program, symbol)?;
+    let emu = Emulator::new(&lifted.program, symbol)?.hw_model();
     let kernel = lifted
         .program
         .kernels

@@ -3,6 +3,15 @@
 // hipfire — see LICENSE and NOTICE in the project root.
 
 use super::{Memory, Result, State, WriteSet};
+/// One LDS byte range touched by an instruction (one entry per active lane access): the happens-before race
+/// detector's input. Atomics are read-modify-write and carry `atomic`.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct LdsTouch {
+    pub lo: usize,
+    pub len: usize,
+    pub write: bool,
+    pub atomic: bool,
+}
 use crate::{
     operand::{ImmField, Operand, VmemToken},
     Inst,
@@ -61,6 +70,7 @@ fn ds_atomic_execute(
     s: &mut State,
     lds: &mut [u8],
     mut defined: Option<&mut WriteSet>,
+    mut log: Option<&mut Vec<LdsTouch>>,
 ) -> Result<()> {
     let ops = &i.operands;
     let (addr_op, data_op) = if returns { (1, 2) } else { (0, 1) };
@@ -82,7 +92,8 @@ fn ds_atomic_execute(
         if s.exec & (1 << lane) == 0 {
             continue;
         }
-        let addr = u64::from(s.read(&ops[addr_op], lane, 0)?).wrapping_add(offset);
+        // LDS addresses are 32-bit (VGPR + 16-bit offset, carry out discarded).
+        let addr = u64::from((s.read(&ops[addr_op], lane, 0)? as u32).wrapping_add(offset as u32));
         if addr & 3 != 0 {
             return Err(format!("{name}: unaligned LDS atomic address {addr:#x}"));
         }
@@ -121,6 +132,9 @@ fn ds_atomic_execute(
         slot.copy_from_slice(&new.to_le_bytes());
         if let Some(w) = defined.as_deref_mut() {
             w.mark(slot_at, 4);
+        }
+        if let Some(l) = log.as_deref_mut() {
+            l.push(LdsTouch { lo: slot_at, len: 4, write: true, atomic: true });
         }
         if returns {
             s.put(&ops[0], lane, 0, old)?;
@@ -191,6 +205,121 @@ fn raw_srd_word3(word3: u32) -> Result<()> {
     }
     Ok(())
 }
+/// `global_atomic_add_u32 [vdst,] vaddr, vdata, saddr|off`: per active lane `tmp = MEM[addr]; MEM[addr] = tmp + DATA.u32
+/// (wrapping); RETURN_DATA = tmp` (RDNA3 ISA `GLOBAL_ATOMIC_ADD_U32`). `glc` selects the returning form, which decodes
+/// with a leading VDST. The ISA does not say how lanes of one wave that hit the same dword are ordered: the integer
+/// adds commute, so the non-returning form applies them lane by lane, but a returning form with two active lanes on one
+/// dword (each would observe a different intermediate value) is an error. Memory is written with `Memory::write` and the
+/// returned dword lands through `State::put`, like the generic loads and stores.
+fn global_atomic_add_u32(i: &Inst, s: &mut State, mem: &mut Memory) -> Result<()> {
+    let regs: Vec<&Operand> = i.operands.iter().filter(|o| !matches!(o, Operand::Imm(_))).collect();
+    let ret = match regs.len() {
+        4 => true,
+        3 => false,
+        _ => return Err("global_atomic_add_u32: unexpected operand shape".into()),
+    };
+    let (vaddr, vdata, saddr) = (regs[usize::from(ret)], regs[1 + usize::from(ret)], regs[2 + usize::from(ret)]);
+    let mut offset = 0i64;
+    for op in &i.operands {
+        if let Operand::Imm(ImmField::VmemOffset(n)) = op {
+            offset += i64::from(*n);
+        }
+    }
+    // SADDR form: a 32-bit VGPR byte offset added to the SGPR-pair base; `off`: a 64-bit VGPR address.
+    let saddr_pair = matches!(saddr, Operand::Reg(r) if r.kind == crate::reg::Kind::S && r.len == 2);
+    let mut lanes: Vec<(usize, u64)> = Vec::new();
+    for lane in 0..32 {
+        if s.exec & (1 << lane) == 0 {
+            continue;
+        }
+        let addr = if saddr_pair {
+            s.read64(saddr, 0)?.wrapping_add(u64::from(s.read(vaddr, lane, 0)?))
+        } else {
+            s.read64(vaddr, lane)?
+        }
+        .wrapping_add_signed(offset);
+        if ret && lanes.iter().any(|(_, a)| *a == addr) {
+            return Err("global_atomic_add_u32: two active lanes return from one dword: the order is not specified".into());
+        }
+        lanes.push((lane, addr));
+    }
+    for (lane, addr) in lanes {
+        let old = u32::from_le_bytes(mem.read(addr, 4)?.try_into().unwrap());
+        mem.write(addr, &old.wrapping_add(s.read(vdata, lane, 0)?).to_le_bytes())?;
+        if ret {
+            s.put(regs[0], lane, 0, old)?;
+        }
+    }
+    Ok(())
+}
+/// `scratch_{load,store}_*`: per-lane private memory (RDNA3 ISA ch. 11, "Scratch"). The lane's byte offset is
+/// `SGPR (when SADDR names one) + VGPR (when ADDR names one: SVE) + OFFSET`; every lane owns
+/// `private_segment_fixed_size` bytes (`State::scratch`) that only it reads or writes, so there is no cross-lane or
+/// cross-wave visibility to model, and the hardware's swizzling of scratch into global memory is not observable by the
+/// lane. An access outside the lane's private segment is an error. Size tokens, sign extension and `d16` merging follow
+/// the generic global/flat path.
+fn scratch_access(name: &str, i: &Inst, s: &mut State) -> Result<()> {
+    let n = width(name)?;
+    let load = name.contains("load");
+    let regs: Vec<&Operand> = i.operands.iter().filter(|o| !matches!(o, Operand::Imm(_))).collect();
+    if regs.len() != 3 {
+        return Err(format!("{name}: unexpected operand shape"));
+    }
+    let (data, vaddr, saddr) = if load { (regs[0], regs[1], regs[2]) } else { (regs[1], regs[0], regs[2]) };
+    let mut offset = 0i64;
+    for op in &i.operands {
+        if let Operand::Imm(ImmField::VmemOffset(k)) = op {
+            offset += i64::from(*k);
+        }
+    }
+    for lane in 0..32 {
+        if s.exec & (1 << lane) == 0 {
+            continue;
+        }
+        let mut addr = offset;
+        if matches!(saddr, Operand::Reg(r) if r.kind == crate::reg::Kind::S) {
+            addr += i64::from(s.read(saddr, 0, 0)?);
+        }
+        if matches!(vaddr, Operand::Reg(r) if r.kind == crate::reg::Kind::V) {
+            addr += i64::from(s.read(vaddr, lane, 0)?);
+        }
+        let size = s.scratch.get(lane).map_or(0, Vec::len);
+        let at = usize::try_from(addr)
+            .ok()
+            .filter(|a| a.checked_add(n).is_some_and(|end| end <= size))
+            .ok_or_else(|| {
+                format!("{name}: private offset {addr:#x}+{n} is outside lane {lane}'s {size}-byte private segment")
+            })?;
+        if load {
+            let mut bytes = [0u8; 16];
+            bytes[..n].copy_from_slice(&s.scratch[lane][at..at + n]);
+            if let Some(bits) = sign_bits(name) {
+                let raw = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
+                bytes[0..4].copy_from_slice(&((((raw << (32 - bits)) as i32) >> (32 - bits)) as u32).to_le_bytes());
+            }
+            for w in 0..n.div_ceil(4) {
+                let mut val = u32::from_le_bytes(bytes[w * 4..w * 4 + 4].try_into().unwrap());
+                if name.contains("d16_hi") {
+                    val = (s.read(data, lane, w)? & 0xffff) | (val << 16);
+                } else if name.contains("d16") {
+                    val = (s.read(data, lane, w)? & 0xffff_0000) | (val & 0xffff);
+                }
+                s.put(data, lane, w, val)?;
+            }
+        } else {
+            let mut bytes = [0u8; 16];
+            for w in 0..n.div_ceil(4) {
+                let mut val = s.read(data, lane, w)?;
+                if name.contains("d16_hi") {
+                    val >>= 16;
+                }
+                bytes[w * 4..w * 4 + 4].copy_from_slice(&val.to_le_bytes());
+            }
+            s.scratch[lane][at..at + n].copy_from_slice(&bytes[..n]);
+        }
+    }
+    Ok(())
+}
 pub(super) fn execute(
     name: &str,
     i: &Inst,
@@ -198,7 +327,7 @@ pub(super) fn execute(
     mem: &mut Memory,
     lds: &mut [u8],
 ) -> Result<()> {
-    execute_tracked(name, i, s, mem, lds, None)
+    execute_tracked(name, i, s, mem, lds, None, None)
 }
 /// `defined`: when present, the per-workgroup set of LDS bytes written so far; a read of any other byte is an error.
 pub(super) fn execute_tracked(
@@ -208,6 +337,7 @@ pub(super) fn execute_tracked(
     mem: &mut Memory,
     lds: &mut [u8],
     mut defined: Option<&mut WriteSet>,
+    mut log: Option<&mut Vec<LdsTouch>>,
 ) -> Result<()> {
     if i.mods.ds.gds {
         return Err("GDS not modeled".into());
@@ -290,8 +420,14 @@ pub(super) fn execute_tracked(
         }
         return Ok(());
     }
+    if name.starts_with("scratch_") {
+        return scratch_access(name, i, s);
+    }
+    if name == "global_atomic_add_u32" {
+        return global_atomic_add_u32(i, s, mem);
+    }
     if let Some((kind, returns)) = ds_atomic(name) {
-        return ds_atomic_execute(kind, returns, name, i, s, lds, defined);
+        return ds_atomic_execute(kind, returns, name, i, s, lds, defined, log);
     }
     let load = name.contains("load");
     let ds = name.starts_with("ds_");
@@ -316,7 +452,9 @@ pub(super) fn execute_tracked(
         let mut addr;
         let mut raw_bounds = None;
         if ds {
-            addr = u64::from(s.read(&ops[usize::from(load)], lane, 0)?).wrapping_add_signed(offset);
+            // LDS addresses are 32-bit (VGPR + 16-bit offset, carry out discarded): hipcc folds a negative base plus
+            // a large constant into the offset field.
+            addr = u64::from(s.read(&ops[usize::from(load)], lane, 0)?.wrapping_add(offset as u32));
         } else if buffer {
             let offen = buffer_shape(ops)?;
             let Operand::Reg(srd) = ops[2] else {
@@ -364,6 +502,14 @@ pub(super) fn execute_tracked(
         } else {
             return Err(format!("memory opcode {name} unsupported"));
         }
+        // Generic (flat) addressing: an address in the shared aperture is an LDS access at its low 32 bits, with the same
+        // bounds, defined-byte and race logging as `ds_*`; any other address is global (an unmapped one is an error).
+        let ds = if name.starts_with("flat_") && (addr >> 32) as u32 == super::SHARED_APERTURE_HI {
+            addr &= 0xffff_ffff;
+            true
+        } else {
+            ds
+        };
         let data = if load {
             &ops[0]
         } else if buffer {
@@ -376,7 +522,11 @@ pub(super) fn execute_tracked(
         let stride = if name.contains("stride64") { 64 } else { 1 };
         for part in 0..count {
             let cur = if two {
-                addr + (if part == 0 { off0 } else { off1 } * stride * n) as u64
+                if ds {
+                    u64::from((addr as u32).wrapping_add((if part == 0 { off0 } else { off1 } * stride * n) as u32))
+                } else {
+                    addr + (if part == 0 { off0 } else { off1 } * stride * n) as u64
+                }
             } else {
                 addr
             };
@@ -409,6 +559,9 @@ pub(super) fn execute_tracked(
                             return Err(format!(
                                 "LDS read of byte {b:#x} never written in this workgroup (access {cur:#x}+{n})"
                             ));
+                        }
+                        if let Some(l) = log.as_deref_mut() {
+                            l.push(LdsTouch { lo, len: size, write: false, atomic: false });
                         }
                         bytes
                     } else {
@@ -458,6 +611,9 @@ pub(super) fn execute_tracked(
                         if let Some(w) = defined.as_deref_mut() {
                             w.mark(lo, size);
                         }
+                        if let Some(l) = log.as_deref_mut() {
+                            l.push(LdsTouch { lo, len: size, write: true, atomic: false });
+                        }
                     } else {
                         mem.write(cur + offset as u64, &bytes[offset..offset + size])?;
                     }
@@ -487,6 +643,7 @@ mod tests {
             ended: false,
             barrier: None,
             signals: 0,
+            scratch: Vec::new(),
         }
     }
     fn reg(kind: Kind, base: u16, len: u8) -> Operand {

@@ -2275,7 +2275,7 @@ fn emu_progs() -> Result<EmuProgs> {
 
 fn emu_make<'a>(p: &'a peacemaker_ir::Program, symbol: &str) -> Result<peacemaker_ir::emu::Emulator<'a>> {
     Ok(peacemaker_ir::emu::Emulator::new(p, symbol)?
-        .strict_lds()
+        .hw_model()
         .gfx1100_as_gfx1151())
 }
 

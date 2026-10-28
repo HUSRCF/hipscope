@@ -809,7 +809,7 @@ impl Mq6 {
             },
         )
         .map_err(|e| format!("lift: {e:?}"))?;
-        let emu = Emulator::new(&lifted.program, &obj.launch_symbol)?;
+        let emu = Emulator::new(&lifted.program, &obj.launch_symbol)?.hw_model();
         let (m, n, k) = (132usize, 130usize, 512usize);
         let host = Host::synth(m, n, k);
         let (kva, ava, xva, yva) = (

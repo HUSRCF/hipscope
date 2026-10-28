@@ -2,13 +2,16 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! In-order wave32 interpreter. Wait counters are no-ops: loads complete before
-//! the next instruction. Workgroup barriers still rendezvous distinct waves.
+//! In-order wave32 interpreter. By default wait counters are no-ops (loads complete before the next instruction)
+//! and workgroup waves run in one fixed interleaving; `Emulator::hw_model` enables the gate model (in-flight
+//! memory, LDS race detection, schedule exploration; see `hw.rs`). Workgroup barriers rendezvous distinct waves.
 mod alu;
 pub mod convert;
 mod dot;
 #[cfg(test)]
 mod gate_ops_tests;
+mod hw;
+pub use hw::RunReport;
 mod memory;
 pub mod mma;
 #[cfg(test)]
@@ -48,6 +51,13 @@ impl WriteSet {
     pub fn first_unwritten(&self, start: usize, len: usize) -> Option<usize> {
         (start..start + len).find(|&b| !self.contains(b))
     }
+    fn set(&mut self, byte: usize, on: bool) {
+        if on {
+            self.bits[byte / 64] |= 1u64 << (byte % 64);
+        } else {
+            self.bits[byte / 64] &= !(1u64 << (byte % 64));
+        }
+    }
     fn mark(&mut self, start: usize, len: usize) {
         let mut pos = start;
         let end = start + len;
@@ -69,10 +79,26 @@ pub struct Region {
     pub base: u64,
     pub bytes: Vec<u8>,
     pub written: WriteSet,
+    /// A load of a byte of this region that no store has written is an error (an uninitialised workspace).
+    pub strict_read: bool,
 }
+/// One journaled global store (at most 16 bytes): the bytes and written-bits it replaced.
+#[derive(Clone, Debug)]
+struct JournalEntry {
+    region: usize,
+    off: usize,
+    len: usize,
+    old: [u8; 16],
+    was_written: u16,
+}
+/// The bytes one workgroup run stored, as sorted unique `(region, offset, byte)`: two schedules of the same
+/// workgroup agree iff their images are equal.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct StoreImage(pub Vec<(u32, u64, u8)>);
 #[derive(Clone, Debug, Default)]
 pub struct Memory {
     pub regions: Vec<Region>,
+    journal: Option<Vec<JournalEntry>>,
 }
 impl Memory {
     pub fn map(&mut self, name: String, base: u64, bytes: Vec<u8>) -> Result<()> {
@@ -91,6 +117,7 @@ impl Memory {
             base,
             written: WriteSet::new(bytes.len()),
             bytes,
+            strict_read: false,
         });
         Ok(())
     }
@@ -107,13 +134,88 @@ impl Memory {
     }
     pub fn read(&self, addr: u64, n: usize) -> Result<&[u8]> {
         let (i, o) = self.locate(addr, n)?;
-        Ok(&self.regions[i].bytes[o..o + n])
+        let r = &self.regions[i];
+        if r.strict_read {
+            if let Some(b) = r.written.first_unwritten(o, n) {
+                return Err(format!(
+                    "[uninit] read of byte {b:#x} (address {:#x}) of region `{}` that no store has written",
+                    r.base + b as u64,
+                    r.name
+                ));
+            }
+        }
+        Ok(&r.bytes[o..o + n])
     }
     pub fn write(&mut self, addr: u64, bytes: &[u8]) -> Result<()> {
         let (i, o) = self.locate(addr, bytes.len())?;
         let r = &mut self.regions[i];
+        if let Some(j) = self.journal.as_mut() {
+            for (c, chunk) in bytes.chunks(16).enumerate() {
+                let off = o + c * 16;
+                let mut e = JournalEntry { region: i, off, len: chunk.len(), old: [0; 16], was_written: 0 };
+                e.old[..chunk.len()].copy_from_slice(&r.bytes[off..off + chunk.len()]);
+                for k in 0..chunk.len() {
+                    e.was_written |= u16::from(r.written.contains(off + k)) << k;
+                }
+                j.push(e);
+            }
+        }
         r.bytes[o..o + bytes.len()].copy_from_slice(bytes);
         r.written.mark(o, bytes.len());
+        Ok(())
+    }
+    /// Marks `name` so a load of any byte not yet stored is an error.
+    pub fn set_strict_read(&mut self, name: &str) -> Result<()> {
+        let r = self
+            .regions
+            .iter_mut()
+            .find(|r| r.name == name)
+            .ok_or_else(|| format!("no region `{name}`"))?;
+        r.strict_read = true;
+        Ok(())
+    }
+    /// Starts recording every store so the run can be undone (`journal_undo`) and compared (`journal_image`).
+    fn journal_start(&mut self) {
+        self.journal = Some(Vec::new());
+    }
+    fn journal_stop(&mut self) {
+        self.journal = None;
+    }
+    /// Final bytes of every location stored since `journal_start`/the last undo.
+    fn journal_image(&self) -> StoreImage {
+        let mut at: Vec<(u32, u64)> = self
+            .journal
+            .iter()
+            .flatten()
+            .flat_map(|e| (0..e.len).map(move |k| (e.region as u32, (e.off + k) as u64)))
+            .collect();
+        at.sort_unstable();
+        at.dedup();
+        StoreImage(
+            at.into_iter()
+                .map(|(r, o)| (r, o, self.regions[r as usize].bytes[o as usize]))
+                .collect(),
+        )
+    }
+    /// Restores the bytes and written-bits every journaled store replaced (newest first) and clears the journal.
+    fn journal_undo(&mut self) {
+        let Some(j) = self.journal.as_mut() else { return };
+        let entries = std::mem::take(j);
+        for e in entries.iter().rev() {
+            let r = &mut self.regions[e.region];
+            r.bytes[e.off..e.off + e.len].copy_from_slice(&e.old[..e.len]);
+            for k in 0..e.len {
+                r.written.set(e.off + k, e.was_written >> k & 1 != 0);
+            }
+        }
+    }
+    /// Writes an image (schedule 0's result) back through the normal store path.
+    fn apply_image(&mut self, image: &StoreImage) -> Result<()> {
+        for &(r, o, b) in &image.0 {
+            let region = &mut self.regions[r as usize];
+            region.bytes[o as usize] = b;
+            region.written.mark(o as usize, 1);
+        }
         Ok(())
     }
     /// Maps `bytes` as its own region placed above every existing region with at least `guard` unmapped bytes before it
@@ -149,6 +251,12 @@ pub struct Launch {
     pub block: [u32; 3],
     pub dynamic_lds: u32,
 }
+/// High dword of the generic (flat) address of the LDS ("shared") aperture, the value of `src_shared_base`'s upper half,
+/// and of the private aperture (`src_private_base`). The hardware's aperture bases are programmed by the driver; the
+/// emulator fixes distinct small values that cannot collide with a mapped global region (every captured buffer lives
+/// below 4 GiB, i.e. high dword 0). A flat access whose address has this high dword goes to LDS at the low 32 bits.
+pub(super) const SHARED_APERTURE_HI: u32 = 2;
+pub(super) const PRIVATE_APERTURE_HI: u32 = 3;
 struct State {
     s: [u32; 106],
     t: [u32; 16],
@@ -161,17 +269,20 @@ struct State {
     ended: bool,
     barrier: Option<u64>,
     signals: u64,
+    /// Per-lane private (scratch) memory, `private_segment_fixed_size` bytes per work-item; empty when the kernel
+    /// allocates none. Lane-private and wave-private by construction: never shared, never journaled.
+    scratch: Vec<Vec<u8>>,
 }
 impl State {
     fn new(arch: Arch, kernel: &Kernel, launch: &Launch, wave: usize) -> Result<Self> {
         if kernel.wave != Wave::Wave32 {
             return Err("emulator requires wave32".into());
         }
-        let Abi::Hsa { descriptor: d, .. } = &kernel.abi else {
+        let Abi::Hsa { descriptor: d, metadata } = &kernel.abi else {
             return Err("descriptor-driven HSA ABI required".into());
         };
-        if d.private_segment_fixed_size != 0 {
-            return Err("private scratch allocation unsupported".into());
+        if metadata.parsed.uses_dynamic_stack {
+            return Err("dynamic stack (private segment beyond the fixed size) unsupported".into());
         }
         let mode = d.compute_pgm_rsrc1.0;
         if (mode >> 12) & 255 != 0xf0 || mode & (1 << 26) != 0 {
@@ -192,6 +303,7 @@ impl State {
             ended: false,
             barrier: None,
             signals: 0,
+            scratch: vec![vec![0; d.private_segment_fixed_size as usize]; 32],
         };
         let props = d.kernel_code_properties.0;
         let mut sg = 0;
@@ -322,6 +434,8 @@ impl State {
             Operand::Reg(_) => {
                 return Err(format!("64-bit operand needs a register pair, got {op}"))
             }
+            Operand::Special(Special::SrcSharedBase) => u64::from(SHARED_APERTURE_HI) << 32,
+            Operand::Special(Special::SrcPrivateBase) => u64::from(PRIVATE_APERTURE_HI) << 32,
             Operand::Special(Special::Vcc | Special::Exec | Special::Null) => {
                 u64::from(self.read(op, lane, 0)?)
             }
@@ -414,6 +528,11 @@ pub struct Emulator<'a> {
     arch: Arch,
     steps: Vec<Step<'a>>,
     strict_lds: bool,
+    /// The program's own target: instruction tables are looked up with this even when numerics run as gfx1151.
+    decode_arch: Arch,
+    hw: Option<Vec<hw::StepHw>>,
+    /// Workgroups run so far (the gate model's schedule budget).
+    runs: std::sync::atomic::AtomicU64,
 }
 impl<'a> Emulator<'a> {
     pub fn new(program: &'a Program, symbol: &str) -> Result<Self> {
@@ -448,6 +567,9 @@ impl<'a> Emulator<'a> {
             arch: program.target.arch,
             steps,
             strict_lds: false,
+            decode_arch: program.target.arch,
+            hw: None,
+            runs: std::sync::atomic::AtomicU64::new(0),
         })
     }
     /// Track which LDS bytes the workgroup has written; a read of any other LDS byte (including by an LDS atomic) is an
@@ -469,8 +591,21 @@ impl<'a> Emulator<'a> {
     pub fn run_workgroup(&self, launch: &Launch, mem: &mut Memory) -> Result<()> {
         self.run_workgroup_counted(launch, mem).map(|_| ())
     }
+    /// As `run_workgroup`, also naming the schedules run (the gate model runs several per workgroup).
+    pub fn run_workgroup_report(&self, launch: &Launch, mem: &mut Memory) -> Result<RunReport> {
+        if self.hw_enabled() {
+            return self.run_hw(launch, mem);
+        }
+        Ok(RunReport {
+            instructions: self.run_workgroup_counted(launch, mem)?,
+            schedules: vec!["round-robin".into()],
+        })
+    }
     /// As `run_workgroup`, returning the number of instructions the workgroup's waves executed.
     pub fn run_workgroup_counted(&self, launch: &Launch, mem: &mut Memory) -> Result<u64> {
+        if self.hw_enabled() {
+            return self.run_hw(launch, mem).map(|r| r.instructions);
+        }
         let kernel = self.kernel;
         let symbol = &kernel.symbol.0;
         let Abi::Hsa { descriptor: d, .. } = &kernel.abi else {
@@ -513,7 +648,7 @@ impl<'a> Emulator<'a> {
                     Class::Wait => Ok(()),
                     Class::Control => control(name, inst, st, kernel),
                     Class::Memory => {
-                        memory::execute_tracked(name, inst, st, mem, &mut lds, defined.as_mut())
+                        memory::execute_tracked(name, inst, st, mem, &mut lds, defined.as_mut(), None)
                     }
                     Class::Alu => alu::execute(self.arch, name, inst, st),
                 };
@@ -698,6 +833,7 @@ mod tests {
             ended: false,
             barrier: None,
             signals: 0,
+            scratch: Vec::new(),
         }
     }
     fn reg(kind: Kind, base: u16, len: u8) -> Operand {
@@ -1161,5 +1297,228 @@ mod tests {
         assert!(m.read(a + 60, 8).is_err());
         let w = WriteSet::new(10);
         assert_eq!(w.first_unwritten(2, 3), Some(2));
+    }
+    // ---- gate model (hw.rs): in-flight memory, LDS races, schedules ----
+    fn winsn(name: &str, waits: &[(crate::wait::Counter, u8)]) -> Inst {
+        let row = crate::isa::gfx12().iter().find(|r| r.name == name).unwrap();
+        let mut w = crate::wait::WaitImm::default();
+        for (c, n) in waits {
+            w.per_counter[*c as usize] = Some(*n);
+        }
+        Inst::from_parts(
+            Arch::Gfx1201,
+            row.op,
+            row.form,
+            Default::default(),
+            [Operand::Imm(ImmField::Sopp(0))].into_iter().collect(),
+            crate::operand::Modifiers {
+                wait: Some(w),
+                ..Default::default()
+            },
+            None,
+            Default::default(),
+        )
+        .unwrap()
+    }
+    fn prog(insts: Vec<Inst>) -> Program {
+        use crate::{
+            cfg::{Block, BlockId, Terminator},
+            inst::{Setting, Target},
+        };
+        let mut body = crate::Body::default();
+        let n = insts.len();
+        for i in insts {
+            let id = body.insts.insert(i);
+            body.layout.push(id);
+        }
+        let id = body.insts.insert(insn("s_endpgm", vec![]));
+        body.layout.push(id);
+        body.blocks.push(Block {
+            id: BlockId(0),
+            range: (0, n + 1),
+            term: Terminator::EndPgm,
+            preds: Default::default(),
+            succs: Default::default(),
+        });
+        Program {
+            target: Target {
+                arch: Arch::Gfx1201,
+                xnack: Setting::Any,
+                sramecc: Setting::Any,
+                abi_version: 4,
+            },
+            kernels: vec![kernel(body)],
+            source: None,
+        }
+    }
+    /// `s4..s7` = a raw SRD over the mapped "buf" region (base 0x10000, 256 bytes), `v1` = 4 * tid.
+    fn srd_prologue() -> Vec<Inst> {
+        vec![
+            insn("s_mov_b32", vec![s(4), Operand::Literal(0x10000)]),
+            insn("s_mov_b32", vec![s(5), Operand::Literal(0)]),
+            insn("s_mov_b32", vec![s(6), Operand::Literal(256)]),
+            insn("s_mov_b32", vec![s(7), Operand::Literal(0x3100_4000)]),
+            insn(
+                "v_lshlrev_b32_e32",
+                vec![v(1), Operand::Inline(InlineConst::Integer(2)), v(0)],
+            ),
+        ]
+    }
+    fn buf_op(name: &str, data: u16, addr: u16) -> Inst {
+        insn(
+            name,
+            vec![
+                v(data),
+                v(addr),
+                reg(Kind::S, 4, 4),
+                Operand::Special(Special::Null),
+                Operand::Vmem(crate::operand::VmemToken::Offen),
+            ],
+        )
+    }
+    fn run_gate(p: &Program, block: u32, hw: bool) -> (Result<RunReport>, Memory) {
+        let mut mem = Memory::default();
+        mem.map("buf".into(), 0x10000, (0..=255u8).collect()).unwrap();
+        let emu = Emulator::new(p, "exchange").unwrap();
+        let emu = if hw { emu.hw_model() } else { emu };
+        let r = emu.run_workgroup_report(
+            &Launch {
+                kernarg_ptr: 0,
+                workgroup: [0, 0, 0],
+                block: [block, 1, 1],
+                dynamic_lds: 0,
+            },
+            &mut mem,
+        );
+        (r, mem)
+    }
+    #[test]
+    fn in_flight_load_destination_is_only_readable_after_its_wait() {
+        use crate::wait::Counter;
+        let mut body = srd_prologue();
+        body.push(buf_op("buffer_load_b32", 3, 1));
+        body.push(insn("v_add_f32_e32", vec![v(4), v(3), v(3)]));
+        let p = prog(body.clone());
+        assert!(run_gate(&p, 32, false).0.is_ok(), "the legacy model retires loads at issue");
+        let e = run_gate(&p, 32, true).0.unwrap_err();
+        assert!(e.contains("[in-flight]") && e.contains("reads v3") && e.contains("buffer_load_b32"), "{e}");
+        // wait first: fine
+        let mut ok = srd_prologue();
+        ok.push(buf_op("buffer_load_b32", 3, 1));
+        ok.push(winsn("s_wait_loadcnt", &[(Counter::Load, 0)]));
+        ok.push(insn("v_add_f32_e32", vec![v(4), v(3), v(3)]));
+        assert!(run_gate(&prog(ok), 32, true).0.is_ok());
+    }
+    #[test]
+    fn partial_wait_retires_only_the_older_load() {
+        use crate::wait::Counter;
+        let mk = |tail: Vec<Inst>| {
+            let mut b = srd_prologue();
+            b.push(buf_op("buffer_load_b32", 3, 1));
+            b.push(buf_op("buffer_load_b32", 5, 1));
+            b.push(winsn("s_wait_loadcnt", &[(Counter::Load, 1)]));
+            b.extend(tail);
+            prog(b)
+        };
+        let older = mk(vec![insn("v_add_f32_e32", vec![v(4), v(3), v(3)])]);
+        assert!(run_gate(&older, 32, true).0.is_ok());
+        let younger = mk(vec![insn("v_add_f32_e32", vec![v(4), v(5), v(5)])]);
+        let e = run_gate(&younger, 32, true).0.unwrap_err();
+        assert!(e.contains("reads v5") && e.contains("loadcnt"), "{e}");
+        // writing the in-flight destination (WAW against an ALU write) is an error too
+        let waw = mk(vec![insn("v_mov_b32_e32", vec![v(5), v(0)])]);
+        assert!(run_gate(&waw, 32, true).0.unwrap_err().contains("writes v5"));
+    }
+    #[test]
+    fn gfx12_store_data_is_locked_until_dscnt_retires() {
+        use crate::wait::Counter;
+        let ds = |wait: bool| {
+            let mut b = srd_prologue();
+            b.push(insn("ds_store_b32", vec![v(1), v(0)]));
+            if wait {
+                b.push(winsn("s_wait_dscnt", &[(Counter::Ds, 0)]));
+            }
+            b.push(insn("v_mov_b32_e32", vec![v(0), v(1)]));
+            prog(b)
+        };
+        assert!(run_gate(&ds(false), 32, false).0.is_ok(), "the legacy model never overwrites late");
+        let e = run_gate(&ds(false), 32, true).0.unwrap_err();
+        assert!(e.contains("[in-flight]") && e.contains("store source") && e.contains("ds_store_b32"), "{e}");
+        assert!(run_gate(&ds(true), 32, true).0.is_ok());
+    }
+    /// Every thread stores `tid` at `4*tid`, then (optionally after a wait and a barrier) loads the slot of the thread 32 away.
+    fn exchange(wait_before_barrier: bool, barrier: bool) -> Program {
+        use crate::wait::Counter;
+        let mut b = srd_prologue();
+        b.push(insn("ds_store_b32", vec![v(1), v(0)]));
+        if wait_before_barrier {
+            b.push(winsn("s_wait_dscnt", &[(Counter::Ds, 0)]));
+        }
+        if barrier {
+            b.push(insn("s_barrier_signal", vec![Operand::Imm(ImmField::Sopp(-1))]));
+            b.push(insn("s_barrier_wait", vec![Operand::Imm(ImmField::Sopp(-1))]));
+        }
+        b.push(insn(
+            "v_xor_b32_e32",
+            vec![v(2), v(1), Operand::Literal(128)],
+        ));
+        b.push(insn("ds_load_b32", vec![v(3), v(2)]));
+        b.push(winsn("s_wait_dscnt", &[(Counter::Ds, 0)]));
+        b.push(buf_op("buffer_store_b32", 3, 1));
+        prog(b)
+    }
+    #[test]
+    fn lds_exchange_needs_a_waited_barrier() {
+        let racy = exchange(true, false);
+        assert!(run_gate(&racy, 64, false).0.is_ok(), "the legacy model cannot see the race");
+        let e = run_gate(&racy, 64, true).0.unwrap_err();
+        assert!(e.contains("[race]") && e.contains("read-after-write") && e.contains("same barrier epoch"), "{e}");
+        // barrier without waiting for the store: the store is still in flight at the barrier
+        let e = run_gate(&exchange(false, true), 64, true).0.unwrap_err();
+        assert!(e.contains("[race]") && e.contains("still in flight"), "{e}");
+        // wait + barrier: ordered, and every schedule agrees
+        let (r, mem) = run_gate(&exchange(true, true), 64, true);
+        let rep = r.unwrap();
+        // round-robin, run-ahead of each of the two waves, two seeded-random orders
+        assert_eq!(rep.schedules.len(), 5, "{:?}", rep.schedules);
+        let expect: Vec<u8> = (0..64u32).flat_map(|n| (n ^ 32).to_le_bytes()).collect();
+        assert_eq!(&mem.regions[0].bytes[..256], &expect[..]);
+        assert_eq!(mem.regions[0].written.count(), 256);
+    }
+    #[test]
+    fn schedules_must_agree_on_global_stores() {
+        // Both waves store their lane 31 value at byte 0: the last writer decides, which a different schedule flips.
+        let mut b = srd_prologue();
+        b.push(insn("v_mov_b32_e32", vec![v(5), Operand::Inline(InlineConst::Integer(0))]));
+        b.push(buf_op("buffer_store_b32", 0, 5));
+        let p = prog(b);
+        assert!(run_gate(&p, 64, false).0.is_ok());
+        let e = run_gate(&p, 64, true).0.unwrap_err();
+        assert!(e.contains("[schedule]") && e.contains("stores differ"), "{e}");
+        // one wave has one schedule and passes
+        assert_eq!(run_gate(&p, 32, true).0.unwrap().schedules, ["round-robin"]);
+    }
+    #[test]
+    fn unwritten_bytes_of_a_strict_region_are_an_uninit_read() {
+        let mut b = srd_prologue();
+        b.push(buf_op("buffer_load_b32", 3, 1));
+        let p = prog(b);
+        let mut mem = Memory::default();
+        mem.map("buf".into(), 0x10000, vec![0; 256]).unwrap();
+        mem.set_strict_read("buf").unwrap();
+        let e = Emulator::new(&p, "exchange")
+            .unwrap()
+            .hw_model()
+            .run_workgroup(
+                &Launch {
+                    kernarg_ptr: 0,
+                    workgroup: [0, 0, 0],
+                    block: [32, 1, 1],
+                    dynamic_lds: 0,
+                },
+                &mut mem,
+            )
+            .unwrap_err();
+        assert!(e.contains("[uninit]"), "{e}");
     }
 }

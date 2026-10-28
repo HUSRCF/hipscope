@@ -919,7 +919,7 @@ impl Iu4 {
         )
         .map_err(|e| format!("lift: {e:?}"))?;
         // Reports the first opcode without semantics, if any.
-        let emu = Emulator::new(&lifted.program, &symbol)?;
+        let emu = Emulator::new(&lifted.program, &symbol)?.hw_model();
         if !matches!(self.cand.epi, Epi::Set | Epi::Add) {
             return Err(format!(
                 "emulator accepts every {symbol} opcode but pm_loop drives only set/add emulation"

@@ -150,9 +150,33 @@ pub fn run_arm(
     case: &mut EmuCase,
     sel: &WgSel,
 ) -> std::result::Result<ArmRun, ArmFail> {
+    run_arm_model(tag, image, symbol, geo, case, sel, Model::Gate)
+}
+
+/// Which emulator model an arm runs under. Every gate path uses `Gate` (in-flight memory, LDS races, schedules).
+/// `Legacy` (the pre-0.4.3 gate: strict LDS, one interleaving, loads retire at issue) and `StrictStoreSources`
+/// (`Gate` plus the PM builder's store-source rule on gfx11) exist for tests and audits only.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Model {
+    Legacy,
+    Gate,
+    StrictStoreSources,
+}
+
+/// `run_arm` under an explicit [`Model`].
+pub fn run_arm_model(
+    tag: &str,
+    image: &[u8],
+    symbol: &str,
+    geo: &Geometry,
+    case: &mut EmuCase,
+    sel: &WgSel,
+    model: Model,
+) -> std::result::Result<ArmRun, ArmFail> {
+    debug_assert!(model == Model::Gate || cfg!(test), "only tests may run a non-gate emulator model");
     let pristine = case.bufs[case.out].bytes.clone();
     let mut mem = Memory::default();
-    let r = exec_arm(tag, image, symbol, geo, case, sel, &mut mem);
+    let r = exec_arm(tag, image, symbol, geo, case, sel, &mut mem, model);
     let mut taken = None;
     for reg in std::mem::take(&mut mem.regions) {
         if let Some(i) = case.bufs.iter().position(|b| b.name == reg.name) {
@@ -181,6 +205,7 @@ fn exec_arm(
     case: &mut EmuCase,
     sel: &WgSel,
     mem: &mut Memory,
+    model: Model,
 ) -> std::result::Result<ArmRun, ArmFail> {
     let started = Instant::now();
     let mut info = json!({"tag": tag, "symbol": symbol, "object_sha256": sha256_hex(image)});
@@ -213,7 +238,12 @@ fn exec_arm(
     }
     let emu = Emulator::new(&program, symbol)
         .map_err(|e| fail(format!("emulator: {e}"), info.clone()))?
-        .strict_lds()
+        .strict_lds();
+    let emu = match model {
+        Model::Legacy => emu,
+        Model::Gate => emu.hw_model(),
+        Model::StrictStoreSources => emu.hw_model_strict_store_sources(),
+    }
         .gfx1100_as_gfx1151();
 
     let mut addrs = Vec::with_capacity(case.bufs.len());
@@ -253,6 +283,7 @@ fn exec_arm(
         }
     };
     let (mut instructions, mut workgroups) = (0u64, 0u64);
+    let mut schedules: Vec<String> = Vec::new();
     for &[x, y, z] in list {
         if x >= geo.grid[0] || y >= geo.grid[1] || z >= geo.grid[2] {
             return Err(ArmFail {
@@ -263,11 +294,14 @@ fn exec_arm(
             });
         }
         let launch = Launch { kernarg_ptr: kva, workgroup: [x, y, z], block: geo.block, dynamic_lds: geo.lds };
-        let r = catch_unwind(AssertUnwindSafe(|| emu.run_workgroup_counted(&launch, mem)));
+        let r = catch_unwind(AssertUnwindSafe(|| emu.run_workgroup_report(&launch, mem)));
         match r {
-            Ok(Ok(n)) => {
-                instructions += n;
+            Ok(Ok(rep)) => {
+                instructions += rep.instructions;
                 workgroups += 1;
+                if schedules.is_empty() {
+                    schedules = rep.schedules;
+                }
             }
             Ok(Err(e)) => {
                 return Err(ArmFail {
@@ -320,6 +354,7 @@ fn exec_arm(
         .count();
     info["workgroups"] = json!(workgroups);
     info["instructions"] = json!(instructions);
+    info["schedules"] = json!(schedules);
     info["geometry"] = json!({"grid_workgroups": geo.grid, "block": geo.block, "lds_dynamic_bytes": geo.lds});
     info["output_written_bytes"] = json!(out_written);
     info["elapsed_ms"] = json!(started.elapsed().as_millis() as u64);
