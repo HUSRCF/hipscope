@@ -672,8 +672,16 @@ fn emu_stage(o: &Opts, node: &dyn Node, prep: &Prep, mut rec: Value) -> (Value, 
         receipt["extent_skipped"] = json!("the small shape already failed");
     } else {
         let mut cases = Vec::new();
-        for shape in node.extent_shapes() {
-            let (ok, r) = extent_case(o, node, prep, &shape);
+        let shapes = node.extent_shapes();
+        let name = node.name();
+        // Full-grid cases are independent and each costs a good part of a minute to minutes of emulation:
+        // a full-grid node runs them side by side (each also runs its two arms side by side).
+        let results: Vec<(bool, Value)> = if node.extent_full_default() {
+            lane_common::par_map(shapes.len(), |i| extent_case(o, name, prep, &shapes[i]))
+        } else {
+            shapes.iter().map(|s| extent_case(o, name, prep, s)).collect()
+        };
+        for (shape, (ok, r)) in shapes.iter().zip(results) {
             if !ok {
                 why.push(format!("extent {shape}: {}", r["reason"].as_str().unwrap_or("?")));
             }
@@ -685,12 +693,35 @@ fn emu_stage(o: &Opts, node: &dyn Node, prep: &Prep, mut rec: Value) -> (Value, 
     // Static hazard checks on the arms' objects (nodes that opt in): any Required/Unchecked finding,
     // any PM-IR hazard obligation or an analysis error on the CANDIDATE fails the gate.
     if node.static_hazards() {
-        let (_, hb) = emu::hazards(&prep.base.image, &prep.inc.symbol);
-        let (hc_ok, hc) = emu::hazards(&prep.cand.image, &prep.inc.symbol);
-        receipt["hazards"] = json!({"pass": hc_ok, "candidate": hc, "baseline": hb});
-        if !hc_ok {
+        // Every entry the gate launches (the small shape's, each extent shape's): a lane_proj candidate
+        // is launched through `_n{lanes}` at every lane count.
+        let mut symbols = vec![prep.inc.symbol.clone()];
+        for s in node.extent_shapes() {
+            if let Some(sym) = build_node(node.name(), Some(&s)).ok().and_then(|n| n.incumbent().ok()).map(|i| i.symbol) {
+                if !symbols.contains(&sym) {
+                    symbols.push(sym);
+                }
+            }
+        }
+        let mut by_symbol = serde_json::Map::new();
+        let mut bad_symbols = Vec::new();
+        for sym in &symbols {
+            let (_, hb) = emu::hazards(&prep.base.image, sym);
+            let (hc_ok, hc) = emu::hazards(&prep.cand.image, sym);
+            if !hc_ok {
+                bad_symbols.push(format!("{sym}: {}", hc["reason"].as_str().unwrap_or("?")));
+            }
+            by_symbol.insert(sym.clone(), json!({"pass": hc_ok, "candidate": hc, "baseline": hb}));
+        }
+        receipt["hazards"] = json!({
+            "pass": bad_symbols.is_empty(),
+            "launched_symbol": by_symbol.get(&prep.inc.symbol),
+            "symbols_checked": symbols,
+            "by_symbol": by_symbol,
+        });
+        if !bad_symbols.is_empty() {
             pass = false;
-            why.push(format!("hazards: {}", hc["reason"].as_str().unwrap_or("?")));
+            why.push(format!("hazards: {}", bad_symbols.join("; ")));
         }
     }
     receipt["pass"] = json!(pass);
@@ -705,12 +736,17 @@ fn emu_stage(o: &Opts, node: &dyn Node, prep: &Prep, mut rec: Value) -> (Value, 
 }
 
 /// One production-extent case of `emu_stage` at `shape`.
-fn extent_case(o: &Opts, like: &dyn Node, prep: &Prep, shape: &str) -> (bool, Value) {
+fn extent_case(o: &Opts, name: &str, prep: &Prep, shape: &str) -> (bool, Value) {
     let t = std::time::Instant::now();
     let bad = |why: String| (false, json!({"label": shape, "shape": shape, "pass": false, "reason": why}));
-    let n = match build_node(like.name(), Some(shape)) {
+    let n = match build_node(name, Some(shape)) {
         Ok(n) => n,
         Err(e) => return bad(format!("extent shape: {e}")),
+    };
+    // The launched entry depends on the shape (lane_proj: `_n{lanes}`).
+    let symbol = match n.incumbent() {
+        Ok(i) => i.symbol,
+        Err(e) => return bad(format!("incumbent: {e}")),
     };
     let base_geo = n.geometry();
     let cand_geo = match n.geometry_with(&mut prep.cand_header.clone()) {
@@ -731,7 +767,7 @@ fn extent_case(o: &Opts, like: &dyn Node, prep: &Prep, shape: &str) -> (bool, Va
         };
         let built = t.elapsed().as_millis() as u64;
         let (ok, mut r) = emu::gate(
-            &prep.inc.symbol,
+            &symbol,
             &mut case,
             (&prep.base.image, &base_geo),
             (&prep.cand.image, &cand_geo),
@@ -756,7 +792,7 @@ fn extent_case(o: &Opts, like: &dyn Node, prep: &Prep, shape: &str) -> (bool, Va
     let built = t.elapsed().as_millis() as u64;
     let (ok, mut r) = emu::extent_gate(
         shape,
-        &prep.inc.symbol,
+        &symbol,
         &mut case,
         (&prep.base.image, &base_geo, &*ob),
         (&prep.cand.image, &cand_geo, &*oc),
@@ -2155,5 +2191,42 @@ mod lane_tests {
         let (ok, hz) = emu::hazards(&good.image, &inc.symbol);
         assert!(ok, "{hz}");
         assert_eq!(hz["wave"], 32);
+    }
+
+    /// The wave64 `lane_proj` kernel through the gate at each group's small shape: the incumbent passes over the full
+    /// grid; a candidate that stores one word past a segment's last row (into the unwritten pad between the packed
+    /// output segments, or into the next lane's row 0) differs from the incumbent; the hazard receipt is clean.
+    #[test]
+    fn lane_proj_emu_gate_passes_the_incumbent_and_fails_a_store_past_a_segment() {
+        if !jit::hipcc_available() {
+            eprintln!("skip: no hipcc");
+            return;
+        }
+        let dir = tmp("proj-gate");
+        for shape in ["emu,group=fa,lanes=3", "emu,group=moe,lanes=1"] {
+            let n = build_node("lane_proj", Some(shape)).unwrap();
+            let inc = n.incumbent().unwrap();
+            let good = jit::compile_for(n.arch(), &dir, "good", &inc, &inc.source).unwrap();
+            let bad_src = inc.source.replace(
+                "yp[r][(long long)b * mseg[r] + rowi[r]] = a;",
+                "yp[r][(long long)b * mseg[r] + rowi[r] + (rowi[r] == mseg[r] - 1 ? 1 : 0)] = a;",
+            );
+            assert_ne!(bad_src, inc.source);
+            let bad = jit::compile_for(n.arch(), &dir, "bad", &inc, &bad_src).unwrap();
+            let geo = n.geometry();
+            let mut case = n.emu_case(1).unwrap();
+            let (pass, rec) = emu::gate(&inc.symbol, &mut case, (&good.image, &geo), (&good.image, &geo), n.shape_json(), 1);
+            assert!(pass, "{shape}: {}", rec["reason"]);
+            assert_eq!(rec["arms"]["baseline"]["wave"], 64);
+            let (pass, rec) = emu::gate(&inc.symbol, &mut case, (&good.image, &geo), (&bad.image, &geo), n.shape_json(), 1);
+            assert!(!pass, "{shape}: a store past the segment must fail the gate");
+            // Either the output differs from the incumbent's, or two waves now store the same word and the
+            // schedules diverge (the gate model's own finding): both are failures of the store past the segment.
+            let why = rec["reason"].as_str().unwrap();
+            assert!(why.contains("differs") || why.contains("[schedule]"), "{why}");
+            let (ok, hz) = emu::hazards(&good.image, &inc.symbol);
+            assert!(ok, "{hz}");
+            assert_eq!(hz["wave"], 64);
+        }
     }
 }

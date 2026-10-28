@@ -557,6 +557,30 @@ mod tests {
     }
 
     #[test]
+    fn chunked_cpu_reference_equals_the_direct_reference() {
+        // m = 333 spans three 128-row chunks with an odd tail: parity is by absolute row.
+        for (m, lanes) in [(41usize, 5usize), (333, 3)] {
+            let n = LaneWo::build(lanes, m, false, false).unwrap();
+            let (w, x, y0) = n.host_inputs(5);
+            let mut y = y0.clone();
+            lane_ref::residual_lanes_ref(&w, &x, &mut y, m, lanes);
+            let want: Vec<u32> = y.iter().map(|v| v.to_bits()).collect();
+            assert_eq!(LaneWo::cpu_reference(&w, &x, &y0, m, lanes), want, "m{m} n{lanes}");
+        }
+    }
+
+    /// Wall time of the CPU reference for one production-size matrix case (m 2048, 8 lanes); `--ignored --nocapture`.
+    #[test]
+    #[ignore = "timing probe"]
+    fn cpu_reference_cost_m2048_8_lanes() {
+        let n = node("lanes=8,m=2048");
+        let (w, x, y0) = n.host_inputs(5);
+        let t = std::time::Instant::now();
+        let r = LaneWo::cpu_reference(&w, &x, &y0, 2048, 8);
+        eprintln!("lane_wo cpu reference m2048 n8: {:?} ({} words)", t.elapsed(), r.len());
+    }
+
+    #[test]
     fn timing_pool_exceeds_the_last_level_cache_with_an_odd_set_count() {
         let n = node("lanes=8,m=2048");
         let sets = pool_sets(n.set_bytes());

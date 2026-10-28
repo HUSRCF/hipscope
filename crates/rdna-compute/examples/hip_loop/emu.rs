@@ -484,8 +484,13 @@ pub fn gate(
     shape: Value,
     seed: u64,
 ) -> (bool, Value) {
-    let b = run_arm("baseline", base.0, symbol, base.1, case, &WgSel::All);
-    let c = run_arm("candidate", cand.0, symbol, cand.1, case, &WgSel::All);
+    // The two arms are independent runs on the same inputs: the baseline on its own copy of the case, side by side.
+    let mut base_case = case.clone();
+    let (b, c) = std::thread::scope(|s| {
+        let hb = s.spawn(|| run_arm("baseline", base.0, symbol, base.1, &mut base_case, &WgSel::All));
+        let c = run_arm("candidate", cand.0, symbol, cand.1, case, &WgSel::All);
+        (hb.join().unwrap_or_else(|_| Err(fail("baseline arm thread panicked", json!({"tag": "baseline"})))), c)
+    });
     let (bn, cn) = (counts(&b), counts(&c));
     let mut rec = json!({
         "pass": false,

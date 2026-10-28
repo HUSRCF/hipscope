@@ -791,6 +791,26 @@ mod tests {
     }
 
     #[test]
+    fn chunked_cpu_reference_equals_the_direct_reference() {
+        let n = node("emu,lanes=3");
+        let (w, x) = n.host_inputs(5);
+        let refs: Vec<&[u8]> = w.iter().map(|v| v.as_slice()).collect();
+        let direct = lane_ref::lane_proj_ref(&refs, &n.rows, &x, 3);
+        assert_eq!(LaneProj::cpu_reference(&w, &n.rows, &x, 3), direct);
+    }
+
+    /// Wall time of the CPU reference for one production-size matrix case (dn, 8 lanes); `--ignored --nocapture`.
+    #[test]
+    #[ignore = "timing probe"]
+    fn cpu_reference_cost_dn_8_lanes() {
+        let n = node("group=dn,lanes=8");
+        let (w, x) = n.host_inputs(5);
+        let t = std::time::Instant::now();
+        let r = LaneProj::cpu_reference(&w, &n.rows, &x, 8);
+        eprintln!("lane_proj cpu reference dn n8: {:?} ({} words)", t.elapsed(), r.iter().map(Vec::len).sum::<usize>());
+    }
+
+    #[test]
     fn weights_use_the_real_group_layout() {
         let w = synth_weights(3, 8, 7, WKind::Small);
         assert_eq!(w.len(), 3 * ROW_BYTES);
