@@ -5445,7 +5445,8 @@ mod tests {
         assert_eq!((short.0, short.1), (43, 8));
         assert!(long.2 >= S1_GROWN_FREE_HOLD_BYTES);
         assert!(short.0 >= 43, "32,780 rows in one window");
-        assert!(S1_WINDOW_ROWS < 43 * tile && 43 * tile >= 32_780);
+        // 43 is the covering tile count of a 32,780-row prompt: 42 tiles fall short.
+        assert!(42 * tile < 32_780 && 43 * tile >= 32_780);
         assert!(short.2 >= S1_GROWN_FREE_HOLD_BYTES, "1 GiB held free");
     }
 
