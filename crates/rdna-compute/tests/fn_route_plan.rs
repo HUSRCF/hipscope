@@ -302,7 +302,8 @@ fn every_walked_kernel_is_planned() {
     for layout in &cases() {
         let (ar, mtp) = route_plans(layout);
         let walked = walked(layout.arch, &layout.sha);
-        let inventory = entries(layout.arch, &builtin_flags(layout.arch).hipcc_extra_flags).unwrap();
+        let inventory =
+            entries(layout.arch, &builtin_flags(layout.arch).hipcc_extra_flags).unwrap();
         for (plan, native_mtp) in [(&ar, false), (&mtp, true)] {
             let rows: Vec<_> = walked
                 .rows
@@ -656,7 +657,10 @@ fn gfx1100_plan_is_the_canonical_header_walked_open_at_q8_legacy() {
             Err(RegistryError::UnsupportedRoute(why)) => {
                 assert!(why.contains("has no walked route"), "{spec:?}: {why}")
             }
-            other => panic!("split on gfx1100 {spec:?}: {:?}", other.map(|p| p.entries.len())),
+            other => panic!(
+                "split on gfx1100 {spec:?}: {:?}",
+                other.map(|p| p.entries.len())
+            ),
         }
     }
 }
