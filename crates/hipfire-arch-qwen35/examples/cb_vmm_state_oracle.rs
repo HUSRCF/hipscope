@@ -32,7 +32,7 @@
 //! shared trunk, once through a single `forward_prefill_batch_multi` (exact
 //! iff the rows fit the effective cap, else refused before any write) and
 //! once through `dflash_cb_verify` (whole lanes packed into chunks of the
-//! effective cap: ONE 128-row chunk at C8 with `HIPFIRE_CB_VERIFY_CHUNK128=1`).
+//! effective cap: ONE 128-row chunk at C8 on gfx1201 by default, `HIPFIRE_CB_VERIFY_CHUNK128=0` restores 63).
 //! Every lane must byte-equal the isolated singleton window (state, KV rows,
 //! tape, ring, picks, committed ids, and the KV rows just past the window).
 //! Per window the profile collector's launched symbols must show exactly the
@@ -6181,7 +6181,7 @@ fn lone_row_control(
 }
 
 /// `HIPFIRE_*` variables recorded in every receipt (both wide-route flags
-/// included: `HIPFIRE_CB_VERIFY_CHUNK128` default off, `HIPFIRE_CB_VERIFY_PM`
+/// included: `HIPFIRE_CB_VERIFY_CHUNK128` default on for gfx1201, `HIPFIRE_CB_VERIFY_PM`
 /// default on inside the enabled route only; the singleton-arm switches that
 /// refuse wide admission; the `HIPFIRE_PREFILL_CHUNK_ROWS` and
 /// `HIPFIRE_VERIFY_GRAPH` pins).

@@ -404,11 +404,13 @@ pub struct FeatureFlags {
     /// outputs are byte-identical. N <= 16 never uses it. Default ON on exact
     /// gfx1201; `=0` restores the one-batch-tile-per-block launch.
     pub wmma_batch_tiles: bool,
-    /// `HIPFIRE_CB_VERIFY_CHUNK128=1` (default OFF) admits exact 64..=128-row
-    /// aggregated verify chunks for the continuous-batching speculative route
-    /// on exact gfx1201 (see `Gpu::mq4_verify_chunk_rows`): 128 rows through
-    /// the explicit `gemm_*_verify_exact` kernels instead of 63. `=0` keeps
-    /// the 63-row chunks and every existing route. Needs `wmma_batch_tiles`.
+    /// `HIPFIRE_CB_VERIFY_CHUNK128` (default ON on gfx1201, `=0` is the kill
+    /// switch) admits exact 64..=128-row aggregated verify chunks for the
+    /// continuous-batching speculative route on exact gfx1201 (see
+    /// `Gpu::mq4_verify_chunk_rows`): up to 128 rows per chunk instead of 63,
+    /// so 8 lanes of 8-row blocks (64 rows) run one weight pass instead of
+    /// two. `=0` keeps the 63-row chunks and every existing route. Needs
+    /// `wmma_batch_tiles`.
     pub cb_verify_chunk128: bool,
     /// `HIPFIRE_CB_VERIFY_PM` (default ON; only meaningful with the wide
     /// verify route): runs the 64..=128-row exact kernels from the embedded
@@ -1191,7 +1193,7 @@ impl FeatureFlags {
             gfx12_mq4v2_fp8_qkv: parse_bool("HIPFIRE_GFX12_MQ4V2_FP8_QKV")
                 .unwrap_or(arch == "gfx1201"),
             wmma_batch_tiles: parse_bool("HIPFIRE_WMMA_BATCH_TILES").unwrap_or(arch == "gfx1201"),
-            cb_verify_chunk128: parse_bool("HIPFIRE_CB_VERIFY_CHUNK128").unwrap_or(false),
+            cb_verify_chunk128: parse_bool("HIPFIRE_CB_VERIFY_CHUNK128").unwrap_or(arch == "gfx1201"),
             cb_verify_pm: parse_bool("HIPFIRE_CB_VERIFY_PM").unwrap_or(true),
             cb_verify_fp8: parse_bool("HIPFIRE_CB_VERIFY_FP8").unwrap_or(false),
             cb_verify_iu4: parse_bool("HIPFIRE_CB_VERIFY_IU4"),
@@ -3015,7 +3017,7 @@ mod tests {
     }
 
     #[test]
-    fn cb_verify_chunk128_defaults_off_and_pm_defaults_on() {
+    fn cb_verify_chunk128_defaults_on_for_gfx1201_and_pm_defaults_on() {
         let flags = |chunk: Option<&str>, pm: Option<&str>| {
             FeatureFlags::from_lookup("gfx1201", |name| match (name, chunk, pm) {
                 ("HIPFIRE_CB_VERIFY_CHUNK128", Some(v), _) => Ok(v.to_owned()),
@@ -3024,10 +3026,14 @@ mod tests {
             })
         };
         let default = flags(None, None);
-        assert!(!default.cb_verify_chunk128);
+        assert!(default.cb_verify_chunk128);
         assert!(default.cb_verify_pm);
         assert!(flags(Some("1"), None).cb_verify_chunk128);
         assert!(!flags(Some("0"), None).cb_verify_chunk128);
+        // Other arches never default it on (their cap stays 63 regardless).
+        let other = FeatureFlags::from_lookup("gfx1100", |_| Err(()));
+        assert!(!other.cb_verify_chunk128);
+        // The unit-test constructor stays on the historical 63-row route.
         assert!(!flags(None, Some("0")).cb_verify_pm);
         assert!(flags(None, Some("1")).cb_verify_pm);
         assert!(!FeatureFlags::for_test("gfx1201").cb_verify_chunk128);
