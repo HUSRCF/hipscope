@@ -33,14 +33,24 @@ fn model_path() -> PathBuf {
     let path = std::env::var_os(MODEL_ENV)
         .map(PathBuf::from)
         .unwrap_or_else(|| panic!("{MODEL_ENV} must name a Flash-Next artifact"));
-    assert!(path.is_file(), "{MODEL_ENV}={} is not a file", path.display());
+    assert!(
+        path.is_file(),
+        "{MODEL_ENV}={} is not a file",
+        path.display()
+    );
     path
 }
 
 fn run_arm(head_d2: &str, dump: &Path) -> (Value, String) {
     let exe = std::env::current_exe().expect("test binary path");
     let output = Command::new(exe)
-        .args(["--exact", "mtp_head_d2_arm", "--ignored", "--nocapture", "--test-threads=1"])
+        .args([
+            "--exact",
+            "mtp_head_d2_arm",
+            "--ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ])
         .env(MODEL_ENV, model_path())
         .env("HIPFIRE_QWEN4_D2_DEFAULT", "1")
         .env("HIPFIRE_QWEN4_MTP_HEAD_D2", head_d2)
@@ -60,12 +70,22 @@ fn run_arm(head_d2: &str, dump: &Path) -> (Value, String) {
         .lines()
         .filter_map(|line| line.split_once(SUMMARY_PREFIX).map(|(_, json)| json))
         .collect();
-    assert_eq!(lines.len(), 1, "arm {head_d2}: expected one summary\n{stdout}");
-    (serde_json::from_str(lines[0]).expect("summary json"), stderr)
+    assert_eq!(
+        lines.len(),
+        1,
+        "arm {head_d2}: expected one summary\n{stdout}"
+    );
+    (
+        serde_json::from_str(lines[0]).expect("summary json"),
+        stderr,
+    )
 }
 
 fn cpu_arm_lines(stderr: &str) -> Vec<&str> {
-    stderr.lines().filter(|l| l.contains("QWEN4_CPU_ARM")).collect()
+    stderr
+        .lines()
+        .filter(|l| l.contains("QWEN4_CPU_ARM"))
+        .collect()
 }
 
 #[test]
@@ -86,13 +106,18 @@ fn mtp_head_d2_hw() {
     // The trunk partition must be live for the head to follow it.
     let trunk = &off["trunk_after_attach_mtp"];
     assert!(
-        trunk["split_layers"].as_array().is_some_and(|l| !l.is_empty()),
+        trunk["split_layers"]
+            .as_array()
+            .is_some_and(|l| !l.is_empty()),
         "trunk D2 not armed; the head arm cannot be exercised: {off}"
     );
     // T4: head arming leaves every trunk D2 observable unchanged, within an
     // arm (attach_mtp) and across arms.
     for arm in [&off, &on] {
-        assert_eq!(arm["trunk_before_attach_mtp"], arm["trunk_after_attach_mtp"]);
+        assert_eq!(
+            arm["trunk_before_attach_mtp"],
+            arm["trunk_after_attach_mtp"]
+        );
     }
     assert_eq!(off["trunk_after_attach_mtp"], on["trunk_after_attach_mtp"]);
     assert_eq!(on["trunk_after_attach_mtp"]["d2_storage_capacity_rows"], 4);
@@ -100,12 +125,18 @@ fn mtp_head_d2_hw() {
     assert_eq!(on["head_d2_armed"], true);
     assert_eq!(on["head_d2_host_bytes"][0], 112_760);
     assert!(off_err.contains("qwen4 MTP head D2: off"), "{off_err}");
-    assert!(on_err.contains("qwen4 MTP head D2: armed (rows=1"), "{on_err}");
+    assert!(
+        on_err.contains("qwen4 MTP head D2: armed (rows=1"),
+        "{on_err}"
+    );
 
     // T6: wiring truth. Armed head step arms the CPU with one row; unarmed none.
     assert_eq!(off["eager_ok"], true, "{off}");
     assert_eq!(on["eager_ok"], true, "{on}");
-    assert!(cpu_arm_lines(&off_err).is_empty(), "unarmed head printed a CPU arm");
+    assert!(
+        cpu_arm_lines(&off_err).is_empty(),
+        "unarmed head printed a CPU arm"
+    );
     let arm = cpu_arm_lines(&on_err);
     assert!(!arm.is_empty(), "armed head printed no QWEN4_CPU_ARM line");
     assert!(arm.iter().all(|l| l.contains("rows=1")), "{arm:?}");
@@ -160,10 +191,8 @@ fn mtp_head_d2_hw() {
 #[test]
 #[ignore = "child process of mtp_head_d2_hw"]
 fn mtp_head_d2_arm() {
-    let result = hipfire_arch_qwen4::state_parity::run_mtp_head_d2_probe(
-        Path::new(&model_path()),
-        MAX_SEQ,
-    )
-    .unwrap_or_else(|e| panic!("head D2 probe: {e}"));
+    let result =
+        hipfire_arch_qwen4::state_parity::run_mtp_head_d2_probe(Path::new(&model_path()), MAX_SEQ)
+            .unwrap_or_else(|e| panic!("head D2 probe: {e}"));
     println!("{SUMMARY_PREFIX}{result}");
 }

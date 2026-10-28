@@ -2279,8 +2279,6 @@ fn head_d2_device_bytes(config: &Qwen4Config, head_d2: bool) -> Option<usize> {
 /// Why the native MTP head keeps its GPU expert route on this load.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum HeadD2Off {
-    /// `HIPFIRE_QWEN4_MTP_HEAD_D2` unset: the default is off.
-    KnobUnset,
     /// `HIPFIRE_QWEN4_MTP_HEAD_D2=0` (the kill).
     KnobOff,
     /// The trunk's D2 split has no armed layer on this load (a fast-link card
@@ -2293,9 +2291,8 @@ pub(crate) enum HeadD2Off {
 impl HeadD2Off {
     pub(crate) fn reason(self) -> &'static str {
         match self {
-            Self::KnobUnset => "HIPFIRE_QWEN4_MTP_HEAD_D2 unset",
             Self::KnobOff => "HIPFIRE_QWEN4_MTP_HEAD_D2=0",
-            Self::TrunkD2Off => "trunk D2 split is not armed on this load",
+            Self::TrunkD2Off => "trunk D2 split is not armed on this load (the head follows it)",
             Self::Ep => "expert-parallel bundle",
         }
     }
@@ -2308,19 +2305,21 @@ pub(crate) enum HeadD2Decision {
     Off(HeadD2Off),
 }
 
-/// Pure decision behind `attach_mtp`: arm only on an explicit `Some(true)`
-/// knob, a trunk whose D2 split is armed on this load, and a non-EP bundle.
+/// Pure decision behind `attach_mtp`: `Some(false)` never arms (the kill);
+/// otherwise (`Some(true)` or unset) the head follows the trunk: armed when the
+/// trunk's D2 split is armed on this load and the bundle is not EP.
 pub(crate) fn head_d2_decision(
     knob: Option<bool>,
     trunk_split_layers_nonempty: bool,
     ep: bool,
 ) -> HeadD2Decision {
     match knob {
-        None => HeadD2Decision::Off(HeadD2Off::KnobUnset),
         Some(false) => HeadD2Decision::Off(HeadD2Off::KnobOff),
-        Some(true) if ep => HeadD2Decision::Off(HeadD2Off::Ep),
-        Some(true) if !trunk_split_layers_nonempty => HeadD2Decision::Off(HeadD2Off::TrunkD2Off),
-        Some(true) => HeadD2Decision::Armed,
+        Some(true) | None if ep => HeadD2Decision::Off(HeadD2Off::Ep),
+        Some(true) | None if !trunk_split_layers_nonempty => {
+            HeadD2Decision::Off(HeadD2Off::TrunkD2Off)
+        }
+        Some(true) | None => HeadD2Decision::Armed,
     }
 }
 
@@ -3928,14 +3927,17 @@ mod tests {
     #[test]
     fn head_d2_decision_table() {
         use HeadD2Decision::{Armed, Off};
-        assert_eq!(
-            head_d2_decision(None, true, false),
-            Off(HeadD2Off::KnobUnset)
-        );
-        assert_eq!(
-            head_d2_decision(None, false, false),
-            Off(HeadD2Off::KnobUnset)
-        );
+        // Unset and `1` both follow the trunk's D2 verdict (non-EP only).
+        for knob in [None, Some(true)] {
+            assert_eq!(head_d2_decision(knob, true, false), Armed);
+            assert_eq!(
+                head_d2_decision(knob, false, false),
+                Off(HeadD2Off::TrunkD2Off)
+            );
+            assert_eq!(head_d2_decision(knob, true, true), Off(HeadD2Off::Ep));
+            assert_eq!(head_d2_decision(knob, false, true), Off(HeadD2Off::Ep));
+        }
+        // `0` is the kill for every trunk/EP combination.
         for trunk in [true, false] {
             for ep in [true, false] {
                 assert_eq!(
@@ -3944,22 +3946,7 @@ mod tests {
                 );
             }
         }
-        assert_eq!(head_d2_decision(Some(true), true, false), Armed);
-        assert_eq!(
-            head_d2_decision(Some(true), false, false),
-            Off(HeadD2Off::TrunkD2Off)
-        );
-        assert_eq!(head_d2_decision(Some(true), true, true), Off(HeadD2Off::Ep));
-        assert_eq!(
-            head_d2_decision(Some(true), false, true),
-            Off(HeadD2Off::Ep)
-        );
-        for off in [
-            HeadD2Off::KnobUnset,
-            HeadD2Off::KnobOff,
-            HeadD2Off::TrunkD2Off,
-            HeadD2Off::Ep,
-        ] {
+        for off in [HeadD2Off::KnobOff, HeadD2Off::TrunkD2Off, HeadD2Off::Ep] {
             assert!(!off.reason().is_empty());
         }
     }

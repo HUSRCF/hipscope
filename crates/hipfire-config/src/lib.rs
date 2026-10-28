@@ -10456,10 +10456,10 @@ pub mod memory {
     }
 
     /// `developer.qwen4_mtp_head_d2` (env `HIPFIRE_QWEN4_MTP_HEAD_D2`), a typed
-    /// boolean read once per load by the native MTP head attach: `Some(true)`
-    /// arms the head's routed experts with a rows=1 D2 CPU split executor when
-    /// the trunk's D2 is armed on the same load, `Some(false)` never arms it
-    /// (the kill), `None` (unset) leaves the head on the GPU route.
+    /// boolean read once per load by the native MTP head attach: `Some(false)`
+    /// never arms the head's rows=1 D2 CPU split executor (the kill); `Some(true)`
+    /// and `None` (unset) arm it whenever the trunk's D2 split is armed on the
+    /// same load (non-EP), otherwise the head keeps the GPU route.
     pub fn qwen4_mtp_head_d2() -> Option<bool> {
         super::developer_typed_bool("HIPFIRE_QWEN4_MTP_HEAD_D2")
     }
