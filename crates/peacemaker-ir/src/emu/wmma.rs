@@ -733,6 +733,7 @@ mod tests {
             ended: false,
             barrier: None,
             signals: 0,
+            scratch: Vec::new(),
         }
     }
     fn reg(base: u16, len: u8) -> Operand {

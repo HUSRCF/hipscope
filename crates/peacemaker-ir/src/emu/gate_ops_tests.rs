@@ -29,6 +29,7 @@ fn state() -> State {
         ended: false,
         barrier: None,
         signals: 0,
+        scratch: Vec::new(),
     }
 }
 fn reg(kind: Kind, base: u16, len: u8) -> Operand {

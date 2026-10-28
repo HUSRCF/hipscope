@@ -84,6 +84,9 @@ use crate::{
     operand::{Dpp, InlineConst, Omod, Operand},
     Arch, FormFields, Inst,
 };
+#[cfg(test)]
+#[path = "isa_gap_tests.rs"]
+mod isa_gap_tests;
 
 const NAN_IN: &str = "NaN operand: the ISA document does not specify NaN propagation (selection/payload/sign) for this opcode";
 const NAN_OUT: &str =
@@ -267,7 +270,7 @@ pub(super) fn execute(arch: Arch, name: &str, i: &Inst, s: &mut State) -> Result
         "v_permlane16_b32" | "v_permlanex16_b32" => permlane(name, i, s),
         "v_div_scale_f32" => div_scale(arch, i, s),
         "v_s_rcp_f32" => udiv_scalar_rcp(arch, i, s),
-        "v_add_co_u32" | "v_add_co_ci_u32_e64" => add_carry(name, i, s),
+        "v_add_co_u32" | "v_add_co_ci_u32_e64" | "v_add_co_ci_u32_e32" => add_carry(name, i, s),
         "v_cvt_pk_f32_fp8_e32" | "v_cvt_pk_f32_fp8_e64" => cvt_pk_f32_fp8(arch, i, s),
         _ if name.starts_with("v_cmp") => compare(name, i, s),
         _ => lanes(arch, name, i, s),
@@ -369,25 +372,35 @@ fn vopd(arch: Arch, x: &str, y: &str, split: usize, i: &Inst, s: &mut State) -> 
     }
     Ok(())
 }
-
-/// VOP3 carry add: read all source lanes and the incoming mask before either destination is written.
-/// Inactive lanes retain their VGPR and contribute zero bits to the outgoing wave32 carry mask.
+/// VOP2/VOP3 carry add: read all source lanes and the incoming mask before either destination is written.
+/// Inactive lanes retain their VGPR and contribute zero bits to the outgoing wave32 carry mask. The VOP2 `_e32`
+/// carry-in form (`v_add_co_ci_u32_e32 vdst, vcc_lo, src0, vsrc1, vcc_lo`) decodes to three operands and carries
+/// through VCC implicitly; the VOP3 forms name the carry-out (`sdst`) and carry-in (`ssrc2`) masks explicitly.
 fn add_carry(name: &str, i: &Inst, s: &mut State) -> Result<()> {
     plain(i)?;
     if i.mods.dpp.is_some() || i.mods.sdwa.is_some() || i.mods.op_sel != 0 {
         return Err(format!("{name}: DPP/SDWA/op_sel is not modeled"));
     }
     let o = &i.operands;
-    let has_cin = name == "v_add_co_ci_u32_e64";
-    if o.len() != if has_cin { 5 } else { 4 } {
+    let has_cin = name != "v_add_co_u32";
+    // Operand layouts: [vdst, sdst, s0, s1(, ssrc2)] (VOP3) or [vdst, s0, s1] with VCC in and out (VOP2).
+    let implicit_vcc = has_cin && o.len() == 3;
+    if !implicit_vcc && o.len() != if has_cin { 5 } else { 4 } {
         return Err(format!("{name}: missing or extra carry operand"));
     }
-    let cin = if has_cin { s.read(&o[4], 0, 0)? } else { 0 };
+    let (a_idx, b_idx) = if implicit_vcc { (1, 2) } else { (2, 3) };
+    let cin = if !has_cin {
+        0
+    } else if implicit_vcc {
+        s.vcc
+    } else {
+        s.read(&o[4], 0, 0)?
+    };
     let mut out = [0u32; 32];
     let mut carry = 0u32;
     for lane in active(s) {
-        let sum = u64::from(s.read(&o[2], lane, 0)?)
-            + u64::from(s.read(&o[3], lane, 0)?)
+        let sum = u64::from(s.read(&o[a_idx], lane, 0)?)
+            + u64::from(s.read(&o[b_idx], lane, 0)?)
             + u64::from(cin >> lane & 1);
         out[lane] = sum as u32;
         carry |= ((sum >> 32) as u32) << lane;
@@ -395,7 +408,12 @@ fn add_carry(name: &str, i: &Inst, s: &mut State) -> Result<()> {
     for lane in active(s) {
         s.put(&o[0], lane, 0, out[lane])?;
     }
-    s.put(&o[1], 0, 0, carry)
+    if implicit_vcc {
+        s.vcc = carry;
+        Ok(())
+    } else {
+        s.put(&o[1], 0, 0, carry)
+    }
 }
 
 fn readfirstlane(i: &Inst, s: &mut State) -> Result<()> {
@@ -883,6 +901,17 @@ fn vector(
             Class::Int,
             (((u64::from(raw(0)?) << 32) | u64::from(raw(1)?)) >> (raw(2)? & 31)) as u32,
         ),
+        // D = ({S0, S1} >> (S2[1:0] * 8))[31:0] (RDNA3 ISA, V_ALIGNBYTE_B32): S0 carries the MSBs, S1 the LSBs. S2 is a
+        // 16-bit operand on gfx11 (OPSEL[2] picks the half of a VGPR); only the unselected-low-half form is modeled.
+        "v_alignbyte_b32" => {
+            if m.op_sel != 0 {
+                return Err("v_alignbyte_b32: OPSEL (16-bit source half select) is not modeled".into());
+            }
+            (
+                Class::Int,
+                (((u64::from(raw(0)?) << 32) | u64::from(raw(1)?)) >> ((raw(2)? & 3) * 8)) as u32,
+            )
+        }
         "v_bfe_u32" => {
             let width = raw(2)? & 31;
             (
@@ -1143,9 +1172,10 @@ fn vector(
             }
         }
         // Packed f16 (VOP3P): result half `h` takes each source's half chosen by `op_sel` (low result)
-        // or `op_sel_hi` (high result); `v_pk_add_f16` is the fused `a * 1 + b`, so both are one
-        // correctly rounded (nearest even, denormals kept) operation. Finite operands only.
-        "v_pk_fma_f16" | "v_pk_add_f16" => {
+        // or `op_sel_hi` (high result); `v_pk_add_f16` is the fused `a * 1 + b` and `v_pk_mul_f16` the fused
+        // `a * b + (-0)` (the -0 addend keeps the sign of a zero product), so every result is one correctly rounded
+        // (nearest even, denormals kept) operation. Finite operands only.
+        "v_pk_fma_f16" | "v_pk_add_f16" | "v_pk_mul_f16" => {
             if m.neg_lo != 0
                 || m.neg_hi != 0
                 || m.neg != 0
@@ -1155,12 +1185,12 @@ fn vector(
             {
                 return Err(format!("{name}: neg/abs/clamp/omod are not modeled"));
             }
-            let fma = stem(name) == "v_pk_fma_f16";
+            let kind = stem(name);
             let mut half = [0u16; 2];
             for (h, slot) in half.iter_mut().enumerate() {
                 let sel = if h == 0 { m.op_sel } else { m.op_sel_hi };
                 let mut w = [0u32; 3];
-                for (n, wn) in w.iter_mut().enumerate().take(if fma { 3 } else { 2 }) {
+                for (n, wn) in w.iter_mut().enumerate().take(if kind == "v_pk_fma_f16" { 3 } else { 2 }) {
                     let word = raw(n)?;
                     let hv = (if sel >> n & 1 != 0 { word >> 16 } else { word }) as u16;
                     if hv & 0x7c00 == 0x7c00 {
@@ -1168,10 +1198,10 @@ fn vector(
                     }
                     *wn = convert::f16_to_f32(hv);
                 }
-                *slot = if fma {
-                    fma_f16(w[0], w[1], w[2])
-                } else {
-                    fma_f16(w[0], 0x3f80_0000, w[1])
+                *slot = match kind {
+                    "v_pk_fma_f16" => fma_f16(w[0], w[1], w[2]),
+                    "v_pk_mul_f16" => fma_f16(w[0], w[1], 0x8000_0000),
+                    _ => fma_f16(w[0], 0x3f80_0000, w[1]),
                 };
             }
             (Class::Own, u32::from(half[0]) | u32::from(half[1]) << 16)
@@ -1373,6 +1403,126 @@ fn vector(
             (Class::Own, u32::from(h))
         }
         "v_or3_b32" => (Class::Int, raw(0)? | raw(1)? | raw(2)?),
+        // D = the 32 bits of S0 in reverse order (RDNA3 ISA V_BFREV_B32; no input/output modifiers).
+        "v_bfrev_b32" => (Class::Int, raw(0)?.reverse_bits()),
+        "v_not_b32" => (Class::Int, !raw(0)?),
+        // D.i = index of the first 1 bit counting from the MSB, -1 if S0 == 0 (V_CLZ_I32_U32).
+        "v_clz_i32_u32" => {
+            let x = raw(0)?;
+            (Class::Int, if x == 0 { u32::MAX } else { x.leading_zeros() })
+        }
+        "v_xor3_b32" => (Class::Int, raw(0)? ^ raw(1)? ^ raw(2)?),
+        // D = S1 + popcount(S0), wrapping (V_BCNT_U32_B32).
+        "v_bcnt_u32_b32" => (Class::Int, raw(1)?.wrapping_add(raw(0)?.count_ones())),
+        "v_min3_i32" => (
+            Class::Int,
+            (raw(0)? as i32).min(raw(1)? as i32).min(raw(2)? as i32) as u32,
+        ),
+        // The ISA pseudocode: if max3(S0,S1,S2) == S0 then max(S1,S2) elif max3 == S1 then max(S0,S2) else max(S0,S1).
+        "v_med3_i32" => {
+            let (a, b, c) = (raw(0)? as i32, raw(1)? as i32, raw(2)? as i32);
+            let max3 = a.max(b).max(c);
+            (
+                Class::Int,
+                (if max3 == a {
+                    b.max(c)
+                } else if max3 == b {
+                    a.max(c)
+                } else {
+                    a.max(b)
+                }) as u32,
+            )
+        }
+        // Median of three: the ISA pseudocode's max3/max chain. A NaN operand (the pseudocode returns min3 for it, whose NaN
+        // rule is not measured) and a median zero whose operand zeros differ in sign (max of +0 and -0 is not specified)
+        // are errors.
+        "v_med3_f32" => {
+            let (a, b, c) = (fnum(0)?, fnum(1)?, fnum(2)?);
+            let max3 = a.max(b).max(c);
+            let r = if max3 == a {
+                b.max(c)
+            } else if max3 == b {
+                a.max(c)
+            } else {
+                a.max(b)
+            };
+            let zeros: Vec<bool> = [a, b, c].iter().filter(|x| **x == 0.0).map(|x| x.is_sign_negative()).collect();
+            if zeros.iter().any(|z| *z != zeros[0]) {
+                return Err("v_med3_f32: operand zeros of both signs: the sign of the median zero is not specified".into());
+            }
+            (Class::F32, r.to_bits())
+        }
+        // D.f = trunc(S0.f) (round toward zero, IEEE roundToIntegralTowardZero: a zero result keeps the input sign).
+        // A NaN operand is an error (propagation is not measured).
+        "v_trunc_f32" => (Class::F32, fnum(0)?.trunc().to_bits()),
+        // ISA: D = trunc(S0); if S0 < 0 && S0 != D then D += -1.0: the floor.
+        "v_floor_f32" => (Class::F32, fnum(0)?.floor().to_bits()),
+        // D.i = exponent(S0.f) - 127 + 1 with `exponent` the biased exponent field, so S0 = significand * 2**D with the
+        // significand in [0.5, 1); D = 0 for +-infinity and NaN (ISA pseudocode). A zero or denormal input has no
+        // biased-exponent meaning the pseudocode agrees with C frexp() on: refused.
+        "v_frexp_exp_i32_f32" => {
+            let x = f(0)?;
+            let e = (x >> 23) & 0xff;
+            if e == 0 {
+                return Err("v_frexp_exp_i32_f32: zero/denormal input is not modeled (pseudocode and frexp() disagree)".into());
+            }
+            (Class::FloatToInt, if e == 0xff { 0 } else { (e as i32 - 126) as u32 })
+        }
+        // D.f = S0.f for +-infinity (a NaN is refused: payload/quieting not specified), else the significand
+        // mantissa(S0.f) in [0.5, 1) with the input sign: exponent field forced to 126. Zero/denormal refused as above.
+        "v_frexp_mant_f32" => {
+            let x = f(0)?;
+            let e = (x >> 23) & 0xff;
+            let v = if e == 0xff {
+                if x & 0x7f_ffff != 0 {
+                    return Err(NAN_IN.into());
+                }
+                x
+            } else if e == 0 {
+                return Err("v_frexp_mant_f32: zero/denormal input is not modeled (pseudocode and frexp() disagree)".into());
+            } else {
+                (x & 0x807f_ffff) | (126 << 23)
+            };
+            (Class::F32, v)
+        }
+        // D.u16 = S1.u16 << S0[3:0] (RDNA3 ISA V_LSHLREV_B16; true16: the other destination half is preserved).
+        "v_lshlrev_b16" => {
+            half_dst(o)?;
+            plain_16(i, d, false)?;
+            let count = half_src(s, o.get(1).ok_or("missing vector operand")?, i, lane, 0)? & 15;
+            let x = half_src(s, o.get(2).ok_or("missing vector operand")?, i, lane, 1)?;
+            (Class::Own, u32::from(x << count))
+        }
+        // D.u16 = S0.u16 | S1.u16 (no input/output modifiers).
+        "v_or_b16" => {
+            half_dst(o)?;
+            plain_16(i, d, false)?;
+            let a = half_src(s, o.get(1).ok_or("missing vector operand")?, i, lane, 0)?;
+            let b = half_src(s, o.get(2).ok_or("missing vector operand")?, i, lane, 1)?;
+            (Class::Own, u32::from(a | b))
+        }
+        // D.u16 = VCC[lane] ? S1.u16 : S0.u16; VOP3 names the mask in S2. Float modifiers are refused.
+        "v_cndmask_b16" => {
+            half_dst(o)?;
+            plain_16(i, d, false)?;
+            let mask = s.read(o.get(3).ok_or("missing vector operand")?, lane, 0)?;
+            let pick = if mask >> lane & 1 != 0 { 2 } else { 1 };
+            (Class::Own, u32::from(half_src(s, &o[pick], i, lane, pick - 1)?))
+        }
+        // D = VGPR[lane][SRC0 + M0] (RDNA3 ISA V_MOVRELS_B32): SRC0 names a VGPR, M0 is the relative offset.
+        "v_movrels_b32" => {
+            let Some(Operand::Reg(r)) = o.get(1) else {
+                return Err("v_movrels_b32: SRC0 must be a VGPR".into());
+            };
+            if r.kind != crate::reg::Kind::V {
+                return Err("v_movrels_b32: SRC0 must be a VGPR".into());
+            }
+            let idx = u64::from(r.base) + u64::from(s.m0);
+            if idx >= 256 {
+                return Err(format!("v_movrels_b32: v{idx} is outside the VGPR file"));
+            }
+            (Class::Int, s.v[idx as usize][lane])
+        }
         // D.i32 = S0.i24 * S1.i24 (low 32 bits of the product).
         "v_mul_i32_i24" => {
             let sext = |x: u32| ((x << 8) as i32) >> 8;
@@ -2134,6 +2284,23 @@ fn scalar(name: &str, i: &Inst, s: &mut State) -> Result<()> {
         s.scc = value != 0;
         return Ok(());
     }
+    // SOP2: D.u64 = S0.u64 >> S1[5:0] (logical); SCC reports a nonzero 64-bit result.
+    if name == "s_lshr_b64" {
+        let a = s.read_wide(o.get(1).ok_or("missing scalar operand")?, 0, Wide::Unsigned)?;
+        let value = a >> (rd(s, 2)? & 63);
+        s.put_wide(o.first().ok_or("missing scalar operand")?, 0, value)?;
+        s.scc = value != 0;
+        return Ok(());
+    }
+    // SOP2: D.u64 = S0.u64 ^ S1.u64; SCC = D != 0. Both pairs are read before the destination is written.
+    if name == "s_xor_b64" {
+        let a = s.read_wide(o.get(1).ok_or("missing scalar operand")?, 0, Wide::Unsigned)?;
+        let b = s.read_wide(o.get(2).ok_or("missing scalar operand")?, 0, Wide::Unsigned)?;
+        let value = a ^ b;
+        s.put_wide(o.first().ok_or("missing scalar operand")?, 0, value)?;
+        s.scc = value != 0;
+        return Ok(());
+    }
     // gfx11 `s_and_not1_saveexec_b32` (= `s_andn2_saveexec_b32`): D = EXEC; EXEC = S0 & ~EXEC; SCC = EXEC != 0.
     if name == "s_and_not1_saveexec_b32" {
         let mask = rd(s, 1)?;
@@ -2150,6 +2317,15 @@ fn scalar(name: &str, i: &Inst, s: &mut State) -> Result<()> {
         let old = s.exec;
         s.put(o.first().ok_or("missing scalar operand")?, 0, 0, old)?;
         s.exec = old & mask;
+        s.scc = s.exec != 0;
+        return Ok(());
+    }
+    // Save the old wave32 EXEC, then EXEC = S0 | EXEC and SCC = EXEC != 0 (RDNA3 ISA S_OR_SAVEEXEC_B32).
+    if name == "s_or_saveexec_b32" {
+        let mask = rd(s, 1)?;
+        let old = s.exec;
+        s.put(o.first().ok_or("missing scalar operand")?, 0, 0, old)?;
+        s.exec = mask | old;
         s.scc = s.exec != 0;
         return Ok(());
     }
@@ -2356,6 +2532,7 @@ mod tests {
             ended: false,
             barrier: None,
             signals: 0,
+            scratch: Vec::new(),
         }
     }
     fn reg(kind: Kind, base: u16, len: u8) -> Operand {

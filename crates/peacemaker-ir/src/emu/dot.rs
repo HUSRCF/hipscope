@@ -196,6 +196,7 @@ mod tests {
             ended: false,
             barrier: None,
             signals: 0,
+            scratch: Vec::new(),
         };
         (st.v[1][0], st.v[2][0], st.v[3][0]) = (s0, s1, c);
         st.v[0][1] = 0x1234; // inactive lane keeps its destination
@@ -330,6 +331,7 @@ mod tests {
             ended: false,
             barrier: None,
             signals: 0,
+            scratch: Vec::new(),
         };
         (st.v[1][0], st.v[2][0], st.v[3][0]) = (s0, s1, c);
         execute(arch, name, &i, &mut st).map(|_| st.v[0][0])

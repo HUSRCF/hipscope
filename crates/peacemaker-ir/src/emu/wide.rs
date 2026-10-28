@@ -36,6 +36,8 @@ pub(super) fn handles(name: &str) -> bool {
             | "v_lshlrev_b64"
             | "v_subrev_co_u32"
             | "v_sub_co_ci_u32"
+            | "v_sub_co_u32"
+            | "v_subrev_co_ci_u32"
             | "v_mad_u64_u32"
             | "v_mad_i64_i32"
     )
@@ -93,7 +95,8 @@ pub(super) fn execute(_arch: Arch, name: &str, i: &Inst, s: &mut State) -> Resul
     let bit = |n: u8, k: u8| n >> k & 1 != 0;
     let mut vals = [0u64; 32];
     let mut carry = 0u32;
-    let explicit_carry = matches!(op, "v_sub_co_ci_u32") && o.len() >= 5 || op == "v_subrev_co_u32";
+    let explicit_carry = matches!(op, "v_sub_co_ci_u32" | "v_subrev_co_ci_u32") && o.len() >= 5
+        || matches!(op, "v_subrev_co_u32" | "v_sub_co_u32");
     let sdst_null = matches!(o.get(1), Some(Operand::Special(Special::Null)));
     if op == "v_mad_i64_i32" && !sdst_null {
         return Err(format!(
@@ -204,6 +207,27 @@ pub(super) fn execute(_arch: Arch, name: &str, i: &Inst, s: &mut State) -> Resul
                 carry |= u32::from(a > b) << lane;
                 u64::from(b.wrapping_sub(a))
             }
+            // tmp = S0 - S1; carry-out = S1 > S0 (unsigned borrow); VOP3, the carry-out lands in SDST.
+            "v_sub_co_u32" => {
+                let (a, b) = (s.read(src(2)?, lane, 0)?, s.read(src(3)?, lane, 0)?);
+                carry |= u32::from(b > a) << lane;
+                u64::from(a.wrapping_sub(b))
+            }
+            // tmp = S1 - S0 - carry_in; carry-out = S0 + carry_in > S1 (unsigned borrow). The RDNA3 pseudocode prints the
+            // `v_sub_co_ci_u32` carry formula (S1 + carry_in > S0) under this opcode too; the borrow of S1 - S0 - carry_in is
+            // S0 + carry_in > S1, which is what the RDNA4 pseudocode states.
+            "v_subrev_co_ci_u32" => {
+                let (a_idx, b_idx) = if o.len() >= 5 { (2, 3) } else { (1, 2) };
+                let (a, b) = (s.read(src(a_idx)?, lane, 0)?, s.read(src(b_idx)?, lane, 0)?);
+                let cin = if o.len() >= 5 {
+                    s.read(src(4)?, 0, 0)?
+                } else {
+                    s.vcc
+                } >> lane
+                    & 1;
+                carry |= u32::from(u64::from(a) + u64::from(cin) > u64::from(b)) << lane;
+                u64::from(b.wrapping_sub(a).wrapping_sub(cin))
+            }
             // tmp = S0 - S1 - carry_in; carry-out = S1 + carry_in > S0 (unsigned).
             "v_sub_co_ci_u32" => {
                 let (a_idx, b_idx) = if o.len() >= 5 { (2, 3) } else { (1, 2) };
@@ -242,8 +266,10 @@ pub(super) fn execute(_arch: Arch, name: &str, i: &Inst, s: &mut State) -> Resul
         }
     }
     match op {
-        "v_subrev_co_u32" | "v_sub_co_ci_u32" if explicit_carry => s.put(src(1)?, 0, 0, carry)?,
-        "v_sub_co_ci_u32" => s.vcc = carry,
+        "v_subrev_co_u32" | "v_sub_co_u32" | "v_sub_co_ci_u32" | "v_subrev_co_ci_u32" if explicit_carry => {
+            s.put(src(1)?, 0, 0, carry)?
+        }
+        "v_sub_co_ci_u32" | "v_subrev_co_ci_u32" => s.vcc = carry,
         "v_mad_u64_u32" if !sdst_null => s.put(src(1)?, 0, 0, carry)?,
         _ => {}
     }
