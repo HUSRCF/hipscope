@@ -88,12 +88,17 @@ pub const S1_PRIMITIVE_TILE_ROWS: usize = 512;
 pub const S1_WINDOW_TILES: usize = 22;
 pub const S1_WINDOW_ROWS: usize = S1_WINDOW_TILES * S1_PRODUCT_TILE_ROWS;
 
-/// Device slack an [`admit_grown`] window never takes: the session cache's
-/// discretionary device snapshot budget
-/// ([`SlowlinkProfile::device_snapshot_budget_bytes`]) keeps at least this
-/// much (about seven 34 MB boundary stages), so window growth never starves
-/// the cache's device-side snapshots down to host-only.
-pub const S1_GROWN_SNAPSHOT_RESERVE_BYTES: u64 = 256 << 20;
+/// Device memory an [`admit_grown`] profile leaves free beyond every charge,
+/// the 512 MiB safety margin and its own
+/// [`SlowlinkProfile::device_snapshot_budget_bytes`]: the quote it is judged on
+/// is the actual free minus this, so the session cache's device snapshots
+/// never reach it either. A grown load therefore never leaves less than this
+/// (plus the margin) free after placement.
+pub const S1_GROWN_FREE_HOLD_BYTES: u64 = 1 << 30;
+
+/// Prompt rows one window should hold when [`admit_grown`] may trade a
+/// resident layer for it: the framed 32K depth prompt (32,780 rows).
+pub const S1_ONE_WINDOW_PROMPT_ROWS: usize = 32_780;
 
 /// Most whole tiles an [`admit_grown`] window ever holds (49,152 rows at the
 /// 768-row product tile). The window's HC-stream elements stay at about
@@ -1602,7 +1607,9 @@ pub struct SlowlinkProfile {
     pub arena: PromptArenaLayout,
     pub census: SlowlinkCensus,
     /// Layers the charged placement keeps resident: the largest count that
-    /// fits ([`PlacementBudget::largest_fitting_layers`]), possibly zero,
+    /// fits ([`PlacementBudget::largest_fitting_layers`]) of the quote it was
+    /// admitted on (the actual free memory, or for an [`admit_grown`] profile
+    /// that actual free less [`S1_GROWN_FREE_HOLD_BYTES`]), possibly zero,
     /// possibly above [`S1_PREFERRED_RESIDENT_LAYERS`]; always below the trunk
     /// layer count (a fully resident load takes the incumbent).
     pub resident_layers: usize,
@@ -1940,22 +1947,34 @@ pub fn admit(inputs: &AdmissionInputs) -> Result<SlowlinkProfile, SlowlinkDeclin
     admit_at_tile(inputs, purpose_tile_rows(inputs.purpose))
 }
 
-/// [`admit`] with the window grown from the actual free device bytes.
+/// [`admit`] with the window grown from the actual free device bytes, never
+/// leaving less than [`S1_GROWN_FREE_HOLD_BYTES`] of device memory free.
 ///
 /// The base profile is the ordinary admission at `inputs.window_rows` (the
-/// [`S1_WINDOW_ROWS`] floor): its refusals are returned unchanged and the
-/// resident layer count it keeps is final. The window is then raised by whole
-/// tiles, up to `max_seq` rounded UP to a tile (a prompt that fits is one
-/// window, never more rows than the context can hold), to the largest size
-/// that still (1) admits through the same [`project_at_tile`] quote, i.e. never
-/// exceeds the budget, (2) keeps exactly the base resident layer count, and
-/// (3) leaves at least [`S1_GROWN_SNAPSHOT_RESERVE_BYTES`] of discretionary
-/// slack. Every term is the same pure census the base used, so charge ==
-/// allocation; the HC-stream arena, route storage, A4 sidecars and scatter
-/// all scale with the window and are re-derived, while
-/// [`S1_F32_STREAM_ROWS`], the boundary snapshot cap and the checkpoint stride
-/// are window independent. Bigger windows never refuse a load: if nothing
-/// above the floor fits, the base profile is returned.
+/// [`S1_WINDOW_ROWS`] floor) on the real free memory: its refusals are
+/// returned unchanged. Growth is then judged on a quote that holds
+/// [`S1_GROWN_FREE_HOLD_BYTES`] back from the actual free bytes, so a grown
+/// profile leaves that much free beyond every charge, the 512 MiB safety
+/// margin and its own [`SlowlinkProfile::device_snapshot_budget_bytes`]. The
+/// held-back quote is the
+/// profile's placement quote, so it is internally consistent (its resident
+/// count is the largest that fits that quote) and the loader places exactly
+/// that count; the cache's device snapshot budget never reaches the hold.
+///
+/// 1. Keep the base resident layer count and raise the window by whole tiles,
+///    up to `max_seq` rounded UP to a tile (never more rows than the context
+///    holds) and [`S1_GROWN_WINDOW_MAX_TILES`], to the largest size that
+///    still admits on the held-back quote with that count.
+/// 2. If that cannot hold a [`S1_ONE_WINDOW_PROMPT_ROWS`]-row prompt (or the
+///    whole context when shorter) in ONE window, trade exactly one resident
+///    layer (its bytes become window and free memory) for a window of exactly
+///    that many tiles, when the held-back quote admits it with `layers - 1`.
+///    More than one layer is never traded.
+///
+/// Every term is the same pure census the base used, so charge ==
+/// allocation; [`S1_F32_STREAM_ROWS`], the boundary snapshot cap and the
+/// checkpoint stride are window independent. Growth never refuses a load: if
+/// nothing above the floor fits, the base profile is returned.
 pub fn admit_grown(
     inputs: &AdmissionInputs,
     max_seq: usize,
@@ -1972,29 +1991,48 @@ pub fn admit_grown(
     if base.window_rows % tile != 0 || ceiling_tiles <= floor_tiles {
         return Ok(base);
     }
-    let fits = |tiles: usize| -> Option<SlowlinkProfile> {
-        let grown = AdmissionInputs {
-            window_rows: tiles * tile,
-            ..*inputs
-        };
-        admit(&grown).ok().filter(|profile| {
-            profile.resident_layers == base.resident_layers
-                && profile.device_snapshot_budget_bytes >= S1_GROWN_SNAPSHOT_RESERVE_BYTES
-        })
+    let held = |tiles: usize| AdmissionInputs {
+        window_rows: tiles * tile,
+        memory: AdmissionMemory {
+            pre_init_free_bytes: inputs
+                .memory
+                .pre_init_free_bytes
+                .map(|free| free.saturating_sub(S1_GROWN_FREE_HOLD_BYTES)),
+            free_bytes: inputs
+                .memory
+                .free_bytes
+                .saturating_sub(S1_GROWN_FREE_HOLD_BYTES),
+        },
+        ..*inputs
+    };
+    let fits = |tiles: usize, layers: usize| -> Option<SlowlinkProfile> {
+        admit(&held(tiles))
+            .ok()
+            .filter(|profile| profile.resident_layers == layers)
     };
     // Slack only falls as the window grows, so "fits" is monotone in tiles.
     let (mut lo, mut hi, mut best) = (floor_tiles, ceiling_tiles, None);
     while lo < hi {
         let mid = lo + (hi - lo).div_ceil(2);
-        match fits(mid) {
+        match fits(mid, base.resident_layers) {
             Some(profile) => {
-                best = Some(profile);
+                best = Some((mid, profile));
                 lo = mid;
             }
             None => hi = mid - 1,
         }
     }
-    Ok(best.unwrap_or(base))
+    let one_window_tiles = S1_ONE_WINDOW_PROMPT_ROWS.div_ceil(tile).min(ceiling_tiles);
+    if best.as_ref().map_or(floor_tiles, |(tiles, _)| *tiles) < one_window_tiles {
+        if let Some(traded) = base
+            .resident_layers
+            .checked_sub(1)
+            .and_then(|layers| fits(one_window_tiles, layers))
+        {
+            return Ok(traded);
+        }
+    }
+    Ok(best.map_or(base, |(_, profile)| profile))
 }
 
 /// [`admit`] at an explicit legal tile ([`legal_tile_rungs`]) through the same
@@ -2370,7 +2408,21 @@ pub fn select_profile(
         Err(decline) => decline,
         Ok(()) => match link_verdict(link())
             .and_then(inputs)
-            .and_then(|inputs| admit_grown(&inputs, shape.max_seq))
+            .and_then(|inputs| {
+                let floor_rows = inputs.window_rows;
+                let floor_layers = admit(&inputs).map(|profile| profile.resident_layers);
+                admit_grown(&inputs, shape.max_seq).inspect(|profile| {
+                    if profile.window_rows != floor_rows {
+                        eprintln!(
+                            "  qwen4 S1 window grown {floor_rows} -> {} rows, {} resident layers (floor admission {}), quote holds back {} MiB of the actual free device memory",
+                            profile.window_rows,
+                            profile.resident_layers,
+                            floor_layers.map_or("n/a".to_string(), |layers| layers.to_string()),
+                            S1_GROWN_FREE_HOLD_BYTES >> 20,
+                        );
+                    }
+                })
+            })
             .and_then(|profile| match explicit_chunk_rows(shape.chunk_rows_env) {
                 Some(rows) if rows != profile.tile_rows => Err(SlowlinkDecline::ExplicitChunk {
                     rows,
@@ -5299,45 +5351,60 @@ mod tests {
         .collect()
     }
 
-    /// The window follows the actual free bytes: the largest whole-tile window
-    /// that keeps the admitted resident layers and the snapshot slack, never
-    /// over budget, never beyond the context.
+    /// The real-memory slack of a grown profile (its quote holds
+    /// [`S1_GROWN_FREE_HOLD_BYTES`] back from `real`).
+    fn real_slack(profile: &SlowlinkProfile, real: AdmissionMemory) -> u64 {
+        let budget = PlacementBudget {
+            memory: real,
+            ..profile.placement
+        };
+        u64::try_from(budget.slack_bytes_at(profile.resident_layers)).unwrap()
+    }
+
+    /// The window follows the actual free bytes and never leaves less than
+    /// [`S1_GROWN_FREE_HOLD_BYTES`] (plus the snapshot slack) free: the AR-loaded
+    /// load (6 resident, 1,080 MiB slack) cannot hold the 32K prompt in one
+    /// window beside that hold, so it trades exactly one layer; the MTP-loaded
+    /// load (5 resident, 442 MiB) cannot afford even that trade and keeps the
+    /// floor; spare memory grows the window with every layer kept.
     #[test]
     fn slowlink_admission_grown_window_tracks_free_vram() {
         let tile = S1_PRODUCT_TILE_ROWS;
-        for (label, layers, slack, tiles) in [
-            ("AR-loaded", 6u64, AR_SLACK_AT_22_TILES, 44usize),
-            ("MTP-loaded", 5, MTP_SLACK_AT_22_TILES, 27),
+        let one_window = S1_ONE_WINDOW_PROMPT_ROWS.div_ceil(tile);
+        assert_eq!(one_window, 43);
+        // (label, resident layers, slack at 22 tiles, expected layers, expected tiles)
+        for (label, layers, slack, kept, tiles) in [
+            ("AR-loaded", 6u64, AR_SLACK_AT_22_TILES, 5usize, 43usize),
+            ("MTP-loaded", 5, MTP_SLACK_AT_22_TILES, 5, 22),
+            ("1.2 GiB slack", 6, 1_200 * MIB, 5, 43),
         ] {
             let inputs = grown_inputs(layers, slack);
             let floor = admit(&inputs).unwrap();
             assert_eq!(floor.window_rows, S1_WINDOW_ROWS, "{label}");
+            assert_eq!(floor.resident_layers, layers as usize, "{label}");
             assert_eq!(floor.device_snapshot_budget_bytes, slack, "{label}");
             let grown = admit_grown(&inputs, FN_MAX_SEQ).unwrap();
-            assert_eq!(
-                grown.resident_layers, layers as usize,
-                "{label}: no layer lost"
-            );
+            assert_eq!(grown.resident_layers, kept, "{label}");
             assert_eq!(grown.window_rows, tiles * tile, "{label}");
-            // Budget: the quote that admitted it, snapshot slack kept.
-            assert!(
-                grown.device_snapshot_budget_bytes >= S1_GROWN_SNAPSHOT_RESERVE_BYTES,
+            if tiles * tile == S1_WINDOW_ROWS {
+                assert_eq!(grown, floor, "{label}: nothing fits above the floor");
+                continue;
+            }
+            // The hold: free beyond every charge, the margin and the snapshot slack.
+            let real = real_slack(&grown, inputs.memory);
+            assert_eq!(
+                real,
+                grown.device_snapshot_budget_bytes + S1_GROWN_FREE_HOLD_BYTES,
                 "{label}"
             );
             assert!(
-                grown.reserve_bytes().unwrap() - floor.reserve_bytes().unwrap()
-                    <= floor.device_snapshot_budget_bytes - S1_GROWN_SNAPSHOT_RESERVE_BYTES,
-                "{label}: the growth fits the discretionary slack"
+                real >= S1_GROWN_FREE_HOLD_BYTES,
+                "{label}: 1 GiB stays free"
             );
-            // Maximal: one more tile loses a layer or the snapshot reserve.
-            let more = admit(&AdmissionInputs {
-                window_rows: grown.window_rows + tile,
-                ..inputs
-            })
-            .unwrap();
-            assert!(
-                more.resident_layers < grown.resident_layers
-                    || more.device_snapshot_budget_bytes < S1_GROWN_SNAPSHOT_RESERVE_BYTES,
+            // Largest layer count of that quote, maximal window for it.
+            assert_eq!(
+                grown.placement.largest_fitting_layers(),
+                Some(grown.resident_layers),
                 "{label}"
             );
             // Every window-scaled term is the grown window's, charge == allocation.
@@ -5350,41 +5417,53 @@ mod tests {
         }
     }
 
-    /// Growth never refuses and never moves what the base admission decided.
+    /// Growth never refuses, trades at most one layer, and only to hold a 32K
+    /// prompt in one window.
     #[test]
     fn slowlink_admission_grown_window_never_exceeds_the_budget() {
         let tile = S1_PRODUCT_TILE_ROWS;
+        let one_window = S1_ONE_WINDOW_PROMPT_ROWS.div_ceil(tile);
         for layers in [2u64, 6, 9] {
-            let mut previous = S1_WINDOW_ROWS;
             for slack_mib in [
-                0u64, 1, 200, 256, 300, 442, 700, 1_080, 1_500, 4_000, 40_000,
+                0u64, 1, 200, 256, 300, 442, 700, 1_080, 1_279, 1_500, 4_000, 40_000,
             ] {
                 let inputs = grown_inputs(layers, slack_mib * MIB);
                 let floor = admit(&inputs).unwrap();
                 let grown = admit_grown(&inputs, FN_MAX_SEQ).unwrap();
-                assert_eq!(grown.resident_layers, floor.resident_layers);
+                assert!(
+                    grown.resident_layers == floor.resident_layers
+                        || grown.resident_layers + 1 == floor.resident_layers,
+                    "at most one layer traded"
+                );
                 assert!(grown.window_rows >= S1_WINDOW_ROWS);
                 assert_eq!(grown.window_rows % tile, 0);
                 assert!(grown.window_rows <= S1_GROWN_WINDOW_MAX_TILES * tile);
-                // More than a layer of slack buys a layer instead: monotone
-                // only while the resident count is the one under test.
-                if floor.resident_layers == layers as usize {
-                    assert!(grown.window_rows >= previous, "monotone in free memory");
-                    previous = grown.window_rows;
-                }
-                // Admission itself proves the quote fits: re-admitting the
-                // grown window on the same free bytes agrees.
-                let again = admit(&AdmissionInputs {
-                    window_rows: grown.window_rows,
-                    ..inputs
-                })
-                .unwrap();
-                assert_eq!(again, grown);
-                if grown.window_rows > S1_WINDOW_ROWS {
-                    assert!(grown.device_snapshot_budget_bytes >= S1_GROWN_SNAPSHOT_RESERVE_BYTES);
-                } else {
+                if grown.window_rows == S1_WINDOW_ROWS {
                     assert_eq!(grown, floor, "no room: the floor profile exactly");
+                    continue;
                 }
+                if grown.resident_layers < floor.resident_layers {
+                    assert_eq!(
+                        grown.window_rows,
+                        one_window * tile,
+                        "trade only for one window"
+                    );
+                }
+                // Never over budget: the real quote keeps the hold and the snapshot slack.
+                let real = real_slack(&grown, inputs.memory);
+                assert!(
+                    real >= S1_GROWN_FREE_HOLD_BYTES,
+                    "{layers} layers {slack_mib} MiB"
+                );
+                // The held-back quote is the profile's own admission.
+                let held = AdmissionInputs {
+                    window_rows: grown.window_rows,
+                    memory: AdmissionMemory::actual(
+                        inputs.memory.free_bytes - S1_GROWN_FREE_HOLD_BYTES,
+                    ),
+                    ..inputs
+                };
+                assert_eq!(admit(&held).unwrap(), grown);
             }
         }
         // A context shorter than the floor window, or one that fits it, is not grown.
@@ -5399,22 +5478,28 @@ mod tests {
                 S1_WINDOW_ROWS.min(max_seq)
             );
         }
-        // A prompt that fits is one window: capped by the context rounded up to a tile.
-        let inputs = grown_inputs(6, AR_SLACK_AT_22_TILES);
+        // A prompt that fits is one window: the context rounded up to a tile, the
+        // layer trade included (1,080 MiB slack alone cannot hold the hold + window).
+        let rows = 20_000usize.div_ceil(tile) * tile;
+        let grown = admit_grown(&inputs, 20_000).unwrap();
+        assert_eq!((grown.window_rows, grown.resident_layers), (rows, 5));
+        // 1,270 MiB of slack leaves 246 MiB past the hold: six more tiles (28 > 27),
+        // so the 20,000-row context takes its one window with every layer kept...
+        let roomy = grown_inputs(6, 1_270 * MIB);
+        let grown = admit_grown(&roomy, 20_000).unwrap();
+        assert_eq!((grown.window_rows, grown.resident_layers), (rows, 6));
+        // ...and a 25,000-row context (33 tiles) is beyond those six, so it trades.
+        let grown = admit_grown(&roomy, 25_000).unwrap();
         assert_eq!(
-            admit_grown(&inputs, 20_000).unwrap().window_rows,
-            20_000usize.div_ceil(tile) * tile
+            (grown.window_rows, grown.resident_layers),
+            (25_000usize.div_ceil(tile) * tile, 5)
         );
         // A refusal of the base admission stays the base refusal.
-        let none = inputs_with_free(GIB);
+        let none = product_window_inputs(GIB);
         assert_eq!(
             admit_grown(&none, FN_MAX_SEQ).map(|_| ()),
             admit(&none).map(|_| ())
         );
-    }
-
-    fn inputs_with_free(free: u64) -> AdmissionInputs {
-        product_window_inputs(free)
     }
 
     /// Window and sweep counts (every window is one expert sweep) of the REAL
@@ -5425,12 +5510,22 @@ mod tests {
         let ar = admit_grown(&grown_inputs(6, AR_SLACK_AT_22_TILES), FN_MAX_SEQ).unwrap();
         let mtp = admit_grown(&grown_inputs(5, MTP_SLACK_AT_22_TILES), FN_MAX_SEQ).unwrap();
         let floor = admit(&grown_inputs(6, AR_SLACK_AT_22_TILES)).unwrap();
-        assert_eq!((ar.window_rows, mtp.window_rows), (33_792, 20_736));
+        assert_eq!(
+            (
+                ar.window_rows,
+                ar.resident_layers,
+                mtp.window_rows,
+                mtp.resident_layers
+            ),
+            (33_024, 5, S1_WINDOW_ROWS, 5)
+        );
+        // 32,780 rows fit one 43-tile (33,024-row) window; the MTP-loaded load
+        // cannot afford the layer trade, so it keeps the 22-tile floor.
         for (rows, ar_sweeps, mtp_sweeps, floor_sweeps) in [
             (8_204usize, 1usize, 1usize, 1usize),
             (32_780, 1, 2, 2),
-            (131_084, 4, 7, 8),
-            (250_012, 8, 13, 15),
+            (131_084, 4, 8, 8),
+            (250_012, 8, 15, 15),
         ] {
             for cache in [false, true] {
                 for (label, profile, expect) in [
