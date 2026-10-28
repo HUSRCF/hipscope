@@ -2037,6 +2037,38 @@ pub fn gen_fwht_signs(seed: u32, n: usize) -> Vec<f32> {
         .collect()
 }
 
+/// `hipErrorInvalidValue`: the code for a null device alias that HIP reported as success.
+const HOST_ALIAS_INVALID_CODE: u32 = 1;
+
+/// Resolve the GPU-addressable alias of a freshly `hipHostMalloc`'d mapping, failing closed.
+///
+/// A non-null alias is returned unchanged (it may differ from `host_ptr`). A lookup error or
+/// a null success frees `host_ptr` exactly once through `free_host` and returns an error;
+/// the host pointer is never substituted for the alias, because HIP documents it as invalid
+/// for kernels and the result would read as zeros or garbage rather than fail. A lookup
+/// error keeps its original code, with any cleanup failure appended as context.
+fn resolve_host_mapped_alias(
+    host_ptr: *mut c_void,
+    get_alias: impl FnOnce(*mut c_void) -> HipResult<*mut c_void>,
+    free_host: impl FnOnce(*mut c_void) -> HipResult<()>,
+) -> HipResult<*mut c_void> {
+    let mut error = match get_alias(host_ptr) {
+        Ok(alias) if !alias.is_null() => return Ok(alias),
+        Ok(_) => HipError::new(
+            HOST_ALIAS_INVALID_CODE,
+            "hipHostGetDevicePointer returned a null device alias for a host-mapped allocation",
+        ),
+        Err(error) => error,
+    };
+    if let Err(cleanup) = free_host(host_ptr) {
+        error.message.push_str(&format!(
+            "; additionally hipHostFree of the unaliased host allocation failed: {}",
+            cleanup.message
+        ));
+    }
+    Err(error)
+}
+
 impl Gpu {
     /// Diagnostic: trace multi-slot session continuation matching.
     pub fn slot_trace(&self) -> bool {
@@ -6752,27 +6784,13 @@ impl Gpu {
             })?;
         // The device alias is what kernels are handed; the host pointer is what
         // hipHostFree needs. They coincide on large-BAR boxes but need not.
-        let dev_ptr = match self.hip.host_get_device_pointer(host_ptr, 0) {
-            Ok(p) if !p.is_null() => p,
-            other => {
-                // Loud, once: HIP documents that the mapped device pointer differs
-                // from the host pointer on discrete GPUs and that
-                // `hipHostGetDevicePointer` is *required* to obtain the one a kernel
-                // may dereference (hipHostMallocDefault alone does not map). Falling
-                // back to the host pointer therefore hands kernels a pointer HIP
-                // calls invalid, which reads as zeros or garbage rather than an
-                // error -- indistinguishable from a bad weight downstream.
-                static WARNED: std::sync::Once = std::sync::Once::new();
-                WARNED.call_once(|| {
-                    eprintln!(
-                        "[host-mapped] hipHostGetDevicePointer failed ({other:?}); using the host \
-                         pointer as the device alias -- GPU reads of these bytes are undefined \
-                         (CPU reads via host_bytes stay correct, so the two disagree silently)"
-                    );
-                });
-                host_ptr
-            }
-        };
+        // Fail closed: a missing alias frees the allocation and refuses the load; the
+        // host pointer is never handed to kernels in its place.
+        let dev_ptr = resolve_host_mapped_alias(
+            host_ptr,
+            |host| self.hip.host_get_device_pointer(host, 0),
+            |host| self.hip.host_free(host),
+        )?;
         let key = dev_ptr as usize;
         if self.host_mapped.insert(key, host_ptr as usize).is_some() {
             self.host_mapped.remove(&key);
@@ -10107,6 +10125,81 @@ mod lab_fn_carve_tests {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn host_alias_lookup_error_frees_once_and_propagates_original() {
+        let h = 0x1000 as *mut std::ffi::c_void;
+        let frees = std::cell::Cell::new(0);
+        let err = super::resolve_host_mapped_alias(
+            h,
+            |_| Err(hip_bridge::HipError::new(700, "alias lookup")),
+            |p| {
+                assert_eq!(p, h);
+                frees.set(frees.get() + 1);
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert_eq!(err.code, 700);
+        assert!(err.message.contains("alias lookup"));
+        assert_eq!(frees.get(), 1);
+    }
+
+    #[test]
+    fn host_alias_null_is_explicit_error_never_host_pointer() {
+        let h = 0x1000 as *mut std::ffi::c_void;
+        let frees = std::cell::Cell::new(0);
+        let r = super::resolve_host_mapped_alias(
+            h,
+            |_| Ok(std::ptr::null_mut()),
+            |_| {
+                frees.set(frees.get() + 1);
+                Ok(())
+            },
+        );
+        let err = r.unwrap_err();
+        assert!(err.message.contains("null device alias"));
+        assert_eq!(frees.get(), 1);
+    }
+
+    #[test]
+    fn host_alias_cleanup_failure_keeps_original_cause_and_context() {
+        let h = 0x1000 as *mut std::ffi::c_void;
+        let frees = std::cell::Cell::new(0);
+        let err = super::resolve_host_mapped_alias(
+            h,
+            |_| Err(hip_bridge::HipError::new(700, "alias lookup")),
+            |_| {
+                frees.set(frees.get() + 1);
+                Err(hip_bridge::HipError::new(1, "free refused"))
+            },
+        )
+        .unwrap_err();
+        assert_eq!(err.code, 700);
+        assert!(err.message.contains("alias lookup"));
+        assert!(err.message.contains("hipHostFree"));
+        assert!(err.message.contains("free refused"));
+        assert_eq!(frees.get(), 1);
+    }
+
+    #[test]
+    fn host_alias_distinct_from_host_is_returned_without_cleanup() {
+        let h = 0x1000 as *mut std::ffi::c_void;
+        let a = 0x9000 as *mut std::ffi::c_void;
+        let frees = std::cell::Cell::new(0);
+        let got = super::resolve_host_mapped_alias(
+            h,
+            |_| Ok(a),
+            |_| {
+                frees.set(frees.get() + 1);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(got, a);
+        assert_ne!(got, h);
+        assert_eq!(frees.get(), 0);
+    }
+
     #[cfg(feature = "lab")]
     #[test]
     fn lab_kernel_fault_counts_successes_then_fails_once_and_disarms() {
