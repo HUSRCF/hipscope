@@ -96,7 +96,9 @@ pub(super) fn execute(_arch: Arch, name: &str, i: &Inst, s: &mut State) -> Resul
     let explicit_carry = matches!(op, "v_sub_co_ci_u32") && o.len() >= 5 || op == "v_subrev_co_u32";
     let sdst_null = matches!(o.get(1), Some(Operand::Special(Special::Null)));
     if op == "v_mad_i64_i32" && !sdst_null {
-        return Err(format!("{name}: the signed form's carry/overflow output is not specified; SDST must be null"));
+        return Err(format!(
+            "{name}: the signed form's carry/overflow output is not specified; SDST must be null"
+        ));
     }
     for lane in 0..32 {
         if s.exec >> lane & 1 == 0 {
@@ -189,7 +191,10 @@ pub(super) fn execute(_arch: Arch, name: &str, i: &Inst, s: &mut State) -> Resul
             // D0.i64 = S0.i32 * S1.i32 + S2.i64 (wrapping). The ISA's carry/overflow output of the signed form is not
             // specified by the pseudocode, so a non-null SDST is refused below.
             "v_mad_i64_i32" => {
-                let (a, b) = (s.read(src(2)?, lane, 0)? as i32, s.read(src(3)?, lane, 0)? as i32);
+                let (a, b) = (
+                    s.read(src(2)?, lane, 0)? as i32,
+                    s.read(src(3)?, lane, 0)? as i32,
+                );
                 let c = s.read_wide(src(4)?, lane, Wide::Signed)? as i64;
                 (i64::from(a) * i64::from(b)).wrapping_add(c) as u64
             }

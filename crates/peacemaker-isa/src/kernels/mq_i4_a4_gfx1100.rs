@@ -262,7 +262,10 @@ pub fn emit_module(arch: Arch) -> Result<(Vec<Emitted>, String, iu4_gemm::Module
 /// wild 4 GiB-shifted store above it; with L = 168,960 slots, group 4 and a slot >= 152,665 hit it.)
 fn mad64(b: &mut Builder, dst: u8, base: u8, x: u8, imm: u32) -> R {
     let a = b.spec.arch;
-    assert!(x != T1, "mad64: x must not be T1 (written before the low-word product)");
+    assert!(
+        x != T1,
+        "mad64: x must not be T1 (written before the low-word product)"
+    );
     // SOP2 literals other than inline constants are not encodable here: the multiplier goes through an SGPR.
     sop(b, format!("s_mov_b32 s{KIMM}, {}", lit(imm)), &[KIMM], &[])?;
     sop(

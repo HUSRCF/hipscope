@@ -7,10 +7,10 @@
 mod alu;
 pub mod convert;
 mod dot;
-mod memory;
-pub mod mma;
 #[cfg(test)]
 mod gate_ops_tests;
+mod memory;
+pub mod mma;
 #[cfg(test)]
 mod swmmac_fixtures;
 pub mod trans;

@@ -1328,7 +1328,10 @@ fn vector(
                     Ok(x)
                 }
             };
-            let (a, b) = (finite(f16_operand(s, o, i, lane, 0)?)?, finite(f16_operand(s, o, i, lane, 1)?)?);
+            let (a, b) = (
+                finite(f16_operand(s, o, i, lane, 0)?)?,
+                finite(f16_operand(s, o, i, lane, 1)?)?,
+            );
             let c = if stem(name) == "v_fma_f16" {
                 finite(f16_operand(s, o, i, lane, 2)?)?
             } else {
@@ -1347,7 +1350,16 @@ fn vector(
             if m.clamp {
                 return Err("clamp on v_mov_b16 is not modeled".into());
             }
-            (Class::Own, u32::from(half_src(s, o.get(1).ok_or("missing vector operand")?, i, lane, 0)?))
+            (
+                Class::Own,
+                u32::from(half_src(
+                    s,
+                    o.get(1).ok_or("missing vector operand")?,
+                    i,
+                    lane,
+                    0,
+                )?),
+            )
         }
         // D.f16 = u16_to_f16(S0.u16): a u16 is exact in binary32, so one rounding to binary16 (65520.. rounds to infinity).
         "v_cvt_f16_u16" => {
@@ -3458,7 +3470,10 @@ mod tests {
         i.mods.op_sel = 0b10;
         i.mods.op_sel_hi = 0b10;
         run("v_pk_add_f16", &i, &mut st).unwrap();
-        assert_eq!(st.v[0][0], 0x4700_4700, "a low (2.0) + b high (5.0) in both results");
+        assert_eq!(
+            st.v[0][0], 0x4700_4700,
+            "a low (2.0) + b high (5.0) in both results"
+        );
     }
 
     #[test]

@@ -403,7 +403,9 @@ pub(super) fn execute_tracked(
                         let bytes = lds
                             .get(lo..lo + size)
                             .ok_or_else(|| format!("LDS read out of bounds {cur:#x}+{n}"))?;
-                        if let Some(b) = defined.as_deref().and_then(|w| w.first_unwritten(lo, size)) {
+                        if let Some(b) =
+                            defined.as_deref().and_then(|w| w.first_unwritten(lo, size))
+                        {
                             return Err(format!(
                                 "LDS read of byte {b:#x} never written in this workgroup (access {cur:#x}+{n})"
                             ));

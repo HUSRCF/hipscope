@@ -41,7 +41,14 @@ fn s(base: u16) -> Operand {
     reg(Kind::S, base, 1)
 }
 fn half(base: u16, h: Half) -> Operand {
-    Operand::Half(RegRef { kind: Kind::V, base, len: 1 }, h)
+    Operand::Half(
+        RegRef {
+            kind: Kind::V,
+            base,
+            len: 1,
+        },
+        h,
+    )
 }
 fn insn_with(name: &str, ops: Vec<Operand>, mods: Modifiers, fields: FormFields) -> Inst {
     let row = crate::isa::gfx1100()
@@ -66,7 +73,13 @@ fn insn(name: &str, ops: Vec<Operand>) -> Inst {
 fn run(name: &str, ops: Vec<Operand>, st: &mut State) -> Result<()> {
     alu::execute(Arch::Gfx1100, name, &insn(name, ops), st)
 }
-fn mem_run(name: &str, ops: Vec<Operand>, st: &mut State, mem: &mut Memory, lds: &mut [u8]) -> Result<()> {
+fn mem_run(
+    name: &str,
+    ops: Vec<Operand>,
+    st: &mut State,
+    mem: &mut Memory,
+    lds: &mut [u8],
+) -> Result<()> {
     memory::execute(name, &insn(name, ops), st, mem, lds)
 }
 
@@ -164,7 +177,10 @@ fn and_not1_saveexec_saves_exec_and_sets_exec_to_s0_and_not_exec() {
 fn or3_and_mul_i24() {
     let mut st = state();
     st.exec = 0b11;
-    for (lane, (a, b, c)) in [(0x1u32, 0x20, 0x300), (0xf000_0000, 0x0f00_0000, 0)].into_iter().enumerate() {
+    for (lane, (a, b, c)) in [(0x1u32, 0x20, 0x300), (0xf000_0000, 0x0f00_0000, 0)]
+        .into_iter()
+        .enumerate()
+    {
         st.v[1][lane] = a;
         st.v[2][lane] = b;
         st.v[3][lane] = c;
@@ -190,23 +206,55 @@ fn true16_mov_and_cvt_f16_u16_preserve_the_other_destination_half() {
     let mut st = state();
     st.v[1][0] = 0x1234_5678;
     st.v[0][0] = 0xabcd_ef01;
-    run("v_mov_b16_e32", vec![half(0, Half::Lo), half(1, Half::Hi)], &mut st).unwrap();
+    run(
+        "v_mov_b16_e32",
+        vec![half(0, Half::Lo), half(1, Half::Hi)],
+        &mut st,
+    )
+    .unwrap();
     assert_eq!(st.v[0][0], 0xabcd_1234);
-    run("v_mov_b16_e32", vec![half(0, Half::Hi), half(1, Half::Lo)], &mut st).unwrap();
+    run(
+        "v_mov_b16_e32",
+        vec![half(0, Half::Hi), half(1, Half::Lo)],
+        &mut st,
+    )
+    .unwrap();
     assert_eq!(st.v[0][0], 0x5678_1234);
     // u16 -> f16, one rounding to nearest even: 1 -> 0x3c00, 2049 -> tie between 2048 and 2050 -> 2048 (0x6800),
     // 2051 -> 2052 (0x6802), 65504 exact (0x7bff), 65520 and up round to infinity (0x7c00).
-    for (x, h) in [(0u32, 0u16), (1, 0x3c00), (2049, 0x6800), (2051, 0x6802), (65504, 0x7bff), (65519, 0x7bff), (65520, 0x7c00), (65535, 0x7c00)] {
+    for (x, h) in [
+        (0u32, 0u16),
+        (1, 0x3c00),
+        (2049, 0x6800),
+        (2051, 0x6802),
+        (65504, 0x7bff),
+        (65519, 0x7bff),
+        (65520, 0x7c00),
+        (65535, 0x7c00),
+    ] {
         st.v[1][0] = x | 0xdead_0000;
         st.v[0][0] = 0xabcd_0000;
-        run("v_cvt_f16_u16_e32", vec![half(0, Half::Lo), half(1, Half::Lo)], &mut st).unwrap();
+        run(
+            "v_cvt_f16_u16_e32",
+            vec![half(0, Half::Lo), half(1, Half::Lo)],
+            &mut st,
+        )
+        .unwrap();
         assert_eq!(st.v[0][0], 0xabcd_0000 | u32::from(h), "u16 {x}");
     }
     // High source half, high destination half.
     st.v[1][0] = (7u32 << 16) | 0xffff;
     st.v[0][0] = 0x0000_beef;
-    run("v_cvt_f16_u16_e32", vec![half(0, Half::Hi), half(1, Half::Hi)], &mut st).unwrap();
-    assert_eq!(st.v[0][0], (u32::from(convert::f32_to_f16(7f32.to_bits())) << 16) | 0xbeef);
+    run(
+        "v_cvt_f16_u16_e32",
+        vec![half(0, Half::Hi), half(1, Half::Hi)],
+        &mut st,
+    )
+    .unwrap();
+    assert_eq!(
+        st.v[0][0],
+        (u32::from(convert::f32_to_f16(7f32.to_bits())) << 16) | 0xbeef
+    );
 }
 
 #[test]
@@ -220,14 +268,25 @@ fn fma_f16_rounds_once_and_honours_op_sel() {
     st.v[2][0] = 0xbeef_0000 | b;
     st.v[3][0] = 0xf00d_0000 | c;
     st.v[0][0] = 0xabcd_0000;
-    run("v_fma_f16", vec![half(0, Half::Lo), v(1), v(2), v(3)], &mut st).unwrap();
-    assert_eq!(st.v[0][0], 0xabcd_0010, "fused, upper destination half preserved");
+    run(
+        "v_fma_f16",
+        vec![half(0, Half::Lo), v(1), v(2), v(3)],
+        &mut st,
+    )
+    .unwrap();
+    assert_eq!(
+        st.v[0][0], 0xabcd_0010,
+        "fused, upper destination half preserved"
+    );
     // op_sel picks the high half of src1 and src2, and op_sel[3] writes the high destination half.
     st.v[1][0] = 0x0000_0000 | a;
     st.v[2][0] = (b << 16) | 0xffff; // src1 high
     st.v[3][0] = (c << 16) | 0xffff; // src2 high
     st.v[0][0] = 0x0000_1234;
-    let mods = Modifiers { op_sel: 0b0110, ..Default::default() };
+    let mods = Modifiers {
+        op_sel: 0b0110,
+        ..Default::default()
+    };
     let i = insn_with(
         "v_fma_f16",
         vec![half(0, Half::Hi), v(1), v(2), v(3)],
@@ -240,11 +299,21 @@ fn fma_f16_rounds_once_and_honours_op_sel() {
     st.v[1][0] = u32::from(h(2.0));
     st.v[2][0] = u32::from(h(3.0));
     st.v[3][0] = u32::from(h(1.0));
-    run("v_fma_f16", vec![half(0, Half::Lo), v(1), v(2), v(3)], &mut st).unwrap();
+    run(
+        "v_fma_f16",
+        vec![half(0, Half::Lo), v(1), v(2), v(3)],
+        &mut st,
+    )
+    .unwrap();
     assert_eq!(st.v[0][0] & 0xffff, u32::from(h(7.0)));
     // An infinite operand is not modeled.
     st.v[1][0] = 0x7c00;
-    assert!(run("v_fma_f16", vec![half(0, Half::Lo), v(1), v(2), v(3)], &mut st).is_err());
+    assert!(run(
+        "v_fma_f16",
+        vec![half(0, Half::Lo), v(1), v(2), v(3)],
+        &mut st
+    )
+    .is_err());
 }
 
 #[test]
@@ -254,8 +323,17 @@ fn fmac_f16_accumulates_into_the_destination_half() {
     st.v[1][0] = h(2.0); // S0.l
     st.v[2][0] = h(3.0) << 16; // S1.h
     st.v[0][0] = (h(1.0) << 16) | 0x4242; // accumulator in the destination's high half
-    run("v_fmac_f16_e32", vec![half(0, Half::Hi), half(1, Half::Lo), half(2, Half::Hi)], &mut st).unwrap();
-    assert_eq!(st.v[0][0], (h(7.0) << 16) | 0x4242, "D = S0 * S1 + D, other half kept");
+    run(
+        "v_fmac_f16_e32",
+        vec![half(0, Half::Hi), half(1, Half::Lo), half(2, Half::Hi)],
+        &mut st,
+    )
+    .unwrap();
+    assert_eq!(
+        st.v[0][0],
+        (h(7.0) << 16) | 0x4242,
+        "D = S0 * S1 + D, other half kept"
+    );
 }
 
 #[test]
@@ -272,32 +350,88 @@ fn mad_u64_u32_carries_and_mad_i64_i32_wraps() {
     st.v[3][1] = 4;
     st.v[4][1] = 5;
     st.v[5][1] = 0;
-    run("v_mad_u64_u32", vec![reg(Kind::V, 0, 2), reg(Kind::S, 10, 1), v(2), v(3), reg(Kind::V, 4, 2)], &mut st).unwrap();
+    run(
+        "v_mad_u64_u32",
+        vec![
+            reg(Kind::V, 0, 2),
+            reg(Kind::S, 10, 1),
+            v(2),
+            v(3),
+            reg(Kind::V, 4, 2),
+        ],
+        &mut st,
+    )
+    .unwrap();
     // 0xffff_ffff^2 = 0xffff_fffe_0000_0001; + 0xffff_ffff_ffff_ffff = 0x1_ffff_fffe_0000_0000.
     assert_eq!([st.v[0][0], st.v[1][0]], [0, 0xffff_fffe]);
     assert_eq!([st.v[0][1], st.v[1][1]], [17, 0]);
     assert_eq!(st.s[10], 0b01);
     // Null SDST is accepted.
-    run("v_mad_u64_u32", vec![reg(Kind::V, 0, 2), Operand::Special(Special::Null), v(2), v(3), reg(Kind::V, 4, 2)], &mut st).unwrap();
+    run(
+        "v_mad_u64_u32",
+        vec![
+            reg(Kind::V, 0, 2),
+            Operand::Special(Special::Null),
+            v(2),
+            v(3),
+            reg(Kind::V, 4, 2),
+        ],
+        &mut st,
+    )
+    .unwrap();
     // Signed: -3 * 4 + 5 = -7.
     st.v[2][0] = (-3i32) as u32;
     st.v[3][0] = 4;
     st.v[4][0] = 5;
     st.v[5][0] = 0;
-    run("v_mad_i64_i32", vec![reg(Kind::V, 0, 2), Operand::Special(Special::Null), v(2), v(3), reg(Kind::V, 4, 2)], &mut st).unwrap();
-    assert_eq!([st.v[0][0], st.v[1][0]], [(-7i64) as u64 as u32, ((-7i64) as u64 >> 32) as u32]);
+    run(
+        "v_mad_i64_i32",
+        vec![
+            reg(Kind::V, 0, 2),
+            Operand::Special(Special::Null),
+            v(2),
+            v(3),
+            reg(Kind::V, 4, 2),
+        ],
+        &mut st,
+    )
+    .unwrap();
+    assert_eq!(
+        [st.v[0][0], st.v[1][0]],
+        [(-7i64) as u64 as u32, ((-7i64) as u64 >> 32) as u32]
+    );
     // The signed form's carry output is unspecified: a real SDST is refused.
-    assert!(run("v_mad_i64_i32", vec![reg(Kind::V, 0, 2), reg(Kind::S, 10, 1), v(2), v(3), reg(Kind::V, 4, 2)], &mut st).is_err());
+    assert!(run(
+        "v_mad_i64_i32",
+        vec![
+            reg(Kind::V, 0, 2),
+            reg(Kind::S, 10, 1),
+            v(2),
+            v(3),
+            reg(Kind::V, 4, 2)
+        ],
+        &mut st
+    )
+    .is_err());
 }
 
 #[test]
 fn vopd_dual_max_selects_the_larger_and_prefers_positive_zero() {
-    let row = |n: &str| crate::isa::gfx1100().iter().find(|r| r.name == n).unwrap().op;
+    let row = |n: &str| {
+        crate::isa::gfx1100()
+            .iter()
+            .find(|r| r.name == n)
+            .unwrap()
+            .op
+    };
     let i = insn_with(
         "v_dual_max_f32",
         vec![v(1), v(2), v(3), v(4), v(5)],
         Modifiers::default(),
-        FormFields::Vopd { y_op: row("v_dual_mov_b32"), x_operands: 3 },
+        FormFields::Vopd {
+            y_op: row("v_dual_mov_b32"),
+            x_operands: 3,
+        },
     );
     let mut st = state();
     st.exec = 0b111;
@@ -311,7 +445,11 @@ fn vopd_dual_max_selects_the_larger_and_prefers_positive_zero() {
     assert_eq!(st.v[1][0], 2.0f32.to_bits());
     assert_eq!(st.v[1][1], 0.0f32.to_bits(), "max(-0, +0) = +0");
     assert_eq!(st.v[1][2], 0.0f32.to_bits(), "max(+0, -0) = +0");
-    assert_eq!([st.v[4][0], st.v[4][1], st.v[4][2]], [0x1111_0000, 0x1111_0001, 0x1111_0002], "Y half moves too");
+    assert_eq!(
+        [st.v[4][0], st.v[4][1], st.v[4][2]],
+        [0x1111_0000, 0x1111_0001, 0x1111_0002],
+        "Y half moves too"
+    );
 }
 
 #[test]
@@ -325,7 +463,13 @@ fn lds_two_address_b64_and_sub_dword_loads() {
     }
     mem_run(
         "ds_store_2addr_b64",
-        vec![v(2), reg(Kind::V, 4, 2), reg(Kind::V, 8, 2), Operand::Imm(ImmField::DsOffset0(1)), Operand::Imm(ImmField::DsOffset1(3))],
+        vec![
+            v(2),
+            reg(Kind::V, 4, 2),
+            reg(Kind::V, 8, 2),
+            Operand::Imm(ImmField::DsOffset0(1)),
+            Operand::Imm(ImmField::DsOffset1(3)),
+        ],
         &mut st,
         &mut Memory::default(),
         &mut lds,
@@ -333,25 +477,54 @@ fn lds_two_address_b64_and_sub_dword_loads() {
     .unwrap();
     // Element offsets scale by the 8-byte element: bytes 8 + 8 and 8 + 24.
     let word = |at: usize| u32::from_le_bytes(lds[at..at + 4].try_into().unwrap());
-    assert_eq!([word(16), word(20), word(32), word(36)], [0x1111_1111, 0x2222_2222, 0x3333_3333, 0x4444_4444]);
-    assert_eq!(lds.iter().filter(|&&b| b != 0).count(), 16, "only the two elements are written");
+    assert_eq!(
+        [word(16), word(20), word(32), word(36)],
+        [0x1111_1111, 0x2222_2222, 0x3333_3333, 0x4444_4444]
+    );
+    assert_eq!(
+        lds.iter().filter(|&&b| b != 0).count(),
+        16,
+        "only the two elements are written"
+    );
     mem_run(
         "ds_load_2addr_b64",
-        vec![reg(Kind::V, 12, 4), v(2), Operand::Imm(ImmField::DsOffset0(1)), Operand::Imm(ImmField::DsOffset1(3))],
+        vec![
+            reg(Kind::V, 12, 4),
+            v(2),
+            Operand::Imm(ImmField::DsOffset0(1)),
+            Operand::Imm(ImmField::DsOffset1(3)),
+        ],
         &mut st,
         &mut Memory::default(),
         &mut lds,
     )
     .unwrap();
-    assert_eq!([st.v[12][0], st.v[13][0], st.v[14][0], st.v[15][0]], [0x1111_1111, 0x2222_2222, 0x3333_3333, 0x4444_4444]);
+    assert_eq!(
+        [st.v[12][0], st.v[13][0], st.v[14][0], st.v[15][0]],
+        [0x1111_1111, 0x2222_2222, 0x3333_3333, 0x4444_4444]
+    );
     // ds_load_i8 sign-extends; ds_load_u16_d16 merges into the low half and keeps the high half.
     lds[40] = 0x80;
     lds[41] = 0x7f;
     st.v[1][0] = 40;
-    mem_run("ds_load_i8", vec![v(0), v(1)], &mut st, &mut Memory::default(), &mut lds).unwrap();
+    mem_run(
+        "ds_load_i8",
+        vec![v(0), v(1)],
+        &mut st,
+        &mut Memory::default(),
+        &mut lds,
+    )
+    .unwrap();
     assert_eq!(st.v[0][0], 0xffff_ff80);
     st.v[0][0] = 0xabcd_0000;
-    mem_run("ds_load_u16_d16", vec![v(0), v(1)], &mut st, &mut Memory::default(), &mut lds).unwrap();
+    mem_run(
+        "ds_load_u16_d16",
+        vec![v(0), v(1)],
+        &mut st,
+        &mut Memory::default(),
+        &mut lds,
+    )
+    .unwrap();
     assert_eq!(st.v[0][0], 0xabcd_7f80);
 }
 
@@ -369,7 +542,14 @@ fn global_d16_loads_merge_halves_and_buffer_i8_zero_fills_out_of_range() {
         ("global_load_d16_hi_b16", 0xabcd_1234, 0x8180_1234),
     ] {
         st.v[0][0] = init;
-        mem_run(name, vec![v(0), reg(Kind::V, 2, 2)], &mut st, &mut mem, &mut []).unwrap();
+        mem_run(
+            name,
+            vec![v(0), reg(Kind::V, 2, 2)],
+            &mut st,
+            &mut mem,
+            &mut [],
+        )
+        .unwrap();
         assert_eq!(st.v[0][0], want, "{name}");
     }
     // buffer_load_i8 with a raw SRD (base 0x1000, 8 records): in range sign-extends, past NUM_RECORDS reads 0.
@@ -382,7 +562,13 @@ fn global_d16_loads_merge_halves_and_buffer_i8_zero_fills_out_of_range() {
         st.v[0][0] = 0xdead_beef;
         mem_run(
             "buffer_load_i8",
-            vec![v(0), v(2), reg(Kind::S, 4, 4), Operand::Special(Special::Null), Operand::Vmem(VmemToken::Offen)],
+            vec![
+                v(0),
+                v(2),
+                reg(Kind::S, 4, 4),
+                Operand::Special(Special::Null),
+                Operand::Vmem(VmemToken::Offen),
+            ],
             st,
             mem,
             &mut [],
@@ -397,7 +583,11 @@ fn global_d16_loads_merge_halves_and_buffer_i8_zero_fills_out_of_range() {
 #[test]
 fn hint_and_invalidate_rows_are_no_ops_that_never_fault() {
     // `wait`-class rows are skipped by the interpreter loop; the class is what keeps them from "no semantics".
-    for name in ["buffer_gl0_inv", "s_sendmsg", "s_set_inst_prefetch_distance"] {
+    for name in [
+        "buffer_gl0_inv",
+        "s_sendmsg",
+        "s_set_inst_prefetch_distance",
+    ] {
         assert_eq!(super::semantic_class(name), Some("wait"), "{name}");
     }
 }
