@@ -2,7 +2,7 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! Exact CPU semantics for scalar and vector ALU opcodes (wave32).
+//! Exact CPU semantics for scalar and vector ALU opcodes (wave32 and wave64; see `emu/mod.rs` for the wave model).
 //!
 //! Every opcode is keyed by its exact ISA name; an unknown name is an error, never a
 //! best guess. Float arithmetic uses host IEEE-754 binary32 (`+ - * fma`, round to
@@ -274,6 +274,9 @@ pub(super) fn execute(arch: Arch, name: &str, i: &Inst, s: &mut State) -> Result
         "v_readlane_b32" => readlane(i, s),
         "v_writelane_b32" => writelane(i, s),
         _ if name.starts_with("v_wmma") || name.starts_with("v_swmmac") => {
+            if s.lanes != 32 {
+                return Err(format!("{name}: the WMMA/SWMMAC fragment layouts are modeled for wave32 only"));
+            }
             super::wmma::execute(arch, name, i, s)
         }
         _ if name.starts_with("v_dot") => super::dot::execute(arch, name, i, s),

@@ -2,9 +2,25 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! In-order wave32 interpreter. By default wait counters are no-ops (loads complete before the next instruction)
+//! In-order wave32/wave64 interpreter. By default wait counters are no-ops (loads complete before the next instruction)
 //! and workgroup waves run in one fixed interleaving; `Emulator::hw_model` enables the gate model (in-flight
 //! memory, LDS race detection, schedule exploration; see `hw.rs`). Workgroup barriers rendezvous distinct waves.
+//!
+//! Wavefront size: taken from the lifted kernel (`Kernel::wave`, derived from KERNEL_CODE_PROPERTIES
+//! ENABLE_WAVEFRONT_SIZE32; `State::new` refuses a disagreement). A wave owns `lanes` (32 or 64) VGPR lanes, 64-bit
+//! EXEC/VCC (a wave32 keeps the upper words zero) and splits the workgroup's work-items `wave * lanes + lane`. The
+//! encodings are wave-size neutral (`vcc_lo`/`exec_lo` and `s[n:n+1]` name whole lane masks in wave64), so lane-mask
+//! operands (`v_cmp*` destination, `v_cndmask`/carry-in source, carry-out, `v_div_scale` flag) go through
+//! `State::read_mask`/`put_mask`: one dword in wave32, an SGPR pair in wave64. DPP rows are 16 lanes in both sizes,
+//! `ds_swizzle` bit/quad modes act inside 32-lane groups, `ds_bpermute` wraps at the wave size, `v_mbcnt_lo/hi` count per
+//! 32-lane dword, `v_readlane`/`v_writelane` select modulo the wave size. The WMMA/SWMMAC, permlane16 and wave32-only
+//! `s_*_saveexec_b32` rows refuse a wave64 wave.
+//!
+//! Numerics (every kernel arch): the descriptor must preserve f32/f16/f64 denormals and round to nearest even
+//! (`State::new` rejects any other FLOAT_MODE: gfx1201 f32 is IEEE with denormals when the KD says so). gfx1201 shares
+//! the measured gfx1151/gfx1201 tables of `alu.rs` wherever the sweeps are identical (see its module doc for the
+//! per-opcode differences, selected through `Arch::Gfx1201`); a gfx1201 object never runs on the gfx1151 model.
+//! `Emulator::nan_meets_nan` (lab exactness contract) relaxes only the NaN-layout refusals, never non-NaN arithmetic.
 mod alu;
 pub mod convert;
 mod dot;
