@@ -211,3 +211,24 @@ fn the_original_instruction_order_stores_4_gib_away() {
         "{err}"
     );
 }
+
+/// The committed product object `kernels/mq_i4_a4_pm_gfx1100.hxaco` is what the builder emits today (fresh module
+/// emission, native assembly and bundling are byte-equal to it), and it follows the gfx1100
+/// `FeatureUserSGPRInit16Bug` rule: 15 declared user SGPRs (kernarg pointer padded) + the workgroup id x = 16, the
+/// workgroup id being `s15` and the kernarg block `s[48:55]`.
+#[test]
+fn committed_bundle_equals_fresh_emission_and_declares_sixteen_user_and_system_sgprs() {
+    let root = concat!(env!("CARGO_MANIFEST_DIR"), "/../../kernels");
+    let committed = std::fs::read(format!("{root}/mq_i4_a4_pm_gfx1100.hxaco")).unwrap();
+    let (_, text, _) = k3::emit_module(ARCH).unwrap();
+    let elf = native::assemble(&text, ARCH).unwrap();
+    let fresh = native::bundle(&elf, ARCH, native::DEFAULT_HOST_TARGET);
+    assert!(
+        fresh == committed,
+        "fresh bundle differs from the committed bundle"
+    );
+    assert!(text.contains("\t.amdhsa_user_sgpr_count 15\n"));
+    assert!(text.contains("\ts_mov_b32 s20, s15\n"));
+    assert!(text.contains("\ts_load_b256 s[48:55], s[0:1], null\n"));
+    assert!(!text.contains("s[8:15]"));
+}

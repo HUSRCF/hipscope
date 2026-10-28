@@ -169,8 +169,8 @@ gemm_mq6g256v2_residual_pm_gfx1100_w4:
 	s_min_i32 s35, s35, s24
 	s_cmp_lt_i32 s35, 1
 	s_cbranch_scc1 .Lmq6g11w4y_end
-	s_mov_b32 s28, s2
-	s_mov_b32 s29, s3
+	s_mov_b32 s28, s14
+	s_mov_b32 s29, s15
 	s_lshr_b32 s25, s23, 8
 	s_lshr_b32 s26, s23, 5
 	s_add_i32 s26, s26, -1
@@ -185,10 +185,10 @@ gemm_mq6g256v2_residual_pm_gfx1100_w4:
 	s_and_b32 s9, s19, 0xffff
 	s_mov_b32 s10, s36
 	s_mov_b32 s11, 0x31004000
-	s_mov_b32 s12, s20
-	s_and_b32 s13, s21, 0xffff
-	s_brev_b32 s14, -2
-	s_mov_b32 s15, 0x31004000
+	s_mov_b32 s56, s20
+	s_and_b32 s57, s21, 0xffff
+	s_brev_b32 s58, -2
+	s_mov_b32 s59, 0x31004000
 	v_lshrrev_b32_e32 v149, 1, v0
 	s_mul_i32 s35, s28, 64
 	s_delay_alu instid0(VALU_DEP_1)
@@ -2541,50 +2541,50 @@ gemm_mq6g256v2_residual_pm_gfx1100_w4:
 	s_sub_i32 s41, s24, 0
 	v_cmp_gt_i32_e64 s44, s41, v7
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b128 v[168:171], v152, s[12:15], s37 offen
-	buffer_load_b128 v[172:175], v152, s[12:15], s37 offen offset:16
+	buffer_load_b128 v[168:171], v152, s[56:59], s37 offen
+	buffer_load_b128 v[172:175], v152, s[56:59], s37 offen offset:16
 	s_mov_b32 exec_lo, -1
 	s_sub_i32 s41, s24, 16
 	v_cmp_gt_i32_e64 s44, s41, v7
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b128 v[176:179], v153, s[12:15], s37 offen
-	buffer_load_b128 v[180:183], v153, s[12:15], s37 offen offset:16
+	buffer_load_b128 v[176:179], v153, s[56:59], s37 offen
+	buffer_load_b128 v[180:183], v153, s[56:59], s37 offen offset:16
 	s_mov_b32 exec_lo, -1
 	s_sub_i32 s41, s24, 32
 	v_cmp_gt_i32_e64 s44, s41, v7
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b128 v[184:187], v154, s[12:15], s37 offen
-	buffer_load_b128 v[188:191], v154, s[12:15], s37 offen offset:16
+	buffer_load_b128 v[184:187], v154, s[56:59], s37 offen
+	buffer_load_b128 v[188:191], v154, s[56:59], s37 offen offset:16
 	s_mov_b32 exec_lo, -1
 	s_sub_i32 s41, s24, 48
 	v_cmp_gt_i32_e64 s44, s41, v7
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b128 v[192:195], v155, s[12:15], s37 offen
-	buffer_load_b128 v[196:199], v155, s[12:15], s37 offen offset:16
+	buffer_load_b128 v[192:195], v155, s[56:59], s37 offen
+	buffer_load_b128 v[196:199], v155, s[56:59], s37 offen offset:16
 	s_mov_b32 exec_lo, -1
 	s_sub_i32 s41, s24, 64
 	v_cmp_gt_i32_e64 s44, s41, v7
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b128 v[200:203], v156, s[12:15], s37 offen
-	buffer_load_b128 v[204:207], v156, s[12:15], s37 offen offset:16
+	buffer_load_b128 v[200:203], v156, s[56:59], s37 offen
+	buffer_load_b128 v[204:207], v156, s[56:59], s37 offen offset:16
 	s_mov_b32 exec_lo, -1
 	s_sub_i32 s41, s24, 0x50
 	v_cmp_gt_i32_e64 s44, s41, v7
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b128 v[208:211], v157, s[12:15], s37 offen
-	buffer_load_b128 v[212:215], v157, s[12:15], s37 offen offset:16
+	buffer_load_b128 v[208:211], v157, s[56:59], s37 offen
+	buffer_load_b128 v[212:215], v157, s[56:59], s37 offen offset:16
 	s_mov_b32 exec_lo, -1
 	s_sub_i32 s41, s24, 0x60
 	v_cmp_gt_i32_e64 s44, s41, v7
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b128 v[216:219], v158, s[12:15], s37 offen
-	buffer_load_b128 v[220:223], v158, s[12:15], s37 offen offset:16
+	buffer_load_b128 v[216:219], v158, s[56:59], s37 offen
+	buffer_load_b128 v[220:223], v158, s[56:59], s37 offen offset:16
 	s_mov_b32 exec_lo, -1
 	s_sub_i32 s41, s24, 0x70
 	v_cmp_gt_i32_e64 s44, s41, v7
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b128 v[224:227], v159, s[12:15], s37 offen
-	buffer_load_b128 v[228:231], v159, s[12:15], s37 offen offset:16
+	buffer_load_b128 v[224:227], v159, s[56:59], s37 offen
+	buffer_load_b128 v[228:231], v159, s[56:59], s37 offen offset:16
 	s_mov_b32 exec_lo, -1
 	s_sub_i32 s41, s24, 0
 	v_cmp_gt_i32_e64 s44, s41, v7
@@ -2599,8 +2599,8 @@ gemm_mq6g256v2_residual_pm_gfx1100_w4:
 	v_add_f32_e32 v23, v23, v173
 	v_add_f32_e32 v24, v24, v174
 	v_add_f32_e32 v25, v25, v175
-	buffer_store_b128 v[18:21], v152, s[12:15], s37 offen
-	buffer_store_b128 v[22:25], v152, s[12:15], s37 offen offset:16
+	buffer_store_b128 v[18:21], v152, s[56:59], s37 offen
+	buffer_store_b128 v[22:25], v152, s[56:59], s37 offen offset:16
 	s_mov_b32 exec_lo, -1
 	s_sub_i32 s41, s24, 16
 	v_cmp_gt_i32_e64 s44, s41, v7
@@ -2615,8 +2615,8 @@ gemm_mq6g256v2_residual_pm_gfx1100_w4:
 	v_add_f32_e32 v31, v31, v181
 	v_add_f32_e32 v32, v32, v182
 	v_add_f32_e32 v33, v33, v183
-	buffer_store_b128 v[26:29], v153, s[12:15], s37 offen
-	buffer_store_b128 v[30:33], v153, s[12:15], s37 offen offset:16
+	buffer_store_b128 v[26:29], v153, s[56:59], s37 offen
+	buffer_store_b128 v[30:33], v153, s[56:59], s37 offen offset:16
 	s_mov_b32 exec_lo, -1
 	s_sub_i32 s41, s24, 32
 	v_cmp_gt_i32_e64 s44, s41, v7
@@ -2631,8 +2631,8 @@ gemm_mq6g256v2_residual_pm_gfx1100_w4:
 	v_add_f32_e32 v39, v39, v189
 	v_add_f32_e32 v40, v40, v190
 	v_add_f32_e32 v41, v41, v191
-	buffer_store_b128 v[34:37], v154, s[12:15], s37 offen
-	buffer_store_b128 v[38:41], v154, s[12:15], s37 offen offset:16
+	buffer_store_b128 v[34:37], v154, s[56:59], s37 offen
+	buffer_store_b128 v[38:41], v154, s[56:59], s37 offen offset:16
 	s_mov_b32 exec_lo, -1
 	s_sub_i32 s41, s24, 48
 	v_cmp_gt_i32_e64 s44, s41, v7
@@ -2647,8 +2647,8 @@ gemm_mq6g256v2_residual_pm_gfx1100_w4:
 	v_add_f32_e32 v47, v47, v197
 	v_add_f32_e32 v48, v48, v198
 	v_add_f32_e32 v49, v49, v199
-	buffer_store_b128 v[42:45], v155, s[12:15], s37 offen
-	buffer_store_b128 v[46:49], v155, s[12:15], s37 offen offset:16
+	buffer_store_b128 v[42:45], v155, s[56:59], s37 offen
+	buffer_store_b128 v[46:49], v155, s[56:59], s37 offen offset:16
 	s_mov_b32 exec_lo, -1
 	s_sub_i32 s41, s24, 64
 	v_cmp_gt_i32_e64 s44, s41, v7
@@ -2663,8 +2663,8 @@ gemm_mq6g256v2_residual_pm_gfx1100_w4:
 	v_add_f32_e32 v55, v55, v205
 	v_add_f32_e32 v56, v56, v206
 	v_add_f32_e32 v57, v57, v207
-	buffer_store_b128 v[50:53], v156, s[12:15], s37 offen
-	buffer_store_b128 v[54:57], v156, s[12:15], s37 offen offset:16
+	buffer_store_b128 v[50:53], v156, s[56:59], s37 offen
+	buffer_store_b128 v[54:57], v156, s[56:59], s37 offen offset:16
 	s_mov_b32 exec_lo, -1
 	s_sub_i32 s41, s24, 0x50
 	v_cmp_gt_i32_e64 s44, s41, v7
@@ -2679,8 +2679,8 @@ gemm_mq6g256v2_residual_pm_gfx1100_w4:
 	v_add_f32_e32 v63, v63, v213
 	v_add_f32_e32 v64, v64, v214
 	v_add_f32_e32 v65, v65, v215
-	buffer_store_b128 v[58:61], v157, s[12:15], s37 offen
-	buffer_store_b128 v[62:65], v157, s[12:15], s37 offen offset:16
+	buffer_store_b128 v[58:61], v157, s[56:59], s37 offen
+	buffer_store_b128 v[62:65], v157, s[56:59], s37 offen offset:16
 	s_mov_b32 exec_lo, -1
 	s_sub_i32 s41, s24, 0x60
 	v_cmp_gt_i32_e64 s44, s41, v7
@@ -2695,8 +2695,8 @@ gemm_mq6g256v2_residual_pm_gfx1100_w4:
 	v_add_f32_e32 v71, v71, v221
 	v_add_f32_e32 v72, v72, v222
 	v_add_f32_e32 v73, v73, v223
-	buffer_store_b128 v[66:69], v158, s[12:15], s37 offen
-	buffer_store_b128 v[70:73], v158, s[12:15], s37 offen offset:16
+	buffer_store_b128 v[66:69], v158, s[56:59], s37 offen
+	buffer_store_b128 v[70:73], v158, s[56:59], s37 offen offset:16
 	s_mov_b32 exec_lo, -1
 	s_sub_i32 s41, s24, 0x70
 	v_cmp_gt_i32_e64 s44, s41, v7
@@ -2711,56 +2711,56 @@ gemm_mq6g256v2_residual_pm_gfx1100_w4:
 	v_add_f32_e32 v79, v79, v229
 	v_add_f32_e32 v80, v80, v230
 	v_add_f32_e32 v81, v81, v231
-	buffer_store_b128 v[74:77], v159, s[12:15], s37 offen
-	buffer_store_b128 v[78:81], v159, s[12:15], s37 offen offset:16
+	buffer_store_b128 v[74:77], v159, s[56:59], s37 offen
+	buffer_store_b128 v[78:81], v159, s[56:59], s37 offen offset:16
 	s_mov_b32 exec_lo, -1
 	s_sub_i32 s41, s24, 0x80
 	v_cmp_gt_i32_e64 s44, s41, v7
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b128 v[168:171], v160, s[12:15], s37 offen
-	buffer_load_b128 v[172:175], v160, s[12:15], s37 offen offset:16
+	buffer_load_b128 v[168:171], v160, s[56:59], s37 offen
+	buffer_load_b128 v[172:175], v160, s[56:59], s37 offen offset:16
 	s_mov_b32 exec_lo, -1
 	s_sub_i32 s41, s24, 0x90
 	v_cmp_gt_i32_e64 s44, s41, v7
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b128 v[176:179], v161, s[12:15], s37 offen
-	buffer_load_b128 v[180:183], v161, s[12:15], s37 offen offset:16
+	buffer_load_b128 v[176:179], v161, s[56:59], s37 offen
+	buffer_load_b128 v[180:183], v161, s[56:59], s37 offen offset:16
 	s_mov_b32 exec_lo, -1
 	s_sub_i32 s41, s24, 0xa0
 	v_cmp_gt_i32_e64 s44, s41, v7
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b128 v[184:187], v162, s[12:15], s37 offen
-	buffer_load_b128 v[188:191], v162, s[12:15], s37 offen offset:16
+	buffer_load_b128 v[184:187], v162, s[56:59], s37 offen
+	buffer_load_b128 v[188:191], v162, s[56:59], s37 offen offset:16
 	s_mov_b32 exec_lo, -1
 	s_sub_i32 s41, s24, 0xb0
 	v_cmp_gt_i32_e64 s44, s41, v7
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b128 v[192:195], v163, s[12:15], s37 offen
-	buffer_load_b128 v[196:199], v163, s[12:15], s37 offen offset:16
+	buffer_load_b128 v[192:195], v163, s[56:59], s37 offen
+	buffer_load_b128 v[196:199], v163, s[56:59], s37 offen offset:16
 	s_mov_b32 exec_lo, -1
 	s_sub_i32 s41, s24, 0xc0
 	v_cmp_gt_i32_e64 s44, s41, v7
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b128 v[200:203], v164, s[12:15], s37 offen
-	buffer_load_b128 v[204:207], v164, s[12:15], s37 offen offset:16
+	buffer_load_b128 v[200:203], v164, s[56:59], s37 offen
+	buffer_load_b128 v[204:207], v164, s[56:59], s37 offen offset:16
 	s_mov_b32 exec_lo, -1
 	s_sub_i32 s41, s24, 0xd0
 	v_cmp_gt_i32_e64 s44, s41, v7
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b128 v[208:211], v165, s[12:15], s37 offen
-	buffer_load_b128 v[212:215], v165, s[12:15], s37 offen offset:16
+	buffer_load_b128 v[208:211], v165, s[56:59], s37 offen
+	buffer_load_b128 v[212:215], v165, s[56:59], s37 offen offset:16
 	s_mov_b32 exec_lo, -1
 	s_sub_i32 s41, s24, 0xe0
 	v_cmp_gt_i32_e64 s44, s41, v7
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b128 v[216:219], v166, s[12:15], s37 offen
-	buffer_load_b128 v[220:223], v166, s[12:15], s37 offen offset:16
+	buffer_load_b128 v[216:219], v166, s[56:59], s37 offen
+	buffer_load_b128 v[220:223], v166, s[56:59], s37 offen offset:16
 	s_mov_b32 exec_lo, -1
 	s_sub_i32 s41, s24, 0xf0
 	v_cmp_gt_i32_e64 s44, s41, v7
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b128 v[224:227], v167, s[12:15], s37 offen
-	buffer_load_b128 v[228:231], v167, s[12:15], s37 offen offset:16
+	buffer_load_b128 v[224:227], v167, s[56:59], s37 offen
+	buffer_load_b128 v[228:231], v167, s[56:59], s37 offen offset:16
 	s_mov_b32 exec_lo, -1
 	s_sub_i32 s41, s24, 0x80
 	v_cmp_gt_i32_e64 s44, s41, v7
@@ -2775,8 +2775,8 @@ gemm_mq6g256v2_residual_pm_gfx1100_w4:
 	v_add_f32_e32 v87, v87, v173
 	v_add_f32_e32 v88, v88, v174
 	v_add_f32_e32 v89, v89, v175
-	buffer_store_b128 v[82:85], v160, s[12:15], s37 offen
-	buffer_store_b128 v[86:89], v160, s[12:15], s37 offen offset:16
+	buffer_store_b128 v[82:85], v160, s[56:59], s37 offen
+	buffer_store_b128 v[86:89], v160, s[56:59], s37 offen offset:16
 	s_mov_b32 exec_lo, -1
 	s_sub_i32 s41, s24, 0x90
 	v_cmp_gt_i32_e64 s44, s41, v7
@@ -2791,8 +2791,8 @@ gemm_mq6g256v2_residual_pm_gfx1100_w4:
 	v_add_f32_e32 v95, v95, v181
 	v_add_f32_e32 v96, v96, v182
 	v_add_f32_e32 v97, v97, v183
-	buffer_store_b128 v[90:93], v161, s[12:15], s37 offen
-	buffer_store_b128 v[94:97], v161, s[12:15], s37 offen offset:16
+	buffer_store_b128 v[90:93], v161, s[56:59], s37 offen
+	buffer_store_b128 v[94:97], v161, s[56:59], s37 offen offset:16
 	s_mov_b32 exec_lo, -1
 	s_sub_i32 s41, s24, 0xa0
 	v_cmp_gt_i32_e64 s44, s41, v7
@@ -2807,8 +2807,8 @@ gemm_mq6g256v2_residual_pm_gfx1100_w4:
 	v_add_f32_e32 v103, v103, v189
 	v_add_f32_e32 v104, v104, v190
 	v_add_f32_e32 v105, v105, v191
-	buffer_store_b128 v[98:101], v162, s[12:15], s37 offen
-	buffer_store_b128 v[102:105], v162, s[12:15], s37 offen offset:16
+	buffer_store_b128 v[98:101], v162, s[56:59], s37 offen
+	buffer_store_b128 v[102:105], v162, s[56:59], s37 offen offset:16
 	s_mov_b32 exec_lo, -1
 	s_sub_i32 s41, s24, 0xb0
 	v_cmp_gt_i32_e64 s44, s41, v7
@@ -2823,8 +2823,8 @@ gemm_mq6g256v2_residual_pm_gfx1100_w4:
 	v_add_f32_e32 v111, v111, v197
 	v_add_f32_e32 v112, v112, v198
 	v_add_f32_e32 v113, v113, v199
-	buffer_store_b128 v[106:109], v163, s[12:15], s37 offen
-	buffer_store_b128 v[110:113], v163, s[12:15], s37 offen offset:16
+	buffer_store_b128 v[106:109], v163, s[56:59], s37 offen
+	buffer_store_b128 v[110:113], v163, s[56:59], s37 offen offset:16
 	s_mov_b32 exec_lo, -1
 	s_sub_i32 s41, s24, 0xc0
 	v_cmp_gt_i32_e64 s44, s41, v7
@@ -2839,8 +2839,8 @@ gemm_mq6g256v2_residual_pm_gfx1100_w4:
 	v_add_f32_e32 v119, v119, v205
 	v_add_f32_e32 v120, v120, v206
 	v_add_f32_e32 v121, v121, v207
-	buffer_store_b128 v[114:117], v164, s[12:15], s37 offen
-	buffer_store_b128 v[118:121], v164, s[12:15], s37 offen offset:16
+	buffer_store_b128 v[114:117], v164, s[56:59], s37 offen
+	buffer_store_b128 v[118:121], v164, s[56:59], s37 offen offset:16
 	s_mov_b32 exec_lo, -1
 	s_sub_i32 s41, s24, 0xd0
 	v_cmp_gt_i32_e64 s44, s41, v7
@@ -2855,8 +2855,8 @@ gemm_mq6g256v2_residual_pm_gfx1100_w4:
 	v_add_f32_e32 v127, v127, v213
 	v_add_f32_e32 v128, v128, v214
 	v_add_f32_e32 v129, v129, v215
-	buffer_store_b128 v[122:125], v165, s[12:15], s37 offen
-	buffer_store_b128 v[126:129], v165, s[12:15], s37 offen offset:16
+	buffer_store_b128 v[122:125], v165, s[56:59], s37 offen
+	buffer_store_b128 v[126:129], v165, s[56:59], s37 offen offset:16
 	s_mov_b32 exec_lo, -1
 	s_sub_i32 s41, s24, 0xe0
 	v_cmp_gt_i32_e64 s44, s41, v7
@@ -2871,8 +2871,8 @@ gemm_mq6g256v2_residual_pm_gfx1100_w4:
 	v_add_f32_e32 v135, v135, v221
 	v_add_f32_e32 v136, v136, v222
 	v_add_f32_e32 v137, v137, v223
-	buffer_store_b128 v[130:133], v166, s[12:15], s37 offen
-	buffer_store_b128 v[134:137], v166, s[12:15], s37 offen offset:16
+	buffer_store_b128 v[130:133], v166, s[56:59], s37 offen
+	buffer_store_b128 v[134:137], v166, s[56:59], s37 offen offset:16
 	s_mov_b32 exec_lo, -1
 	s_sub_i32 s41, s24, 0xf0
 	v_cmp_gt_i32_e64 s44, s41, v7
@@ -2887,8 +2887,8 @@ gemm_mq6g256v2_residual_pm_gfx1100_w4:
 	v_add_f32_e32 v143, v143, v229
 	v_add_f32_e32 v144, v144, v230
 	v_add_f32_e32 v145, v145, v231
-	buffer_store_b128 v[138:141], v167, s[12:15], s37 offen
-	buffer_store_b128 v[142:145], v167, s[12:15], s37 offen offset:16
+	buffer_store_b128 v[138:141], v167, s[56:59], s37 offen
+	buffer_store_b128 v[142:145], v167, s[56:59], s37 offen offset:16
 	s_mov_b32 exec_lo, -1
 	s_waitcnt_vscnt null, 0x0
 	s_branch .Lmq6g11w4y_end
@@ -2898,42 +2898,42 @@ gemm_mq6g256v2_residual_pm_gfx1100_w4:
 	s_mov_b32 s42, s22
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v168, v152, s[12:15], s37 offen
+	buffer_load_b32 v168, v152, s[56:59], s37 offen
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v169, v152, s[12:15], s37 offen offset:4
+	buffer_load_b32 v169, v152, s[56:59], s37 offen offset:4
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v170, v152, s[12:15], s37 offen offset:8
+	buffer_load_b32 v170, v152, s[56:59], s37 offen offset:8
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v171, v152, s[12:15], s37 offen offset:12
+	buffer_load_b32 v171, v152, s[56:59], s37 offen offset:12
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v172, v152, s[12:15], s37 offen offset:16
+	buffer_load_b32 v172, v152, s[56:59], s37 offen offset:16
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v173, v152, s[12:15], s37 offen offset:20
+	buffer_load_b32 v173, v152, s[56:59], s37 offen offset:20
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v174, v152, s[12:15], s37 offen offset:24
+	buffer_load_b32 v174, v152, s[56:59], s37 offen offset:24
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v175, v152, s[12:15], s37 offen offset:28
+	buffer_load_b32 v175, v152, s[56:59], s37 offen offset:28
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	s_mov_b32 s42, s22
@@ -2941,56 +2941,56 @@ gemm_mq6g256v2_residual_pm_gfx1100_w4:
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(7)
 	v_add_f32_e32 v18, v18, v168
-	buffer_store_b32 v18, v152, s[12:15], s37 offen
+	buffer_store_b32 v18, v152, s[56:59], s37 offen
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(6)
 	v_add_f32_e32 v19, v19, v169
-	buffer_store_b32 v19, v152, s[12:15], s37 offen offset:4
+	buffer_store_b32 v19, v152, s[56:59], s37 offen offset:4
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(5)
 	v_add_f32_e32 v20, v20, v170
-	buffer_store_b32 v20, v152, s[12:15], s37 offen offset:8
+	buffer_store_b32 v20, v152, s[56:59], s37 offen offset:8
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(4)
 	v_add_f32_e32 v21, v21, v171
-	buffer_store_b32 v21, v152, s[12:15], s37 offen offset:12
+	buffer_store_b32 v21, v152, s[56:59], s37 offen offset:12
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(3)
 	v_add_f32_e32 v22, v22, v172
-	buffer_store_b32 v22, v152, s[12:15], s37 offen offset:16
+	buffer_store_b32 v22, v152, s[56:59], s37 offen offset:16
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(2)
 	v_add_f32_e32 v23, v23, v173
-	buffer_store_b32 v23, v152, s[12:15], s37 offen offset:20
+	buffer_store_b32 v23, v152, s[56:59], s37 offen offset:20
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(1)
 	v_add_f32_e32 v24, v24, v174
-	buffer_store_b32 v24, v152, s[12:15], s37 offen offset:24
+	buffer_store_b32 v24, v152, s[56:59], s37 offen offset:24
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(0)
 	v_add_f32_e32 v25, v25, v175
-	buffer_store_b32 v25, v152, s[12:15], s37 offen offset:28
+	buffer_store_b32 v25, v152, s[56:59], s37 offen offset:28
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	s_sub_i32 s41, s24, 16
@@ -2998,42 +2998,42 @@ gemm_mq6g256v2_residual_pm_gfx1100_w4:
 	s_mov_b32 s42, s22
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v168, v153, s[12:15], s37 offen
+	buffer_load_b32 v168, v153, s[56:59], s37 offen
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v169, v153, s[12:15], s37 offen offset:4
+	buffer_load_b32 v169, v153, s[56:59], s37 offen offset:4
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v170, v153, s[12:15], s37 offen offset:8
+	buffer_load_b32 v170, v153, s[56:59], s37 offen offset:8
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v171, v153, s[12:15], s37 offen offset:12
+	buffer_load_b32 v171, v153, s[56:59], s37 offen offset:12
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v172, v153, s[12:15], s37 offen offset:16
+	buffer_load_b32 v172, v153, s[56:59], s37 offen offset:16
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v173, v153, s[12:15], s37 offen offset:20
+	buffer_load_b32 v173, v153, s[56:59], s37 offen offset:20
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v174, v153, s[12:15], s37 offen offset:24
+	buffer_load_b32 v174, v153, s[56:59], s37 offen offset:24
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v175, v153, s[12:15], s37 offen offset:28
+	buffer_load_b32 v175, v153, s[56:59], s37 offen offset:28
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	s_mov_b32 s42, s22
@@ -3041,56 +3041,56 @@ gemm_mq6g256v2_residual_pm_gfx1100_w4:
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(7)
 	v_add_f32_e32 v26, v26, v168
-	buffer_store_b32 v26, v153, s[12:15], s37 offen
+	buffer_store_b32 v26, v153, s[56:59], s37 offen
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(6)
 	v_add_f32_e32 v27, v27, v169
-	buffer_store_b32 v27, v153, s[12:15], s37 offen offset:4
+	buffer_store_b32 v27, v153, s[56:59], s37 offen offset:4
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(5)
 	v_add_f32_e32 v28, v28, v170
-	buffer_store_b32 v28, v153, s[12:15], s37 offen offset:8
+	buffer_store_b32 v28, v153, s[56:59], s37 offen offset:8
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(4)
 	v_add_f32_e32 v29, v29, v171
-	buffer_store_b32 v29, v153, s[12:15], s37 offen offset:12
+	buffer_store_b32 v29, v153, s[56:59], s37 offen offset:12
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(3)
 	v_add_f32_e32 v30, v30, v172
-	buffer_store_b32 v30, v153, s[12:15], s37 offen offset:16
+	buffer_store_b32 v30, v153, s[56:59], s37 offen offset:16
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(2)
 	v_add_f32_e32 v31, v31, v173
-	buffer_store_b32 v31, v153, s[12:15], s37 offen offset:20
+	buffer_store_b32 v31, v153, s[56:59], s37 offen offset:20
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(1)
 	v_add_f32_e32 v32, v32, v174
-	buffer_store_b32 v32, v153, s[12:15], s37 offen offset:24
+	buffer_store_b32 v32, v153, s[56:59], s37 offen offset:24
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(0)
 	v_add_f32_e32 v33, v33, v175
-	buffer_store_b32 v33, v153, s[12:15], s37 offen offset:28
+	buffer_store_b32 v33, v153, s[56:59], s37 offen offset:28
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	s_sub_i32 s41, s24, 32
@@ -3098,42 +3098,42 @@ gemm_mq6g256v2_residual_pm_gfx1100_w4:
 	s_mov_b32 s42, s22
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v168, v154, s[12:15], s37 offen
+	buffer_load_b32 v168, v154, s[56:59], s37 offen
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v169, v154, s[12:15], s37 offen offset:4
+	buffer_load_b32 v169, v154, s[56:59], s37 offen offset:4
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v170, v154, s[12:15], s37 offen offset:8
+	buffer_load_b32 v170, v154, s[56:59], s37 offen offset:8
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v171, v154, s[12:15], s37 offen offset:12
+	buffer_load_b32 v171, v154, s[56:59], s37 offen offset:12
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v172, v154, s[12:15], s37 offen offset:16
+	buffer_load_b32 v172, v154, s[56:59], s37 offen offset:16
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v173, v154, s[12:15], s37 offen offset:20
+	buffer_load_b32 v173, v154, s[56:59], s37 offen offset:20
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v174, v154, s[12:15], s37 offen offset:24
+	buffer_load_b32 v174, v154, s[56:59], s37 offen offset:24
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v175, v154, s[12:15], s37 offen offset:28
+	buffer_load_b32 v175, v154, s[56:59], s37 offen offset:28
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	s_mov_b32 s42, s22
@@ -3141,56 +3141,56 @@ gemm_mq6g256v2_residual_pm_gfx1100_w4:
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(7)
 	v_add_f32_e32 v34, v34, v168
-	buffer_store_b32 v34, v154, s[12:15], s37 offen
+	buffer_store_b32 v34, v154, s[56:59], s37 offen
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(6)
 	v_add_f32_e32 v35, v35, v169
-	buffer_store_b32 v35, v154, s[12:15], s37 offen offset:4
+	buffer_store_b32 v35, v154, s[56:59], s37 offen offset:4
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(5)
 	v_add_f32_e32 v36, v36, v170
-	buffer_store_b32 v36, v154, s[12:15], s37 offen offset:8
+	buffer_store_b32 v36, v154, s[56:59], s37 offen offset:8
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(4)
 	v_add_f32_e32 v37, v37, v171
-	buffer_store_b32 v37, v154, s[12:15], s37 offen offset:12
+	buffer_store_b32 v37, v154, s[56:59], s37 offen offset:12
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(3)
 	v_add_f32_e32 v38, v38, v172
-	buffer_store_b32 v38, v154, s[12:15], s37 offen offset:16
+	buffer_store_b32 v38, v154, s[56:59], s37 offen offset:16
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(2)
 	v_add_f32_e32 v39, v39, v173
-	buffer_store_b32 v39, v154, s[12:15], s37 offen offset:20
+	buffer_store_b32 v39, v154, s[56:59], s37 offen offset:20
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(1)
 	v_add_f32_e32 v40, v40, v174
-	buffer_store_b32 v40, v154, s[12:15], s37 offen offset:24
+	buffer_store_b32 v40, v154, s[56:59], s37 offen offset:24
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(0)
 	v_add_f32_e32 v41, v41, v175
-	buffer_store_b32 v41, v154, s[12:15], s37 offen offset:28
+	buffer_store_b32 v41, v154, s[56:59], s37 offen offset:28
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	s_sub_i32 s41, s24, 48
@@ -3198,42 +3198,42 @@ gemm_mq6g256v2_residual_pm_gfx1100_w4:
 	s_mov_b32 s42, s22
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v168, v155, s[12:15], s37 offen
+	buffer_load_b32 v168, v155, s[56:59], s37 offen
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v169, v155, s[12:15], s37 offen offset:4
+	buffer_load_b32 v169, v155, s[56:59], s37 offen offset:4
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v170, v155, s[12:15], s37 offen offset:8
+	buffer_load_b32 v170, v155, s[56:59], s37 offen offset:8
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v171, v155, s[12:15], s37 offen offset:12
+	buffer_load_b32 v171, v155, s[56:59], s37 offen offset:12
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v172, v155, s[12:15], s37 offen offset:16
+	buffer_load_b32 v172, v155, s[56:59], s37 offen offset:16
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v173, v155, s[12:15], s37 offen offset:20
+	buffer_load_b32 v173, v155, s[56:59], s37 offen offset:20
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v174, v155, s[12:15], s37 offen offset:24
+	buffer_load_b32 v174, v155, s[56:59], s37 offen offset:24
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v175, v155, s[12:15], s37 offen offset:28
+	buffer_load_b32 v175, v155, s[56:59], s37 offen offset:28
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	s_mov_b32 s42, s22
@@ -3241,56 +3241,56 @@ gemm_mq6g256v2_residual_pm_gfx1100_w4:
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(7)
 	v_add_f32_e32 v42, v42, v168
-	buffer_store_b32 v42, v155, s[12:15], s37 offen
+	buffer_store_b32 v42, v155, s[56:59], s37 offen
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(6)
 	v_add_f32_e32 v43, v43, v169
-	buffer_store_b32 v43, v155, s[12:15], s37 offen offset:4
+	buffer_store_b32 v43, v155, s[56:59], s37 offen offset:4
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(5)
 	v_add_f32_e32 v44, v44, v170
-	buffer_store_b32 v44, v155, s[12:15], s37 offen offset:8
+	buffer_store_b32 v44, v155, s[56:59], s37 offen offset:8
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(4)
 	v_add_f32_e32 v45, v45, v171
-	buffer_store_b32 v45, v155, s[12:15], s37 offen offset:12
+	buffer_store_b32 v45, v155, s[56:59], s37 offen offset:12
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(3)
 	v_add_f32_e32 v46, v46, v172
-	buffer_store_b32 v46, v155, s[12:15], s37 offen offset:16
+	buffer_store_b32 v46, v155, s[56:59], s37 offen offset:16
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(2)
 	v_add_f32_e32 v47, v47, v173
-	buffer_store_b32 v47, v155, s[12:15], s37 offen offset:20
+	buffer_store_b32 v47, v155, s[56:59], s37 offen offset:20
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(1)
 	v_add_f32_e32 v48, v48, v174
-	buffer_store_b32 v48, v155, s[12:15], s37 offen offset:24
+	buffer_store_b32 v48, v155, s[56:59], s37 offen offset:24
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(0)
 	v_add_f32_e32 v49, v49, v175
-	buffer_store_b32 v49, v155, s[12:15], s37 offen offset:28
+	buffer_store_b32 v49, v155, s[56:59], s37 offen offset:28
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	s_sub_i32 s41, s24, 64
@@ -3298,42 +3298,42 @@ gemm_mq6g256v2_residual_pm_gfx1100_w4:
 	s_mov_b32 s42, s22
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v168, v156, s[12:15], s37 offen
+	buffer_load_b32 v168, v156, s[56:59], s37 offen
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v169, v156, s[12:15], s37 offen offset:4
+	buffer_load_b32 v169, v156, s[56:59], s37 offen offset:4
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v170, v156, s[12:15], s37 offen offset:8
+	buffer_load_b32 v170, v156, s[56:59], s37 offen offset:8
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v171, v156, s[12:15], s37 offen offset:12
+	buffer_load_b32 v171, v156, s[56:59], s37 offen offset:12
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v172, v156, s[12:15], s37 offen offset:16
+	buffer_load_b32 v172, v156, s[56:59], s37 offen offset:16
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v173, v156, s[12:15], s37 offen offset:20
+	buffer_load_b32 v173, v156, s[56:59], s37 offen offset:20
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v174, v156, s[12:15], s37 offen offset:24
+	buffer_load_b32 v174, v156, s[56:59], s37 offen offset:24
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v175, v156, s[12:15], s37 offen offset:28
+	buffer_load_b32 v175, v156, s[56:59], s37 offen offset:28
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	s_mov_b32 s42, s22
@@ -3341,56 +3341,56 @@ gemm_mq6g256v2_residual_pm_gfx1100_w4:
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(7)
 	v_add_f32_e32 v50, v50, v168
-	buffer_store_b32 v50, v156, s[12:15], s37 offen
+	buffer_store_b32 v50, v156, s[56:59], s37 offen
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(6)
 	v_add_f32_e32 v51, v51, v169
-	buffer_store_b32 v51, v156, s[12:15], s37 offen offset:4
+	buffer_store_b32 v51, v156, s[56:59], s37 offen offset:4
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(5)
 	v_add_f32_e32 v52, v52, v170
-	buffer_store_b32 v52, v156, s[12:15], s37 offen offset:8
+	buffer_store_b32 v52, v156, s[56:59], s37 offen offset:8
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(4)
 	v_add_f32_e32 v53, v53, v171
-	buffer_store_b32 v53, v156, s[12:15], s37 offen offset:12
+	buffer_store_b32 v53, v156, s[56:59], s37 offen offset:12
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(3)
 	v_add_f32_e32 v54, v54, v172
-	buffer_store_b32 v54, v156, s[12:15], s37 offen offset:16
+	buffer_store_b32 v54, v156, s[56:59], s37 offen offset:16
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(2)
 	v_add_f32_e32 v55, v55, v173
-	buffer_store_b32 v55, v156, s[12:15], s37 offen offset:20
+	buffer_store_b32 v55, v156, s[56:59], s37 offen offset:20
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(1)
 	v_add_f32_e32 v56, v56, v174
-	buffer_store_b32 v56, v156, s[12:15], s37 offen offset:24
+	buffer_store_b32 v56, v156, s[56:59], s37 offen offset:24
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(0)
 	v_add_f32_e32 v57, v57, v175
-	buffer_store_b32 v57, v156, s[12:15], s37 offen offset:28
+	buffer_store_b32 v57, v156, s[56:59], s37 offen offset:28
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	s_sub_i32 s41, s24, 0x50
@@ -3398,42 +3398,42 @@ gemm_mq6g256v2_residual_pm_gfx1100_w4:
 	s_mov_b32 s42, s22
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v168, v157, s[12:15], s37 offen
+	buffer_load_b32 v168, v157, s[56:59], s37 offen
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v169, v157, s[12:15], s37 offen offset:4
+	buffer_load_b32 v169, v157, s[56:59], s37 offen offset:4
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v170, v157, s[12:15], s37 offen offset:8
+	buffer_load_b32 v170, v157, s[56:59], s37 offen offset:8
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v171, v157, s[12:15], s37 offen offset:12
+	buffer_load_b32 v171, v157, s[56:59], s37 offen offset:12
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v172, v157, s[12:15], s37 offen offset:16
+	buffer_load_b32 v172, v157, s[56:59], s37 offen offset:16
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v173, v157, s[12:15], s37 offen offset:20
+	buffer_load_b32 v173, v157, s[56:59], s37 offen offset:20
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v174, v157, s[12:15], s37 offen offset:24
+	buffer_load_b32 v174, v157, s[56:59], s37 offen offset:24
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v175, v157, s[12:15], s37 offen offset:28
+	buffer_load_b32 v175, v157, s[56:59], s37 offen offset:28
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	s_mov_b32 s42, s22
@@ -3441,56 +3441,56 @@ gemm_mq6g256v2_residual_pm_gfx1100_w4:
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(7)
 	v_add_f32_e32 v58, v58, v168
-	buffer_store_b32 v58, v157, s[12:15], s37 offen
+	buffer_store_b32 v58, v157, s[56:59], s37 offen
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(6)
 	v_add_f32_e32 v59, v59, v169
-	buffer_store_b32 v59, v157, s[12:15], s37 offen offset:4
+	buffer_store_b32 v59, v157, s[56:59], s37 offen offset:4
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(5)
 	v_add_f32_e32 v60, v60, v170
-	buffer_store_b32 v60, v157, s[12:15], s37 offen offset:8
+	buffer_store_b32 v60, v157, s[56:59], s37 offen offset:8
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(4)
 	v_add_f32_e32 v61, v61, v171
-	buffer_store_b32 v61, v157, s[12:15], s37 offen offset:12
+	buffer_store_b32 v61, v157, s[56:59], s37 offen offset:12
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(3)
 	v_add_f32_e32 v62, v62, v172
-	buffer_store_b32 v62, v157, s[12:15], s37 offen offset:16
+	buffer_store_b32 v62, v157, s[56:59], s37 offen offset:16
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(2)
 	v_add_f32_e32 v63, v63, v173
-	buffer_store_b32 v63, v157, s[12:15], s37 offen offset:20
+	buffer_store_b32 v63, v157, s[56:59], s37 offen offset:20
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(1)
 	v_add_f32_e32 v64, v64, v174
-	buffer_store_b32 v64, v157, s[12:15], s37 offen offset:24
+	buffer_store_b32 v64, v157, s[56:59], s37 offen offset:24
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(0)
 	v_add_f32_e32 v65, v65, v175
-	buffer_store_b32 v65, v157, s[12:15], s37 offen offset:28
+	buffer_store_b32 v65, v157, s[56:59], s37 offen offset:28
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	s_sub_i32 s41, s24, 0x60
@@ -3498,42 +3498,42 @@ gemm_mq6g256v2_residual_pm_gfx1100_w4:
 	s_mov_b32 s42, s22
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v168, v158, s[12:15], s37 offen
+	buffer_load_b32 v168, v158, s[56:59], s37 offen
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v169, v158, s[12:15], s37 offen offset:4
+	buffer_load_b32 v169, v158, s[56:59], s37 offen offset:4
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v170, v158, s[12:15], s37 offen offset:8
+	buffer_load_b32 v170, v158, s[56:59], s37 offen offset:8
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v171, v158, s[12:15], s37 offen offset:12
+	buffer_load_b32 v171, v158, s[56:59], s37 offen offset:12
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v172, v158, s[12:15], s37 offen offset:16
+	buffer_load_b32 v172, v158, s[56:59], s37 offen offset:16
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v173, v158, s[12:15], s37 offen offset:20
+	buffer_load_b32 v173, v158, s[56:59], s37 offen offset:20
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v174, v158, s[12:15], s37 offen offset:24
+	buffer_load_b32 v174, v158, s[56:59], s37 offen offset:24
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v175, v158, s[12:15], s37 offen offset:28
+	buffer_load_b32 v175, v158, s[56:59], s37 offen offset:28
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	s_mov_b32 s42, s22
@@ -3541,56 +3541,56 @@ gemm_mq6g256v2_residual_pm_gfx1100_w4:
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(7)
 	v_add_f32_e32 v66, v66, v168
-	buffer_store_b32 v66, v158, s[12:15], s37 offen
+	buffer_store_b32 v66, v158, s[56:59], s37 offen
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(6)
 	v_add_f32_e32 v67, v67, v169
-	buffer_store_b32 v67, v158, s[12:15], s37 offen offset:4
+	buffer_store_b32 v67, v158, s[56:59], s37 offen offset:4
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(5)
 	v_add_f32_e32 v68, v68, v170
-	buffer_store_b32 v68, v158, s[12:15], s37 offen offset:8
+	buffer_store_b32 v68, v158, s[56:59], s37 offen offset:8
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(4)
 	v_add_f32_e32 v69, v69, v171
-	buffer_store_b32 v69, v158, s[12:15], s37 offen offset:12
+	buffer_store_b32 v69, v158, s[56:59], s37 offen offset:12
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(3)
 	v_add_f32_e32 v70, v70, v172
-	buffer_store_b32 v70, v158, s[12:15], s37 offen offset:16
+	buffer_store_b32 v70, v158, s[56:59], s37 offen offset:16
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(2)
 	v_add_f32_e32 v71, v71, v173
-	buffer_store_b32 v71, v158, s[12:15], s37 offen offset:20
+	buffer_store_b32 v71, v158, s[56:59], s37 offen offset:20
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(1)
 	v_add_f32_e32 v72, v72, v174
-	buffer_store_b32 v72, v158, s[12:15], s37 offen offset:24
+	buffer_store_b32 v72, v158, s[56:59], s37 offen offset:24
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(0)
 	v_add_f32_e32 v73, v73, v175
-	buffer_store_b32 v73, v158, s[12:15], s37 offen offset:28
+	buffer_store_b32 v73, v158, s[56:59], s37 offen offset:28
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	s_sub_i32 s41, s24, 0x70
@@ -3598,42 +3598,42 @@ gemm_mq6g256v2_residual_pm_gfx1100_w4:
 	s_mov_b32 s42, s22
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v168, v159, s[12:15], s37 offen
+	buffer_load_b32 v168, v159, s[56:59], s37 offen
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v169, v159, s[12:15], s37 offen offset:4
+	buffer_load_b32 v169, v159, s[56:59], s37 offen offset:4
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v170, v159, s[12:15], s37 offen offset:8
+	buffer_load_b32 v170, v159, s[56:59], s37 offen offset:8
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v171, v159, s[12:15], s37 offen offset:12
+	buffer_load_b32 v171, v159, s[56:59], s37 offen offset:12
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v172, v159, s[12:15], s37 offen offset:16
+	buffer_load_b32 v172, v159, s[56:59], s37 offen offset:16
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v173, v159, s[12:15], s37 offen offset:20
+	buffer_load_b32 v173, v159, s[56:59], s37 offen offset:20
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v174, v159, s[12:15], s37 offen offset:24
+	buffer_load_b32 v174, v159, s[56:59], s37 offen offset:24
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v175, v159, s[12:15], s37 offen offset:28
+	buffer_load_b32 v175, v159, s[56:59], s37 offen offset:28
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	s_mov_b32 s42, s22
@@ -3641,56 +3641,56 @@ gemm_mq6g256v2_residual_pm_gfx1100_w4:
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(7)
 	v_add_f32_e32 v74, v74, v168
-	buffer_store_b32 v74, v159, s[12:15], s37 offen
+	buffer_store_b32 v74, v159, s[56:59], s37 offen
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(6)
 	v_add_f32_e32 v75, v75, v169
-	buffer_store_b32 v75, v159, s[12:15], s37 offen offset:4
+	buffer_store_b32 v75, v159, s[56:59], s37 offen offset:4
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(5)
 	v_add_f32_e32 v76, v76, v170
-	buffer_store_b32 v76, v159, s[12:15], s37 offen offset:8
+	buffer_store_b32 v76, v159, s[56:59], s37 offen offset:8
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(4)
 	v_add_f32_e32 v77, v77, v171
-	buffer_store_b32 v77, v159, s[12:15], s37 offen offset:12
+	buffer_store_b32 v77, v159, s[56:59], s37 offen offset:12
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(3)
 	v_add_f32_e32 v78, v78, v172
-	buffer_store_b32 v78, v159, s[12:15], s37 offen offset:16
+	buffer_store_b32 v78, v159, s[56:59], s37 offen offset:16
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(2)
 	v_add_f32_e32 v79, v79, v173
-	buffer_store_b32 v79, v159, s[12:15], s37 offen offset:20
+	buffer_store_b32 v79, v159, s[56:59], s37 offen offset:20
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(1)
 	v_add_f32_e32 v80, v80, v174
-	buffer_store_b32 v80, v159, s[12:15], s37 offen offset:24
+	buffer_store_b32 v80, v159, s[56:59], s37 offen offset:24
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(0)
 	v_add_f32_e32 v81, v81, v175
-	buffer_store_b32 v81, v159, s[12:15], s37 offen offset:28
+	buffer_store_b32 v81, v159, s[56:59], s37 offen offset:28
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	s_sub_i32 s41, s24, 0x80
@@ -3698,42 +3698,42 @@ gemm_mq6g256v2_residual_pm_gfx1100_w4:
 	s_mov_b32 s42, s22
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v168, v160, s[12:15], s37 offen
+	buffer_load_b32 v168, v160, s[56:59], s37 offen
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v169, v160, s[12:15], s37 offen offset:4
+	buffer_load_b32 v169, v160, s[56:59], s37 offen offset:4
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v170, v160, s[12:15], s37 offen offset:8
+	buffer_load_b32 v170, v160, s[56:59], s37 offen offset:8
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v171, v160, s[12:15], s37 offen offset:12
+	buffer_load_b32 v171, v160, s[56:59], s37 offen offset:12
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v172, v160, s[12:15], s37 offen offset:16
+	buffer_load_b32 v172, v160, s[56:59], s37 offen offset:16
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v173, v160, s[12:15], s37 offen offset:20
+	buffer_load_b32 v173, v160, s[56:59], s37 offen offset:20
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v174, v160, s[12:15], s37 offen offset:24
+	buffer_load_b32 v174, v160, s[56:59], s37 offen offset:24
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v175, v160, s[12:15], s37 offen offset:28
+	buffer_load_b32 v175, v160, s[56:59], s37 offen offset:28
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	s_mov_b32 s42, s22
@@ -3741,56 +3741,56 @@ gemm_mq6g256v2_residual_pm_gfx1100_w4:
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(7)
 	v_add_f32_e32 v82, v82, v168
-	buffer_store_b32 v82, v160, s[12:15], s37 offen
+	buffer_store_b32 v82, v160, s[56:59], s37 offen
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(6)
 	v_add_f32_e32 v83, v83, v169
-	buffer_store_b32 v83, v160, s[12:15], s37 offen offset:4
+	buffer_store_b32 v83, v160, s[56:59], s37 offen offset:4
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(5)
 	v_add_f32_e32 v84, v84, v170
-	buffer_store_b32 v84, v160, s[12:15], s37 offen offset:8
+	buffer_store_b32 v84, v160, s[56:59], s37 offen offset:8
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(4)
 	v_add_f32_e32 v85, v85, v171
-	buffer_store_b32 v85, v160, s[12:15], s37 offen offset:12
+	buffer_store_b32 v85, v160, s[56:59], s37 offen offset:12
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(3)
 	v_add_f32_e32 v86, v86, v172
-	buffer_store_b32 v86, v160, s[12:15], s37 offen offset:16
+	buffer_store_b32 v86, v160, s[56:59], s37 offen offset:16
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(2)
 	v_add_f32_e32 v87, v87, v173
-	buffer_store_b32 v87, v160, s[12:15], s37 offen offset:20
+	buffer_store_b32 v87, v160, s[56:59], s37 offen offset:20
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(1)
 	v_add_f32_e32 v88, v88, v174
-	buffer_store_b32 v88, v160, s[12:15], s37 offen offset:24
+	buffer_store_b32 v88, v160, s[56:59], s37 offen offset:24
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(0)
 	v_add_f32_e32 v89, v89, v175
-	buffer_store_b32 v89, v160, s[12:15], s37 offen offset:28
+	buffer_store_b32 v89, v160, s[56:59], s37 offen offset:28
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	s_sub_i32 s41, s24, 0x90
@@ -3798,42 +3798,42 @@ gemm_mq6g256v2_residual_pm_gfx1100_w4:
 	s_mov_b32 s42, s22
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v168, v161, s[12:15], s37 offen
+	buffer_load_b32 v168, v161, s[56:59], s37 offen
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v169, v161, s[12:15], s37 offen offset:4
+	buffer_load_b32 v169, v161, s[56:59], s37 offen offset:4
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v170, v161, s[12:15], s37 offen offset:8
+	buffer_load_b32 v170, v161, s[56:59], s37 offen offset:8
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v171, v161, s[12:15], s37 offen offset:12
+	buffer_load_b32 v171, v161, s[56:59], s37 offen offset:12
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v172, v161, s[12:15], s37 offen offset:16
+	buffer_load_b32 v172, v161, s[56:59], s37 offen offset:16
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v173, v161, s[12:15], s37 offen offset:20
+	buffer_load_b32 v173, v161, s[56:59], s37 offen offset:20
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v174, v161, s[12:15], s37 offen offset:24
+	buffer_load_b32 v174, v161, s[56:59], s37 offen offset:24
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v175, v161, s[12:15], s37 offen offset:28
+	buffer_load_b32 v175, v161, s[56:59], s37 offen offset:28
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	s_mov_b32 s42, s22
@@ -3841,56 +3841,56 @@ gemm_mq6g256v2_residual_pm_gfx1100_w4:
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(7)
 	v_add_f32_e32 v90, v90, v168
-	buffer_store_b32 v90, v161, s[12:15], s37 offen
+	buffer_store_b32 v90, v161, s[56:59], s37 offen
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(6)
 	v_add_f32_e32 v91, v91, v169
-	buffer_store_b32 v91, v161, s[12:15], s37 offen offset:4
+	buffer_store_b32 v91, v161, s[56:59], s37 offen offset:4
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(5)
 	v_add_f32_e32 v92, v92, v170
-	buffer_store_b32 v92, v161, s[12:15], s37 offen offset:8
+	buffer_store_b32 v92, v161, s[56:59], s37 offen offset:8
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(4)
 	v_add_f32_e32 v93, v93, v171
-	buffer_store_b32 v93, v161, s[12:15], s37 offen offset:12
+	buffer_store_b32 v93, v161, s[56:59], s37 offen offset:12
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(3)
 	v_add_f32_e32 v94, v94, v172
-	buffer_store_b32 v94, v161, s[12:15], s37 offen offset:16
+	buffer_store_b32 v94, v161, s[56:59], s37 offen offset:16
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(2)
 	v_add_f32_e32 v95, v95, v173
-	buffer_store_b32 v95, v161, s[12:15], s37 offen offset:20
+	buffer_store_b32 v95, v161, s[56:59], s37 offen offset:20
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(1)
 	v_add_f32_e32 v96, v96, v174
-	buffer_store_b32 v96, v161, s[12:15], s37 offen offset:24
+	buffer_store_b32 v96, v161, s[56:59], s37 offen offset:24
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(0)
 	v_add_f32_e32 v97, v97, v175
-	buffer_store_b32 v97, v161, s[12:15], s37 offen offset:28
+	buffer_store_b32 v97, v161, s[56:59], s37 offen offset:28
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	s_sub_i32 s41, s24, 0xa0
@@ -3898,42 +3898,42 @@ gemm_mq6g256v2_residual_pm_gfx1100_w4:
 	s_mov_b32 s42, s22
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v168, v162, s[12:15], s37 offen
+	buffer_load_b32 v168, v162, s[56:59], s37 offen
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v169, v162, s[12:15], s37 offen offset:4
+	buffer_load_b32 v169, v162, s[56:59], s37 offen offset:4
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v170, v162, s[12:15], s37 offen offset:8
+	buffer_load_b32 v170, v162, s[56:59], s37 offen offset:8
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v171, v162, s[12:15], s37 offen offset:12
+	buffer_load_b32 v171, v162, s[56:59], s37 offen offset:12
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v172, v162, s[12:15], s37 offen offset:16
+	buffer_load_b32 v172, v162, s[56:59], s37 offen offset:16
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v173, v162, s[12:15], s37 offen offset:20
+	buffer_load_b32 v173, v162, s[56:59], s37 offen offset:20
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v174, v162, s[12:15], s37 offen offset:24
+	buffer_load_b32 v174, v162, s[56:59], s37 offen offset:24
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v175, v162, s[12:15], s37 offen offset:28
+	buffer_load_b32 v175, v162, s[56:59], s37 offen offset:28
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	s_mov_b32 s42, s22
@@ -3941,56 +3941,56 @@ gemm_mq6g256v2_residual_pm_gfx1100_w4:
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(7)
 	v_add_f32_e32 v98, v98, v168
-	buffer_store_b32 v98, v162, s[12:15], s37 offen
+	buffer_store_b32 v98, v162, s[56:59], s37 offen
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(6)
 	v_add_f32_e32 v99, v99, v169
-	buffer_store_b32 v99, v162, s[12:15], s37 offen offset:4
+	buffer_store_b32 v99, v162, s[56:59], s37 offen offset:4
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(5)
 	v_add_f32_e32 v100, v100, v170
-	buffer_store_b32 v100, v162, s[12:15], s37 offen offset:8
+	buffer_store_b32 v100, v162, s[56:59], s37 offen offset:8
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(4)
 	v_add_f32_e32 v101, v101, v171
-	buffer_store_b32 v101, v162, s[12:15], s37 offen offset:12
+	buffer_store_b32 v101, v162, s[56:59], s37 offen offset:12
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(3)
 	v_add_f32_e32 v102, v102, v172
-	buffer_store_b32 v102, v162, s[12:15], s37 offen offset:16
+	buffer_store_b32 v102, v162, s[56:59], s37 offen offset:16
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(2)
 	v_add_f32_e32 v103, v103, v173
-	buffer_store_b32 v103, v162, s[12:15], s37 offen offset:20
+	buffer_store_b32 v103, v162, s[56:59], s37 offen offset:20
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(1)
 	v_add_f32_e32 v104, v104, v174
-	buffer_store_b32 v104, v162, s[12:15], s37 offen offset:24
+	buffer_store_b32 v104, v162, s[56:59], s37 offen offset:24
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(0)
 	v_add_f32_e32 v105, v105, v175
-	buffer_store_b32 v105, v162, s[12:15], s37 offen offset:28
+	buffer_store_b32 v105, v162, s[56:59], s37 offen offset:28
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	s_sub_i32 s41, s24, 0xb0
@@ -3998,42 +3998,42 @@ gemm_mq6g256v2_residual_pm_gfx1100_w4:
 	s_mov_b32 s42, s22
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v168, v163, s[12:15], s37 offen
+	buffer_load_b32 v168, v163, s[56:59], s37 offen
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v169, v163, s[12:15], s37 offen offset:4
+	buffer_load_b32 v169, v163, s[56:59], s37 offen offset:4
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v170, v163, s[12:15], s37 offen offset:8
+	buffer_load_b32 v170, v163, s[56:59], s37 offen offset:8
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v171, v163, s[12:15], s37 offen offset:12
+	buffer_load_b32 v171, v163, s[56:59], s37 offen offset:12
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v172, v163, s[12:15], s37 offen offset:16
+	buffer_load_b32 v172, v163, s[56:59], s37 offen offset:16
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v173, v163, s[12:15], s37 offen offset:20
+	buffer_load_b32 v173, v163, s[56:59], s37 offen offset:20
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v174, v163, s[12:15], s37 offen offset:24
+	buffer_load_b32 v174, v163, s[56:59], s37 offen offset:24
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v175, v163, s[12:15], s37 offen offset:28
+	buffer_load_b32 v175, v163, s[56:59], s37 offen offset:28
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	s_mov_b32 s42, s22
@@ -4041,56 +4041,56 @@ gemm_mq6g256v2_residual_pm_gfx1100_w4:
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(7)
 	v_add_f32_e32 v106, v106, v168
-	buffer_store_b32 v106, v163, s[12:15], s37 offen
+	buffer_store_b32 v106, v163, s[56:59], s37 offen
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(6)
 	v_add_f32_e32 v107, v107, v169
-	buffer_store_b32 v107, v163, s[12:15], s37 offen offset:4
+	buffer_store_b32 v107, v163, s[56:59], s37 offen offset:4
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(5)
 	v_add_f32_e32 v108, v108, v170
-	buffer_store_b32 v108, v163, s[12:15], s37 offen offset:8
+	buffer_store_b32 v108, v163, s[56:59], s37 offen offset:8
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(4)
 	v_add_f32_e32 v109, v109, v171
-	buffer_store_b32 v109, v163, s[12:15], s37 offen offset:12
+	buffer_store_b32 v109, v163, s[56:59], s37 offen offset:12
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(3)
 	v_add_f32_e32 v110, v110, v172
-	buffer_store_b32 v110, v163, s[12:15], s37 offen offset:16
+	buffer_store_b32 v110, v163, s[56:59], s37 offen offset:16
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(2)
 	v_add_f32_e32 v111, v111, v173
-	buffer_store_b32 v111, v163, s[12:15], s37 offen offset:20
+	buffer_store_b32 v111, v163, s[56:59], s37 offen offset:20
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(1)
 	v_add_f32_e32 v112, v112, v174
-	buffer_store_b32 v112, v163, s[12:15], s37 offen offset:24
+	buffer_store_b32 v112, v163, s[56:59], s37 offen offset:24
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(0)
 	v_add_f32_e32 v113, v113, v175
-	buffer_store_b32 v113, v163, s[12:15], s37 offen offset:28
+	buffer_store_b32 v113, v163, s[56:59], s37 offen offset:28
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	s_sub_i32 s41, s24, 0xc0
@@ -4098,42 +4098,42 @@ gemm_mq6g256v2_residual_pm_gfx1100_w4:
 	s_mov_b32 s42, s22
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v168, v164, s[12:15], s37 offen
+	buffer_load_b32 v168, v164, s[56:59], s37 offen
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v169, v164, s[12:15], s37 offen offset:4
+	buffer_load_b32 v169, v164, s[56:59], s37 offen offset:4
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v170, v164, s[12:15], s37 offen offset:8
+	buffer_load_b32 v170, v164, s[56:59], s37 offen offset:8
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v171, v164, s[12:15], s37 offen offset:12
+	buffer_load_b32 v171, v164, s[56:59], s37 offen offset:12
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v172, v164, s[12:15], s37 offen offset:16
+	buffer_load_b32 v172, v164, s[56:59], s37 offen offset:16
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v173, v164, s[12:15], s37 offen offset:20
+	buffer_load_b32 v173, v164, s[56:59], s37 offen offset:20
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v174, v164, s[12:15], s37 offen offset:24
+	buffer_load_b32 v174, v164, s[56:59], s37 offen offset:24
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v175, v164, s[12:15], s37 offen offset:28
+	buffer_load_b32 v175, v164, s[56:59], s37 offen offset:28
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	s_mov_b32 s42, s22
@@ -4141,56 +4141,56 @@ gemm_mq6g256v2_residual_pm_gfx1100_w4:
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(7)
 	v_add_f32_e32 v114, v114, v168
-	buffer_store_b32 v114, v164, s[12:15], s37 offen
+	buffer_store_b32 v114, v164, s[56:59], s37 offen
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(6)
 	v_add_f32_e32 v115, v115, v169
-	buffer_store_b32 v115, v164, s[12:15], s37 offen offset:4
+	buffer_store_b32 v115, v164, s[56:59], s37 offen offset:4
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(5)
 	v_add_f32_e32 v116, v116, v170
-	buffer_store_b32 v116, v164, s[12:15], s37 offen offset:8
+	buffer_store_b32 v116, v164, s[56:59], s37 offen offset:8
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(4)
 	v_add_f32_e32 v117, v117, v171
-	buffer_store_b32 v117, v164, s[12:15], s37 offen offset:12
+	buffer_store_b32 v117, v164, s[56:59], s37 offen offset:12
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(3)
 	v_add_f32_e32 v118, v118, v172
-	buffer_store_b32 v118, v164, s[12:15], s37 offen offset:16
+	buffer_store_b32 v118, v164, s[56:59], s37 offen offset:16
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(2)
 	v_add_f32_e32 v119, v119, v173
-	buffer_store_b32 v119, v164, s[12:15], s37 offen offset:20
+	buffer_store_b32 v119, v164, s[56:59], s37 offen offset:20
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(1)
 	v_add_f32_e32 v120, v120, v174
-	buffer_store_b32 v120, v164, s[12:15], s37 offen offset:24
+	buffer_store_b32 v120, v164, s[56:59], s37 offen offset:24
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(0)
 	v_add_f32_e32 v121, v121, v175
-	buffer_store_b32 v121, v164, s[12:15], s37 offen offset:28
+	buffer_store_b32 v121, v164, s[56:59], s37 offen offset:28
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	s_sub_i32 s41, s24, 0xd0
@@ -4198,42 +4198,42 @@ gemm_mq6g256v2_residual_pm_gfx1100_w4:
 	s_mov_b32 s42, s22
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v168, v165, s[12:15], s37 offen
+	buffer_load_b32 v168, v165, s[56:59], s37 offen
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v169, v165, s[12:15], s37 offen offset:4
+	buffer_load_b32 v169, v165, s[56:59], s37 offen offset:4
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v170, v165, s[12:15], s37 offen offset:8
+	buffer_load_b32 v170, v165, s[56:59], s37 offen offset:8
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v171, v165, s[12:15], s37 offen offset:12
+	buffer_load_b32 v171, v165, s[56:59], s37 offen offset:12
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v172, v165, s[12:15], s37 offen offset:16
+	buffer_load_b32 v172, v165, s[56:59], s37 offen offset:16
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v173, v165, s[12:15], s37 offen offset:20
+	buffer_load_b32 v173, v165, s[56:59], s37 offen offset:20
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v174, v165, s[12:15], s37 offen offset:24
+	buffer_load_b32 v174, v165, s[56:59], s37 offen offset:24
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v175, v165, s[12:15], s37 offen offset:28
+	buffer_load_b32 v175, v165, s[56:59], s37 offen offset:28
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	s_mov_b32 s42, s22
@@ -4241,56 +4241,56 @@ gemm_mq6g256v2_residual_pm_gfx1100_w4:
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(7)
 	v_add_f32_e32 v122, v122, v168
-	buffer_store_b32 v122, v165, s[12:15], s37 offen
+	buffer_store_b32 v122, v165, s[56:59], s37 offen
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(6)
 	v_add_f32_e32 v123, v123, v169
-	buffer_store_b32 v123, v165, s[12:15], s37 offen offset:4
+	buffer_store_b32 v123, v165, s[56:59], s37 offen offset:4
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(5)
 	v_add_f32_e32 v124, v124, v170
-	buffer_store_b32 v124, v165, s[12:15], s37 offen offset:8
+	buffer_store_b32 v124, v165, s[56:59], s37 offen offset:8
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(4)
 	v_add_f32_e32 v125, v125, v171
-	buffer_store_b32 v125, v165, s[12:15], s37 offen offset:12
+	buffer_store_b32 v125, v165, s[56:59], s37 offen offset:12
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(3)
 	v_add_f32_e32 v126, v126, v172
-	buffer_store_b32 v126, v165, s[12:15], s37 offen offset:16
+	buffer_store_b32 v126, v165, s[56:59], s37 offen offset:16
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(2)
 	v_add_f32_e32 v127, v127, v173
-	buffer_store_b32 v127, v165, s[12:15], s37 offen offset:20
+	buffer_store_b32 v127, v165, s[56:59], s37 offen offset:20
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(1)
 	v_add_f32_e32 v128, v128, v174
-	buffer_store_b32 v128, v165, s[12:15], s37 offen offset:24
+	buffer_store_b32 v128, v165, s[56:59], s37 offen offset:24
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(0)
 	v_add_f32_e32 v129, v129, v175
-	buffer_store_b32 v129, v165, s[12:15], s37 offen offset:28
+	buffer_store_b32 v129, v165, s[56:59], s37 offen offset:28
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	s_sub_i32 s41, s24, 0xe0
@@ -4298,42 +4298,42 @@ gemm_mq6g256v2_residual_pm_gfx1100_w4:
 	s_mov_b32 s42, s22
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v168, v166, s[12:15], s37 offen
+	buffer_load_b32 v168, v166, s[56:59], s37 offen
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v169, v166, s[12:15], s37 offen offset:4
+	buffer_load_b32 v169, v166, s[56:59], s37 offen offset:4
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v170, v166, s[12:15], s37 offen offset:8
+	buffer_load_b32 v170, v166, s[56:59], s37 offen offset:8
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v171, v166, s[12:15], s37 offen offset:12
+	buffer_load_b32 v171, v166, s[56:59], s37 offen offset:12
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v172, v166, s[12:15], s37 offen offset:16
+	buffer_load_b32 v172, v166, s[56:59], s37 offen offset:16
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v173, v166, s[12:15], s37 offen offset:20
+	buffer_load_b32 v173, v166, s[56:59], s37 offen offset:20
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v174, v166, s[12:15], s37 offen offset:24
+	buffer_load_b32 v174, v166, s[56:59], s37 offen offset:24
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v175, v166, s[12:15], s37 offen offset:28
+	buffer_load_b32 v175, v166, s[56:59], s37 offen offset:28
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	s_mov_b32 s42, s22
@@ -4341,56 +4341,56 @@ gemm_mq6g256v2_residual_pm_gfx1100_w4:
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(7)
 	v_add_f32_e32 v130, v130, v168
-	buffer_store_b32 v130, v166, s[12:15], s37 offen
+	buffer_store_b32 v130, v166, s[56:59], s37 offen
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(6)
 	v_add_f32_e32 v131, v131, v169
-	buffer_store_b32 v131, v166, s[12:15], s37 offen offset:4
+	buffer_store_b32 v131, v166, s[56:59], s37 offen offset:4
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(5)
 	v_add_f32_e32 v132, v132, v170
-	buffer_store_b32 v132, v166, s[12:15], s37 offen offset:8
+	buffer_store_b32 v132, v166, s[56:59], s37 offen offset:8
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(4)
 	v_add_f32_e32 v133, v133, v171
-	buffer_store_b32 v133, v166, s[12:15], s37 offen offset:12
+	buffer_store_b32 v133, v166, s[56:59], s37 offen offset:12
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(3)
 	v_add_f32_e32 v134, v134, v172
-	buffer_store_b32 v134, v166, s[12:15], s37 offen offset:16
+	buffer_store_b32 v134, v166, s[56:59], s37 offen offset:16
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(2)
 	v_add_f32_e32 v135, v135, v173
-	buffer_store_b32 v135, v166, s[12:15], s37 offen offset:20
+	buffer_store_b32 v135, v166, s[56:59], s37 offen offset:20
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(1)
 	v_add_f32_e32 v136, v136, v174
-	buffer_store_b32 v136, v166, s[12:15], s37 offen offset:24
+	buffer_store_b32 v136, v166, s[56:59], s37 offen offset:24
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(0)
 	v_add_f32_e32 v137, v137, v175
-	buffer_store_b32 v137, v166, s[12:15], s37 offen offset:28
+	buffer_store_b32 v137, v166, s[56:59], s37 offen offset:28
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	s_sub_i32 s41, s24, 0xf0
@@ -4398,42 +4398,42 @@ gemm_mq6g256v2_residual_pm_gfx1100_w4:
 	s_mov_b32 s42, s22
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v168, v167, s[12:15], s37 offen
+	buffer_load_b32 v168, v167, s[56:59], s37 offen
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v169, v167, s[12:15], s37 offen offset:4
+	buffer_load_b32 v169, v167, s[56:59], s37 offen offset:4
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v170, v167, s[12:15], s37 offen offset:8
+	buffer_load_b32 v170, v167, s[56:59], s37 offen offset:8
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v171, v167, s[12:15], s37 offen offset:12
+	buffer_load_b32 v171, v167, s[56:59], s37 offen offset:12
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v172, v167, s[12:15], s37 offen offset:16
+	buffer_load_b32 v172, v167, s[56:59], s37 offen offset:16
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v173, v167, s[12:15], s37 offen offset:20
+	buffer_load_b32 v173, v167, s[56:59], s37 offen offset:20
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v174, v167, s[12:15], s37 offen offset:24
+	buffer_load_b32 v174, v167, s[56:59], s37 offen offset:24
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v175, v167, s[12:15], s37 offen offset:28
+	buffer_load_b32 v175, v167, s[56:59], s37 offen offset:28
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	s_mov_b32 s42, s22
@@ -4441,56 +4441,56 @@ gemm_mq6g256v2_residual_pm_gfx1100_w4:
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(7)
 	v_add_f32_e32 v138, v138, v168
-	buffer_store_b32 v138, v167, s[12:15], s37 offen
+	buffer_store_b32 v138, v167, s[56:59], s37 offen
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(6)
 	v_add_f32_e32 v139, v139, v169
-	buffer_store_b32 v139, v167, s[12:15], s37 offen offset:4
+	buffer_store_b32 v139, v167, s[56:59], s37 offen offset:4
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(5)
 	v_add_f32_e32 v140, v140, v170
-	buffer_store_b32 v140, v167, s[12:15], s37 offen offset:8
+	buffer_store_b32 v140, v167, s[56:59], s37 offen offset:8
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(4)
 	v_add_f32_e32 v141, v141, v171
-	buffer_store_b32 v141, v167, s[12:15], s37 offen offset:12
+	buffer_store_b32 v141, v167, s[56:59], s37 offen offset:12
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(3)
 	v_add_f32_e32 v142, v142, v172
-	buffer_store_b32 v142, v167, s[12:15], s37 offen offset:16
+	buffer_store_b32 v142, v167, s[56:59], s37 offen offset:16
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(2)
 	v_add_f32_e32 v143, v143, v173
-	buffer_store_b32 v143, v167, s[12:15], s37 offen offset:20
+	buffer_store_b32 v143, v167, s[56:59], s37 offen offset:20
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(1)
 	v_add_f32_e32 v144, v144, v174
-	buffer_store_b32 v144, v167, s[12:15], s37 offen offset:24
+	buffer_store_b32 v144, v167, s[56:59], s37 offen offset:24
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(0)
 	v_add_f32_e32 v145, v145, v175
-	buffer_store_b32 v145, v167, s[12:15], s37 offen offset:28
+	buffer_store_b32 v145, v167, s[56:59], s37 offen offset:28
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	.Lmq6g11w4y_end:
@@ -4503,7 +4503,7 @@ gemm_mq6g256v2_residual_pm_gfx1100_w4:
 	.amdhsa_group_segment_fixed_size 40960
 	.amdhsa_private_segment_fixed_size 0
 	.amdhsa_kernarg_size 36
-	.amdhsa_user_sgpr_count 2
+	.amdhsa_user_sgpr_count 14
 	.amdhsa_user_sgpr_dispatch_ptr 0
 	.amdhsa_user_sgpr_queue_ptr 0
 	.amdhsa_user_sgpr_kernarg_segment_ptr 1
@@ -4710,8 +4710,8 @@ gemm_mq6g256v2_residual_pm_gfx1100_w8:
 	s_min_i32 s35, s35, s24
 	s_cmp_lt_i32 s35, 1
 	s_cbranch_scc1 .Lmq6g11w8y_end
-	s_mov_b32 s28, s2
-	s_mov_b32 s29, s3
+	s_mov_b32 s28, s14
+	s_mov_b32 s29, s15
 	s_lshr_b32 s25, s23, 8
 	s_lshr_b32 s26, s23, 5
 	s_add_i32 s26, s26, -1
@@ -4726,10 +4726,10 @@ gemm_mq6g256v2_residual_pm_gfx1100_w8:
 	s_and_b32 s9, s19, 0xffff
 	s_mov_b32 s10, s36
 	s_mov_b32 s11, 0x31004000
-	s_mov_b32 s12, s20
-	s_and_b32 s13, s21, 0xffff
-	s_brev_b32 s14, -2
-	s_mov_b32 s15, 0x31004000
+	s_mov_b32 s56, s20
+	s_and_b32 s57, s21, 0xffff
+	s_brev_b32 s58, -2
+	s_mov_b32 s59, 0x31004000
 	v_lshrrev_b32_e32 v145, 1, v0
 	s_mul_i32 s35, s28, 0x80
 	s_delay_alu instid0(VALU_DEP_1)
@@ -6950,50 +6950,50 @@ gemm_mq6g256v2_residual_pm_gfx1100_w8:
 	s_sub_i32 s41, s24, 0
 	v_cmp_gt_i32_e64 s44, s41, v7
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b128 v[164:167], v148, s[12:15], s37 offen
-	buffer_load_b128 v[168:171], v148, s[12:15], s37 offen offset:16
+	buffer_load_b128 v[164:167], v148, s[56:59], s37 offen
+	buffer_load_b128 v[168:171], v148, s[56:59], s37 offen offset:16
 	s_mov_b32 exec_lo, -1
 	s_sub_i32 s41, s24, 16
 	v_cmp_gt_i32_e64 s44, s41, v7
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b128 v[172:175], v149, s[12:15], s37 offen
-	buffer_load_b128 v[176:179], v149, s[12:15], s37 offen offset:16
+	buffer_load_b128 v[172:175], v149, s[56:59], s37 offen
+	buffer_load_b128 v[176:179], v149, s[56:59], s37 offen offset:16
 	s_mov_b32 exec_lo, -1
 	s_sub_i32 s41, s24, 32
 	v_cmp_gt_i32_e64 s44, s41, v7
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b128 v[180:183], v150, s[12:15], s37 offen
-	buffer_load_b128 v[184:187], v150, s[12:15], s37 offen offset:16
+	buffer_load_b128 v[180:183], v150, s[56:59], s37 offen
+	buffer_load_b128 v[184:187], v150, s[56:59], s37 offen offset:16
 	s_mov_b32 exec_lo, -1
 	s_sub_i32 s41, s24, 48
 	v_cmp_gt_i32_e64 s44, s41, v7
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b128 v[188:191], v151, s[12:15], s37 offen
-	buffer_load_b128 v[192:195], v151, s[12:15], s37 offen offset:16
+	buffer_load_b128 v[188:191], v151, s[56:59], s37 offen
+	buffer_load_b128 v[192:195], v151, s[56:59], s37 offen offset:16
 	s_mov_b32 exec_lo, -1
 	s_sub_i32 s41, s24, 64
 	v_cmp_gt_i32_e64 s44, s41, v7
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b128 v[196:199], v152, s[12:15], s37 offen
-	buffer_load_b128 v[200:203], v152, s[12:15], s37 offen offset:16
+	buffer_load_b128 v[196:199], v152, s[56:59], s37 offen
+	buffer_load_b128 v[200:203], v152, s[56:59], s37 offen offset:16
 	s_mov_b32 exec_lo, -1
 	s_sub_i32 s41, s24, 0x50
 	v_cmp_gt_i32_e64 s44, s41, v7
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b128 v[204:207], v153, s[12:15], s37 offen
-	buffer_load_b128 v[208:211], v153, s[12:15], s37 offen offset:16
+	buffer_load_b128 v[204:207], v153, s[56:59], s37 offen
+	buffer_load_b128 v[208:211], v153, s[56:59], s37 offen offset:16
 	s_mov_b32 exec_lo, -1
 	s_sub_i32 s41, s24, 0x60
 	v_cmp_gt_i32_e64 s44, s41, v7
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b128 v[212:215], v154, s[12:15], s37 offen
-	buffer_load_b128 v[216:219], v154, s[12:15], s37 offen offset:16
+	buffer_load_b128 v[212:215], v154, s[56:59], s37 offen
+	buffer_load_b128 v[216:219], v154, s[56:59], s37 offen offset:16
 	s_mov_b32 exec_lo, -1
 	s_sub_i32 s41, s24, 0x70
 	v_cmp_gt_i32_e64 s44, s41, v7
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b128 v[220:223], v155, s[12:15], s37 offen
-	buffer_load_b128 v[224:227], v155, s[12:15], s37 offen offset:16
+	buffer_load_b128 v[220:223], v155, s[56:59], s37 offen
+	buffer_load_b128 v[224:227], v155, s[56:59], s37 offen offset:16
 	s_mov_b32 exec_lo, -1
 	s_sub_i32 s41, s24, 0
 	v_cmp_gt_i32_e64 s44, s41, v7
@@ -7008,8 +7008,8 @@ gemm_mq6g256v2_residual_pm_gfx1100_w8:
 	v_add_f32_e32 v19, v19, v169
 	v_add_f32_e32 v20, v20, v170
 	v_add_f32_e32 v21, v21, v171
-	buffer_store_b128 v[14:17], v148, s[12:15], s37 offen
-	buffer_store_b128 v[18:21], v148, s[12:15], s37 offen offset:16
+	buffer_store_b128 v[14:17], v148, s[56:59], s37 offen
+	buffer_store_b128 v[18:21], v148, s[56:59], s37 offen offset:16
 	s_mov_b32 exec_lo, -1
 	s_sub_i32 s41, s24, 16
 	v_cmp_gt_i32_e64 s44, s41, v7
@@ -7024,8 +7024,8 @@ gemm_mq6g256v2_residual_pm_gfx1100_w8:
 	v_add_f32_e32 v27, v27, v177
 	v_add_f32_e32 v28, v28, v178
 	v_add_f32_e32 v29, v29, v179
-	buffer_store_b128 v[22:25], v149, s[12:15], s37 offen
-	buffer_store_b128 v[26:29], v149, s[12:15], s37 offen offset:16
+	buffer_store_b128 v[22:25], v149, s[56:59], s37 offen
+	buffer_store_b128 v[26:29], v149, s[56:59], s37 offen offset:16
 	s_mov_b32 exec_lo, -1
 	s_sub_i32 s41, s24, 32
 	v_cmp_gt_i32_e64 s44, s41, v7
@@ -7040,8 +7040,8 @@ gemm_mq6g256v2_residual_pm_gfx1100_w8:
 	v_add_f32_e32 v35, v35, v185
 	v_add_f32_e32 v36, v36, v186
 	v_add_f32_e32 v37, v37, v187
-	buffer_store_b128 v[30:33], v150, s[12:15], s37 offen
-	buffer_store_b128 v[34:37], v150, s[12:15], s37 offen offset:16
+	buffer_store_b128 v[30:33], v150, s[56:59], s37 offen
+	buffer_store_b128 v[34:37], v150, s[56:59], s37 offen offset:16
 	s_mov_b32 exec_lo, -1
 	s_sub_i32 s41, s24, 48
 	v_cmp_gt_i32_e64 s44, s41, v7
@@ -7056,8 +7056,8 @@ gemm_mq6g256v2_residual_pm_gfx1100_w8:
 	v_add_f32_e32 v43, v43, v193
 	v_add_f32_e32 v44, v44, v194
 	v_add_f32_e32 v45, v45, v195
-	buffer_store_b128 v[38:41], v151, s[12:15], s37 offen
-	buffer_store_b128 v[42:45], v151, s[12:15], s37 offen offset:16
+	buffer_store_b128 v[38:41], v151, s[56:59], s37 offen
+	buffer_store_b128 v[42:45], v151, s[56:59], s37 offen offset:16
 	s_mov_b32 exec_lo, -1
 	s_sub_i32 s41, s24, 64
 	v_cmp_gt_i32_e64 s44, s41, v7
@@ -7072,8 +7072,8 @@ gemm_mq6g256v2_residual_pm_gfx1100_w8:
 	v_add_f32_e32 v51, v51, v201
 	v_add_f32_e32 v52, v52, v202
 	v_add_f32_e32 v53, v53, v203
-	buffer_store_b128 v[46:49], v152, s[12:15], s37 offen
-	buffer_store_b128 v[50:53], v152, s[12:15], s37 offen offset:16
+	buffer_store_b128 v[46:49], v152, s[56:59], s37 offen
+	buffer_store_b128 v[50:53], v152, s[56:59], s37 offen offset:16
 	s_mov_b32 exec_lo, -1
 	s_sub_i32 s41, s24, 0x50
 	v_cmp_gt_i32_e64 s44, s41, v7
@@ -7088,8 +7088,8 @@ gemm_mq6g256v2_residual_pm_gfx1100_w8:
 	v_add_f32_e32 v59, v59, v209
 	v_add_f32_e32 v60, v60, v210
 	v_add_f32_e32 v61, v61, v211
-	buffer_store_b128 v[54:57], v153, s[12:15], s37 offen
-	buffer_store_b128 v[58:61], v153, s[12:15], s37 offen offset:16
+	buffer_store_b128 v[54:57], v153, s[56:59], s37 offen
+	buffer_store_b128 v[58:61], v153, s[56:59], s37 offen offset:16
 	s_mov_b32 exec_lo, -1
 	s_sub_i32 s41, s24, 0x60
 	v_cmp_gt_i32_e64 s44, s41, v7
@@ -7104,8 +7104,8 @@ gemm_mq6g256v2_residual_pm_gfx1100_w8:
 	v_add_f32_e32 v67, v67, v217
 	v_add_f32_e32 v68, v68, v218
 	v_add_f32_e32 v69, v69, v219
-	buffer_store_b128 v[62:65], v154, s[12:15], s37 offen
-	buffer_store_b128 v[66:69], v154, s[12:15], s37 offen offset:16
+	buffer_store_b128 v[62:65], v154, s[56:59], s37 offen
+	buffer_store_b128 v[66:69], v154, s[56:59], s37 offen offset:16
 	s_mov_b32 exec_lo, -1
 	s_sub_i32 s41, s24, 0x70
 	v_cmp_gt_i32_e64 s44, s41, v7
@@ -7120,56 +7120,56 @@ gemm_mq6g256v2_residual_pm_gfx1100_w8:
 	v_add_f32_e32 v75, v75, v225
 	v_add_f32_e32 v76, v76, v226
 	v_add_f32_e32 v77, v77, v227
-	buffer_store_b128 v[70:73], v155, s[12:15], s37 offen
-	buffer_store_b128 v[74:77], v155, s[12:15], s37 offen offset:16
+	buffer_store_b128 v[70:73], v155, s[56:59], s37 offen
+	buffer_store_b128 v[74:77], v155, s[56:59], s37 offen offset:16
 	s_mov_b32 exec_lo, -1
 	s_sub_i32 s41, s24, 0x80
 	v_cmp_gt_i32_e64 s44, s41, v7
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b128 v[164:167], v156, s[12:15], s37 offen
-	buffer_load_b128 v[168:171], v156, s[12:15], s37 offen offset:16
+	buffer_load_b128 v[164:167], v156, s[56:59], s37 offen
+	buffer_load_b128 v[168:171], v156, s[56:59], s37 offen offset:16
 	s_mov_b32 exec_lo, -1
 	s_sub_i32 s41, s24, 0x90
 	v_cmp_gt_i32_e64 s44, s41, v7
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b128 v[172:175], v157, s[12:15], s37 offen
-	buffer_load_b128 v[176:179], v157, s[12:15], s37 offen offset:16
+	buffer_load_b128 v[172:175], v157, s[56:59], s37 offen
+	buffer_load_b128 v[176:179], v157, s[56:59], s37 offen offset:16
 	s_mov_b32 exec_lo, -1
 	s_sub_i32 s41, s24, 0xa0
 	v_cmp_gt_i32_e64 s44, s41, v7
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b128 v[180:183], v158, s[12:15], s37 offen
-	buffer_load_b128 v[184:187], v158, s[12:15], s37 offen offset:16
+	buffer_load_b128 v[180:183], v158, s[56:59], s37 offen
+	buffer_load_b128 v[184:187], v158, s[56:59], s37 offen offset:16
 	s_mov_b32 exec_lo, -1
 	s_sub_i32 s41, s24, 0xb0
 	v_cmp_gt_i32_e64 s44, s41, v7
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b128 v[188:191], v159, s[12:15], s37 offen
-	buffer_load_b128 v[192:195], v159, s[12:15], s37 offen offset:16
+	buffer_load_b128 v[188:191], v159, s[56:59], s37 offen
+	buffer_load_b128 v[192:195], v159, s[56:59], s37 offen offset:16
 	s_mov_b32 exec_lo, -1
 	s_sub_i32 s41, s24, 0xc0
 	v_cmp_gt_i32_e64 s44, s41, v7
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b128 v[196:199], v160, s[12:15], s37 offen
-	buffer_load_b128 v[200:203], v160, s[12:15], s37 offen offset:16
+	buffer_load_b128 v[196:199], v160, s[56:59], s37 offen
+	buffer_load_b128 v[200:203], v160, s[56:59], s37 offen offset:16
 	s_mov_b32 exec_lo, -1
 	s_sub_i32 s41, s24, 0xd0
 	v_cmp_gt_i32_e64 s44, s41, v7
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b128 v[204:207], v161, s[12:15], s37 offen
-	buffer_load_b128 v[208:211], v161, s[12:15], s37 offen offset:16
+	buffer_load_b128 v[204:207], v161, s[56:59], s37 offen
+	buffer_load_b128 v[208:211], v161, s[56:59], s37 offen offset:16
 	s_mov_b32 exec_lo, -1
 	s_sub_i32 s41, s24, 0xe0
 	v_cmp_gt_i32_e64 s44, s41, v7
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b128 v[212:215], v162, s[12:15], s37 offen
-	buffer_load_b128 v[216:219], v162, s[12:15], s37 offen offset:16
+	buffer_load_b128 v[212:215], v162, s[56:59], s37 offen
+	buffer_load_b128 v[216:219], v162, s[56:59], s37 offen offset:16
 	s_mov_b32 exec_lo, -1
 	s_sub_i32 s41, s24, 0xf0
 	v_cmp_gt_i32_e64 s44, s41, v7
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b128 v[220:223], v163, s[12:15], s37 offen
-	buffer_load_b128 v[224:227], v163, s[12:15], s37 offen offset:16
+	buffer_load_b128 v[220:223], v163, s[56:59], s37 offen
+	buffer_load_b128 v[224:227], v163, s[56:59], s37 offen offset:16
 	s_mov_b32 exec_lo, -1
 	s_sub_i32 s41, s24, 0x80
 	v_cmp_gt_i32_e64 s44, s41, v7
@@ -7184,8 +7184,8 @@ gemm_mq6g256v2_residual_pm_gfx1100_w8:
 	v_add_f32_e32 v83, v83, v169
 	v_add_f32_e32 v84, v84, v170
 	v_add_f32_e32 v85, v85, v171
-	buffer_store_b128 v[78:81], v156, s[12:15], s37 offen
-	buffer_store_b128 v[82:85], v156, s[12:15], s37 offen offset:16
+	buffer_store_b128 v[78:81], v156, s[56:59], s37 offen
+	buffer_store_b128 v[82:85], v156, s[56:59], s37 offen offset:16
 	s_mov_b32 exec_lo, -1
 	s_sub_i32 s41, s24, 0x90
 	v_cmp_gt_i32_e64 s44, s41, v7
@@ -7200,8 +7200,8 @@ gemm_mq6g256v2_residual_pm_gfx1100_w8:
 	v_add_f32_e32 v91, v91, v177
 	v_add_f32_e32 v92, v92, v178
 	v_add_f32_e32 v93, v93, v179
-	buffer_store_b128 v[86:89], v157, s[12:15], s37 offen
-	buffer_store_b128 v[90:93], v157, s[12:15], s37 offen offset:16
+	buffer_store_b128 v[86:89], v157, s[56:59], s37 offen
+	buffer_store_b128 v[90:93], v157, s[56:59], s37 offen offset:16
 	s_mov_b32 exec_lo, -1
 	s_sub_i32 s41, s24, 0xa0
 	v_cmp_gt_i32_e64 s44, s41, v7
@@ -7216,8 +7216,8 @@ gemm_mq6g256v2_residual_pm_gfx1100_w8:
 	v_add_f32_e32 v99, v99, v185
 	v_add_f32_e32 v100, v100, v186
 	v_add_f32_e32 v101, v101, v187
-	buffer_store_b128 v[94:97], v158, s[12:15], s37 offen
-	buffer_store_b128 v[98:101], v158, s[12:15], s37 offen offset:16
+	buffer_store_b128 v[94:97], v158, s[56:59], s37 offen
+	buffer_store_b128 v[98:101], v158, s[56:59], s37 offen offset:16
 	s_mov_b32 exec_lo, -1
 	s_sub_i32 s41, s24, 0xb0
 	v_cmp_gt_i32_e64 s44, s41, v7
@@ -7232,8 +7232,8 @@ gemm_mq6g256v2_residual_pm_gfx1100_w8:
 	v_add_f32_e32 v107, v107, v193
 	v_add_f32_e32 v108, v108, v194
 	v_add_f32_e32 v109, v109, v195
-	buffer_store_b128 v[102:105], v159, s[12:15], s37 offen
-	buffer_store_b128 v[106:109], v159, s[12:15], s37 offen offset:16
+	buffer_store_b128 v[102:105], v159, s[56:59], s37 offen
+	buffer_store_b128 v[106:109], v159, s[56:59], s37 offen offset:16
 	s_mov_b32 exec_lo, -1
 	s_sub_i32 s41, s24, 0xc0
 	v_cmp_gt_i32_e64 s44, s41, v7
@@ -7248,8 +7248,8 @@ gemm_mq6g256v2_residual_pm_gfx1100_w8:
 	v_add_f32_e32 v115, v115, v201
 	v_add_f32_e32 v116, v116, v202
 	v_add_f32_e32 v117, v117, v203
-	buffer_store_b128 v[110:113], v160, s[12:15], s37 offen
-	buffer_store_b128 v[114:117], v160, s[12:15], s37 offen offset:16
+	buffer_store_b128 v[110:113], v160, s[56:59], s37 offen
+	buffer_store_b128 v[114:117], v160, s[56:59], s37 offen offset:16
 	s_mov_b32 exec_lo, -1
 	s_sub_i32 s41, s24, 0xd0
 	v_cmp_gt_i32_e64 s44, s41, v7
@@ -7264,8 +7264,8 @@ gemm_mq6g256v2_residual_pm_gfx1100_w8:
 	v_add_f32_e32 v123, v123, v209
 	v_add_f32_e32 v124, v124, v210
 	v_add_f32_e32 v125, v125, v211
-	buffer_store_b128 v[118:121], v161, s[12:15], s37 offen
-	buffer_store_b128 v[122:125], v161, s[12:15], s37 offen offset:16
+	buffer_store_b128 v[118:121], v161, s[56:59], s37 offen
+	buffer_store_b128 v[122:125], v161, s[56:59], s37 offen offset:16
 	s_mov_b32 exec_lo, -1
 	s_sub_i32 s41, s24, 0xe0
 	v_cmp_gt_i32_e64 s44, s41, v7
@@ -7280,8 +7280,8 @@ gemm_mq6g256v2_residual_pm_gfx1100_w8:
 	v_add_f32_e32 v131, v131, v217
 	v_add_f32_e32 v132, v132, v218
 	v_add_f32_e32 v133, v133, v219
-	buffer_store_b128 v[126:129], v162, s[12:15], s37 offen
-	buffer_store_b128 v[130:133], v162, s[12:15], s37 offen offset:16
+	buffer_store_b128 v[126:129], v162, s[56:59], s37 offen
+	buffer_store_b128 v[130:133], v162, s[56:59], s37 offen offset:16
 	s_mov_b32 exec_lo, -1
 	s_sub_i32 s41, s24, 0xf0
 	v_cmp_gt_i32_e64 s44, s41, v7
@@ -7296,8 +7296,8 @@ gemm_mq6g256v2_residual_pm_gfx1100_w8:
 	v_add_f32_e32 v139, v139, v225
 	v_add_f32_e32 v140, v140, v226
 	v_add_f32_e32 v141, v141, v227
-	buffer_store_b128 v[134:137], v163, s[12:15], s37 offen
-	buffer_store_b128 v[138:141], v163, s[12:15], s37 offen offset:16
+	buffer_store_b128 v[134:137], v163, s[56:59], s37 offen
+	buffer_store_b128 v[138:141], v163, s[56:59], s37 offen offset:16
 	s_mov_b32 exec_lo, -1
 	s_waitcnt_vscnt null, 0x0
 	s_branch .Lmq6g11w8y_end
@@ -7307,42 +7307,42 @@ gemm_mq6g256v2_residual_pm_gfx1100_w8:
 	s_mov_b32 s42, s22
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v164, v148, s[12:15], s37 offen
+	buffer_load_b32 v164, v148, s[56:59], s37 offen
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v165, v148, s[12:15], s37 offen offset:4
+	buffer_load_b32 v165, v148, s[56:59], s37 offen offset:4
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v166, v148, s[12:15], s37 offen offset:8
+	buffer_load_b32 v166, v148, s[56:59], s37 offen offset:8
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v167, v148, s[12:15], s37 offen offset:12
+	buffer_load_b32 v167, v148, s[56:59], s37 offen offset:12
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v168, v148, s[12:15], s37 offen offset:16
+	buffer_load_b32 v168, v148, s[56:59], s37 offen offset:16
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v169, v148, s[12:15], s37 offen offset:20
+	buffer_load_b32 v169, v148, s[56:59], s37 offen offset:20
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v170, v148, s[12:15], s37 offen offset:24
+	buffer_load_b32 v170, v148, s[56:59], s37 offen offset:24
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v171, v148, s[12:15], s37 offen offset:28
+	buffer_load_b32 v171, v148, s[56:59], s37 offen offset:28
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	s_mov_b32 s42, s22
@@ -7350,56 +7350,56 @@ gemm_mq6g256v2_residual_pm_gfx1100_w8:
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(7)
 	v_add_f32_e32 v14, v14, v164
-	buffer_store_b32 v14, v148, s[12:15], s37 offen
+	buffer_store_b32 v14, v148, s[56:59], s37 offen
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(6)
 	v_add_f32_e32 v15, v15, v165
-	buffer_store_b32 v15, v148, s[12:15], s37 offen offset:4
+	buffer_store_b32 v15, v148, s[56:59], s37 offen offset:4
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(5)
 	v_add_f32_e32 v16, v16, v166
-	buffer_store_b32 v16, v148, s[12:15], s37 offen offset:8
+	buffer_store_b32 v16, v148, s[56:59], s37 offen offset:8
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(4)
 	v_add_f32_e32 v17, v17, v167
-	buffer_store_b32 v17, v148, s[12:15], s37 offen offset:12
+	buffer_store_b32 v17, v148, s[56:59], s37 offen offset:12
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(3)
 	v_add_f32_e32 v18, v18, v168
-	buffer_store_b32 v18, v148, s[12:15], s37 offen offset:16
+	buffer_store_b32 v18, v148, s[56:59], s37 offen offset:16
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(2)
 	v_add_f32_e32 v19, v19, v169
-	buffer_store_b32 v19, v148, s[12:15], s37 offen offset:20
+	buffer_store_b32 v19, v148, s[56:59], s37 offen offset:20
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(1)
 	v_add_f32_e32 v20, v20, v170
-	buffer_store_b32 v20, v148, s[12:15], s37 offen offset:24
+	buffer_store_b32 v20, v148, s[56:59], s37 offen offset:24
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(0)
 	v_add_f32_e32 v21, v21, v171
-	buffer_store_b32 v21, v148, s[12:15], s37 offen offset:28
+	buffer_store_b32 v21, v148, s[56:59], s37 offen offset:28
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	s_sub_i32 s41, s24, 16
@@ -7407,42 +7407,42 @@ gemm_mq6g256v2_residual_pm_gfx1100_w8:
 	s_mov_b32 s42, s22
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v164, v149, s[12:15], s37 offen
+	buffer_load_b32 v164, v149, s[56:59], s37 offen
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v165, v149, s[12:15], s37 offen offset:4
+	buffer_load_b32 v165, v149, s[56:59], s37 offen offset:4
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v166, v149, s[12:15], s37 offen offset:8
+	buffer_load_b32 v166, v149, s[56:59], s37 offen offset:8
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v167, v149, s[12:15], s37 offen offset:12
+	buffer_load_b32 v167, v149, s[56:59], s37 offen offset:12
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v168, v149, s[12:15], s37 offen offset:16
+	buffer_load_b32 v168, v149, s[56:59], s37 offen offset:16
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v169, v149, s[12:15], s37 offen offset:20
+	buffer_load_b32 v169, v149, s[56:59], s37 offen offset:20
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v170, v149, s[12:15], s37 offen offset:24
+	buffer_load_b32 v170, v149, s[56:59], s37 offen offset:24
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v171, v149, s[12:15], s37 offen offset:28
+	buffer_load_b32 v171, v149, s[56:59], s37 offen offset:28
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	s_mov_b32 s42, s22
@@ -7450,56 +7450,56 @@ gemm_mq6g256v2_residual_pm_gfx1100_w8:
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(7)
 	v_add_f32_e32 v22, v22, v164
-	buffer_store_b32 v22, v149, s[12:15], s37 offen
+	buffer_store_b32 v22, v149, s[56:59], s37 offen
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(6)
 	v_add_f32_e32 v23, v23, v165
-	buffer_store_b32 v23, v149, s[12:15], s37 offen offset:4
+	buffer_store_b32 v23, v149, s[56:59], s37 offen offset:4
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(5)
 	v_add_f32_e32 v24, v24, v166
-	buffer_store_b32 v24, v149, s[12:15], s37 offen offset:8
+	buffer_store_b32 v24, v149, s[56:59], s37 offen offset:8
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(4)
 	v_add_f32_e32 v25, v25, v167
-	buffer_store_b32 v25, v149, s[12:15], s37 offen offset:12
+	buffer_store_b32 v25, v149, s[56:59], s37 offen offset:12
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(3)
 	v_add_f32_e32 v26, v26, v168
-	buffer_store_b32 v26, v149, s[12:15], s37 offen offset:16
+	buffer_store_b32 v26, v149, s[56:59], s37 offen offset:16
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(2)
 	v_add_f32_e32 v27, v27, v169
-	buffer_store_b32 v27, v149, s[12:15], s37 offen offset:20
+	buffer_store_b32 v27, v149, s[56:59], s37 offen offset:20
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(1)
 	v_add_f32_e32 v28, v28, v170
-	buffer_store_b32 v28, v149, s[12:15], s37 offen offset:24
+	buffer_store_b32 v28, v149, s[56:59], s37 offen offset:24
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(0)
 	v_add_f32_e32 v29, v29, v171
-	buffer_store_b32 v29, v149, s[12:15], s37 offen offset:28
+	buffer_store_b32 v29, v149, s[56:59], s37 offen offset:28
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	s_sub_i32 s41, s24, 32
@@ -7507,42 +7507,42 @@ gemm_mq6g256v2_residual_pm_gfx1100_w8:
 	s_mov_b32 s42, s22
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v164, v150, s[12:15], s37 offen
+	buffer_load_b32 v164, v150, s[56:59], s37 offen
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v165, v150, s[12:15], s37 offen offset:4
+	buffer_load_b32 v165, v150, s[56:59], s37 offen offset:4
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v166, v150, s[12:15], s37 offen offset:8
+	buffer_load_b32 v166, v150, s[56:59], s37 offen offset:8
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v167, v150, s[12:15], s37 offen offset:12
+	buffer_load_b32 v167, v150, s[56:59], s37 offen offset:12
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v168, v150, s[12:15], s37 offen offset:16
+	buffer_load_b32 v168, v150, s[56:59], s37 offen offset:16
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v169, v150, s[12:15], s37 offen offset:20
+	buffer_load_b32 v169, v150, s[56:59], s37 offen offset:20
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v170, v150, s[12:15], s37 offen offset:24
+	buffer_load_b32 v170, v150, s[56:59], s37 offen offset:24
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v171, v150, s[12:15], s37 offen offset:28
+	buffer_load_b32 v171, v150, s[56:59], s37 offen offset:28
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	s_mov_b32 s42, s22
@@ -7550,56 +7550,56 @@ gemm_mq6g256v2_residual_pm_gfx1100_w8:
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(7)
 	v_add_f32_e32 v30, v30, v164
-	buffer_store_b32 v30, v150, s[12:15], s37 offen
+	buffer_store_b32 v30, v150, s[56:59], s37 offen
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(6)
 	v_add_f32_e32 v31, v31, v165
-	buffer_store_b32 v31, v150, s[12:15], s37 offen offset:4
+	buffer_store_b32 v31, v150, s[56:59], s37 offen offset:4
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(5)
 	v_add_f32_e32 v32, v32, v166
-	buffer_store_b32 v32, v150, s[12:15], s37 offen offset:8
+	buffer_store_b32 v32, v150, s[56:59], s37 offen offset:8
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(4)
 	v_add_f32_e32 v33, v33, v167
-	buffer_store_b32 v33, v150, s[12:15], s37 offen offset:12
+	buffer_store_b32 v33, v150, s[56:59], s37 offen offset:12
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(3)
 	v_add_f32_e32 v34, v34, v168
-	buffer_store_b32 v34, v150, s[12:15], s37 offen offset:16
+	buffer_store_b32 v34, v150, s[56:59], s37 offen offset:16
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(2)
 	v_add_f32_e32 v35, v35, v169
-	buffer_store_b32 v35, v150, s[12:15], s37 offen offset:20
+	buffer_store_b32 v35, v150, s[56:59], s37 offen offset:20
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(1)
 	v_add_f32_e32 v36, v36, v170
-	buffer_store_b32 v36, v150, s[12:15], s37 offen offset:24
+	buffer_store_b32 v36, v150, s[56:59], s37 offen offset:24
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(0)
 	v_add_f32_e32 v37, v37, v171
-	buffer_store_b32 v37, v150, s[12:15], s37 offen offset:28
+	buffer_store_b32 v37, v150, s[56:59], s37 offen offset:28
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	s_sub_i32 s41, s24, 48
@@ -7607,42 +7607,42 @@ gemm_mq6g256v2_residual_pm_gfx1100_w8:
 	s_mov_b32 s42, s22
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v164, v151, s[12:15], s37 offen
+	buffer_load_b32 v164, v151, s[56:59], s37 offen
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v165, v151, s[12:15], s37 offen offset:4
+	buffer_load_b32 v165, v151, s[56:59], s37 offen offset:4
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v166, v151, s[12:15], s37 offen offset:8
+	buffer_load_b32 v166, v151, s[56:59], s37 offen offset:8
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v167, v151, s[12:15], s37 offen offset:12
+	buffer_load_b32 v167, v151, s[56:59], s37 offen offset:12
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v168, v151, s[12:15], s37 offen offset:16
+	buffer_load_b32 v168, v151, s[56:59], s37 offen offset:16
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v169, v151, s[12:15], s37 offen offset:20
+	buffer_load_b32 v169, v151, s[56:59], s37 offen offset:20
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v170, v151, s[12:15], s37 offen offset:24
+	buffer_load_b32 v170, v151, s[56:59], s37 offen offset:24
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v171, v151, s[12:15], s37 offen offset:28
+	buffer_load_b32 v171, v151, s[56:59], s37 offen offset:28
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	s_mov_b32 s42, s22
@@ -7650,56 +7650,56 @@ gemm_mq6g256v2_residual_pm_gfx1100_w8:
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(7)
 	v_add_f32_e32 v38, v38, v164
-	buffer_store_b32 v38, v151, s[12:15], s37 offen
+	buffer_store_b32 v38, v151, s[56:59], s37 offen
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(6)
 	v_add_f32_e32 v39, v39, v165
-	buffer_store_b32 v39, v151, s[12:15], s37 offen offset:4
+	buffer_store_b32 v39, v151, s[56:59], s37 offen offset:4
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(5)
 	v_add_f32_e32 v40, v40, v166
-	buffer_store_b32 v40, v151, s[12:15], s37 offen offset:8
+	buffer_store_b32 v40, v151, s[56:59], s37 offen offset:8
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(4)
 	v_add_f32_e32 v41, v41, v167
-	buffer_store_b32 v41, v151, s[12:15], s37 offen offset:12
+	buffer_store_b32 v41, v151, s[56:59], s37 offen offset:12
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(3)
 	v_add_f32_e32 v42, v42, v168
-	buffer_store_b32 v42, v151, s[12:15], s37 offen offset:16
+	buffer_store_b32 v42, v151, s[56:59], s37 offen offset:16
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(2)
 	v_add_f32_e32 v43, v43, v169
-	buffer_store_b32 v43, v151, s[12:15], s37 offen offset:20
+	buffer_store_b32 v43, v151, s[56:59], s37 offen offset:20
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(1)
 	v_add_f32_e32 v44, v44, v170
-	buffer_store_b32 v44, v151, s[12:15], s37 offen offset:24
+	buffer_store_b32 v44, v151, s[56:59], s37 offen offset:24
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(0)
 	v_add_f32_e32 v45, v45, v171
-	buffer_store_b32 v45, v151, s[12:15], s37 offen offset:28
+	buffer_store_b32 v45, v151, s[56:59], s37 offen offset:28
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	s_sub_i32 s41, s24, 64
@@ -7707,42 +7707,42 @@ gemm_mq6g256v2_residual_pm_gfx1100_w8:
 	s_mov_b32 s42, s22
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v164, v152, s[12:15], s37 offen
+	buffer_load_b32 v164, v152, s[56:59], s37 offen
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v165, v152, s[12:15], s37 offen offset:4
+	buffer_load_b32 v165, v152, s[56:59], s37 offen offset:4
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v166, v152, s[12:15], s37 offen offset:8
+	buffer_load_b32 v166, v152, s[56:59], s37 offen offset:8
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v167, v152, s[12:15], s37 offen offset:12
+	buffer_load_b32 v167, v152, s[56:59], s37 offen offset:12
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v168, v152, s[12:15], s37 offen offset:16
+	buffer_load_b32 v168, v152, s[56:59], s37 offen offset:16
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v169, v152, s[12:15], s37 offen offset:20
+	buffer_load_b32 v169, v152, s[56:59], s37 offen offset:20
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v170, v152, s[12:15], s37 offen offset:24
+	buffer_load_b32 v170, v152, s[56:59], s37 offen offset:24
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v171, v152, s[12:15], s37 offen offset:28
+	buffer_load_b32 v171, v152, s[56:59], s37 offen offset:28
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	s_mov_b32 s42, s22
@@ -7750,56 +7750,56 @@ gemm_mq6g256v2_residual_pm_gfx1100_w8:
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(7)
 	v_add_f32_e32 v46, v46, v164
-	buffer_store_b32 v46, v152, s[12:15], s37 offen
+	buffer_store_b32 v46, v152, s[56:59], s37 offen
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(6)
 	v_add_f32_e32 v47, v47, v165
-	buffer_store_b32 v47, v152, s[12:15], s37 offen offset:4
+	buffer_store_b32 v47, v152, s[56:59], s37 offen offset:4
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(5)
 	v_add_f32_e32 v48, v48, v166
-	buffer_store_b32 v48, v152, s[12:15], s37 offen offset:8
+	buffer_store_b32 v48, v152, s[56:59], s37 offen offset:8
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(4)
 	v_add_f32_e32 v49, v49, v167
-	buffer_store_b32 v49, v152, s[12:15], s37 offen offset:12
+	buffer_store_b32 v49, v152, s[56:59], s37 offen offset:12
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(3)
 	v_add_f32_e32 v50, v50, v168
-	buffer_store_b32 v50, v152, s[12:15], s37 offen offset:16
+	buffer_store_b32 v50, v152, s[56:59], s37 offen offset:16
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(2)
 	v_add_f32_e32 v51, v51, v169
-	buffer_store_b32 v51, v152, s[12:15], s37 offen offset:20
+	buffer_store_b32 v51, v152, s[56:59], s37 offen offset:20
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(1)
 	v_add_f32_e32 v52, v52, v170
-	buffer_store_b32 v52, v152, s[12:15], s37 offen offset:24
+	buffer_store_b32 v52, v152, s[56:59], s37 offen offset:24
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(0)
 	v_add_f32_e32 v53, v53, v171
-	buffer_store_b32 v53, v152, s[12:15], s37 offen offset:28
+	buffer_store_b32 v53, v152, s[56:59], s37 offen offset:28
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	s_sub_i32 s41, s24, 0x50
@@ -7807,42 +7807,42 @@ gemm_mq6g256v2_residual_pm_gfx1100_w8:
 	s_mov_b32 s42, s22
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v164, v153, s[12:15], s37 offen
+	buffer_load_b32 v164, v153, s[56:59], s37 offen
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v165, v153, s[12:15], s37 offen offset:4
+	buffer_load_b32 v165, v153, s[56:59], s37 offen offset:4
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v166, v153, s[12:15], s37 offen offset:8
+	buffer_load_b32 v166, v153, s[56:59], s37 offen offset:8
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v167, v153, s[12:15], s37 offen offset:12
+	buffer_load_b32 v167, v153, s[56:59], s37 offen offset:12
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v168, v153, s[12:15], s37 offen offset:16
+	buffer_load_b32 v168, v153, s[56:59], s37 offen offset:16
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v169, v153, s[12:15], s37 offen offset:20
+	buffer_load_b32 v169, v153, s[56:59], s37 offen offset:20
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v170, v153, s[12:15], s37 offen offset:24
+	buffer_load_b32 v170, v153, s[56:59], s37 offen offset:24
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v171, v153, s[12:15], s37 offen offset:28
+	buffer_load_b32 v171, v153, s[56:59], s37 offen offset:28
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	s_mov_b32 s42, s22
@@ -7850,56 +7850,56 @@ gemm_mq6g256v2_residual_pm_gfx1100_w8:
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(7)
 	v_add_f32_e32 v54, v54, v164
-	buffer_store_b32 v54, v153, s[12:15], s37 offen
+	buffer_store_b32 v54, v153, s[56:59], s37 offen
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(6)
 	v_add_f32_e32 v55, v55, v165
-	buffer_store_b32 v55, v153, s[12:15], s37 offen offset:4
+	buffer_store_b32 v55, v153, s[56:59], s37 offen offset:4
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(5)
 	v_add_f32_e32 v56, v56, v166
-	buffer_store_b32 v56, v153, s[12:15], s37 offen offset:8
+	buffer_store_b32 v56, v153, s[56:59], s37 offen offset:8
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(4)
 	v_add_f32_e32 v57, v57, v167
-	buffer_store_b32 v57, v153, s[12:15], s37 offen offset:12
+	buffer_store_b32 v57, v153, s[56:59], s37 offen offset:12
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(3)
 	v_add_f32_e32 v58, v58, v168
-	buffer_store_b32 v58, v153, s[12:15], s37 offen offset:16
+	buffer_store_b32 v58, v153, s[56:59], s37 offen offset:16
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(2)
 	v_add_f32_e32 v59, v59, v169
-	buffer_store_b32 v59, v153, s[12:15], s37 offen offset:20
+	buffer_store_b32 v59, v153, s[56:59], s37 offen offset:20
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(1)
 	v_add_f32_e32 v60, v60, v170
-	buffer_store_b32 v60, v153, s[12:15], s37 offen offset:24
+	buffer_store_b32 v60, v153, s[56:59], s37 offen offset:24
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(0)
 	v_add_f32_e32 v61, v61, v171
-	buffer_store_b32 v61, v153, s[12:15], s37 offen offset:28
+	buffer_store_b32 v61, v153, s[56:59], s37 offen offset:28
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	s_sub_i32 s41, s24, 0x60
@@ -7907,42 +7907,42 @@ gemm_mq6g256v2_residual_pm_gfx1100_w8:
 	s_mov_b32 s42, s22
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v164, v154, s[12:15], s37 offen
+	buffer_load_b32 v164, v154, s[56:59], s37 offen
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v165, v154, s[12:15], s37 offen offset:4
+	buffer_load_b32 v165, v154, s[56:59], s37 offen offset:4
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v166, v154, s[12:15], s37 offen offset:8
+	buffer_load_b32 v166, v154, s[56:59], s37 offen offset:8
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v167, v154, s[12:15], s37 offen offset:12
+	buffer_load_b32 v167, v154, s[56:59], s37 offen offset:12
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v168, v154, s[12:15], s37 offen offset:16
+	buffer_load_b32 v168, v154, s[56:59], s37 offen offset:16
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v169, v154, s[12:15], s37 offen offset:20
+	buffer_load_b32 v169, v154, s[56:59], s37 offen offset:20
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v170, v154, s[12:15], s37 offen offset:24
+	buffer_load_b32 v170, v154, s[56:59], s37 offen offset:24
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v171, v154, s[12:15], s37 offen offset:28
+	buffer_load_b32 v171, v154, s[56:59], s37 offen offset:28
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	s_mov_b32 s42, s22
@@ -7950,56 +7950,56 @@ gemm_mq6g256v2_residual_pm_gfx1100_w8:
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(7)
 	v_add_f32_e32 v62, v62, v164
-	buffer_store_b32 v62, v154, s[12:15], s37 offen
+	buffer_store_b32 v62, v154, s[56:59], s37 offen
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(6)
 	v_add_f32_e32 v63, v63, v165
-	buffer_store_b32 v63, v154, s[12:15], s37 offen offset:4
+	buffer_store_b32 v63, v154, s[56:59], s37 offen offset:4
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(5)
 	v_add_f32_e32 v64, v64, v166
-	buffer_store_b32 v64, v154, s[12:15], s37 offen offset:8
+	buffer_store_b32 v64, v154, s[56:59], s37 offen offset:8
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(4)
 	v_add_f32_e32 v65, v65, v167
-	buffer_store_b32 v65, v154, s[12:15], s37 offen offset:12
+	buffer_store_b32 v65, v154, s[56:59], s37 offen offset:12
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(3)
 	v_add_f32_e32 v66, v66, v168
-	buffer_store_b32 v66, v154, s[12:15], s37 offen offset:16
+	buffer_store_b32 v66, v154, s[56:59], s37 offen offset:16
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(2)
 	v_add_f32_e32 v67, v67, v169
-	buffer_store_b32 v67, v154, s[12:15], s37 offen offset:20
+	buffer_store_b32 v67, v154, s[56:59], s37 offen offset:20
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(1)
 	v_add_f32_e32 v68, v68, v170
-	buffer_store_b32 v68, v154, s[12:15], s37 offen offset:24
+	buffer_store_b32 v68, v154, s[56:59], s37 offen offset:24
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(0)
 	v_add_f32_e32 v69, v69, v171
-	buffer_store_b32 v69, v154, s[12:15], s37 offen offset:28
+	buffer_store_b32 v69, v154, s[56:59], s37 offen offset:28
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	s_sub_i32 s41, s24, 0x70
@@ -8007,42 +8007,42 @@ gemm_mq6g256v2_residual_pm_gfx1100_w8:
 	s_mov_b32 s42, s22
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v164, v155, s[12:15], s37 offen
+	buffer_load_b32 v164, v155, s[56:59], s37 offen
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v165, v155, s[12:15], s37 offen offset:4
+	buffer_load_b32 v165, v155, s[56:59], s37 offen offset:4
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v166, v155, s[12:15], s37 offen offset:8
+	buffer_load_b32 v166, v155, s[56:59], s37 offen offset:8
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v167, v155, s[12:15], s37 offen offset:12
+	buffer_load_b32 v167, v155, s[56:59], s37 offen offset:12
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v168, v155, s[12:15], s37 offen offset:16
+	buffer_load_b32 v168, v155, s[56:59], s37 offen offset:16
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v169, v155, s[12:15], s37 offen offset:20
+	buffer_load_b32 v169, v155, s[56:59], s37 offen offset:20
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v170, v155, s[12:15], s37 offen offset:24
+	buffer_load_b32 v170, v155, s[56:59], s37 offen offset:24
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v171, v155, s[12:15], s37 offen offset:28
+	buffer_load_b32 v171, v155, s[56:59], s37 offen offset:28
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	s_mov_b32 s42, s22
@@ -8050,56 +8050,56 @@ gemm_mq6g256v2_residual_pm_gfx1100_w8:
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(7)
 	v_add_f32_e32 v70, v70, v164
-	buffer_store_b32 v70, v155, s[12:15], s37 offen
+	buffer_store_b32 v70, v155, s[56:59], s37 offen
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(6)
 	v_add_f32_e32 v71, v71, v165
-	buffer_store_b32 v71, v155, s[12:15], s37 offen offset:4
+	buffer_store_b32 v71, v155, s[56:59], s37 offen offset:4
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(5)
 	v_add_f32_e32 v72, v72, v166
-	buffer_store_b32 v72, v155, s[12:15], s37 offen offset:8
+	buffer_store_b32 v72, v155, s[56:59], s37 offen offset:8
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(4)
 	v_add_f32_e32 v73, v73, v167
-	buffer_store_b32 v73, v155, s[12:15], s37 offen offset:12
+	buffer_store_b32 v73, v155, s[56:59], s37 offen offset:12
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(3)
 	v_add_f32_e32 v74, v74, v168
-	buffer_store_b32 v74, v155, s[12:15], s37 offen offset:16
+	buffer_store_b32 v74, v155, s[56:59], s37 offen offset:16
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(2)
 	v_add_f32_e32 v75, v75, v169
-	buffer_store_b32 v75, v155, s[12:15], s37 offen offset:20
+	buffer_store_b32 v75, v155, s[56:59], s37 offen offset:20
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(1)
 	v_add_f32_e32 v76, v76, v170
-	buffer_store_b32 v76, v155, s[12:15], s37 offen offset:24
+	buffer_store_b32 v76, v155, s[56:59], s37 offen offset:24
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(0)
 	v_add_f32_e32 v77, v77, v171
-	buffer_store_b32 v77, v155, s[12:15], s37 offen offset:28
+	buffer_store_b32 v77, v155, s[56:59], s37 offen offset:28
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	s_sub_i32 s41, s24, 0x80
@@ -8107,42 +8107,42 @@ gemm_mq6g256v2_residual_pm_gfx1100_w8:
 	s_mov_b32 s42, s22
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v164, v156, s[12:15], s37 offen
+	buffer_load_b32 v164, v156, s[56:59], s37 offen
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v165, v156, s[12:15], s37 offen offset:4
+	buffer_load_b32 v165, v156, s[56:59], s37 offen offset:4
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v166, v156, s[12:15], s37 offen offset:8
+	buffer_load_b32 v166, v156, s[56:59], s37 offen offset:8
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v167, v156, s[12:15], s37 offen offset:12
+	buffer_load_b32 v167, v156, s[56:59], s37 offen offset:12
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v168, v156, s[12:15], s37 offen offset:16
+	buffer_load_b32 v168, v156, s[56:59], s37 offen offset:16
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v169, v156, s[12:15], s37 offen offset:20
+	buffer_load_b32 v169, v156, s[56:59], s37 offen offset:20
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v170, v156, s[12:15], s37 offen offset:24
+	buffer_load_b32 v170, v156, s[56:59], s37 offen offset:24
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v171, v156, s[12:15], s37 offen offset:28
+	buffer_load_b32 v171, v156, s[56:59], s37 offen offset:28
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	s_mov_b32 s42, s22
@@ -8150,56 +8150,56 @@ gemm_mq6g256v2_residual_pm_gfx1100_w8:
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(7)
 	v_add_f32_e32 v78, v78, v164
-	buffer_store_b32 v78, v156, s[12:15], s37 offen
+	buffer_store_b32 v78, v156, s[56:59], s37 offen
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(6)
 	v_add_f32_e32 v79, v79, v165
-	buffer_store_b32 v79, v156, s[12:15], s37 offen offset:4
+	buffer_store_b32 v79, v156, s[56:59], s37 offen offset:4
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(5)
 	v_add_f32_e32 v80, v80, v166
-	buffer_store_b32 v80, v156, s[12:15], s37 offen offset:8
+	buffer_store_b32 v80, v156, s[56:59], s37 offen offset:8
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(4)
 	v_add_f32_e32 v81, v81, v167
-	buffer_store_b32 v81, v156, s[12:15], s37 offen offset:12
+	buffer_store_b32 v81, v156, s[56:59], s37 offen offset:12
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(3)
 	v_add_f32_e32 v82, v82, v168
-	buffer_store_b32 v82, v156, s[12:15], s37 offen offset:16
+	buffer_store_b32 v82, v156, s[56:59], s37 offen offset:16
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(2)
 	v_add_f32_e32 v83, v83, v169
-	buffer_store_b32 v83, v156, s[12:15], s37 offen offset:20
+	buffer_store_b32 v83, v156, s[56:59], s37 offen offset:20
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(1)
 	v_add_f32_e32 v84, v84, v170
-	buffer_store_b32 v84, v156, s[12:15], s37 offen offset:24
+	buffer_store_b32 v84, v156, s[56:59], s37 offen offset:24
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(0)
 	v_add_f32_e32 v85, v85, v171
-	buffer_store_b32 v85, v156, s[12:15], s37 offen offset:28
+	buffer_store_b32 v85, v156, s[56:59], s37 offen offset:28
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	s_sub_i32 s41, s24, 0x90
@@ -8207,42 +8207,42 @@ gemm_mq6g256v2_residual_pm_gfx1100_w8:
 	s_mov_b32 s42, s22
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v164, v157, s[12:15], s37 offen
+	buffer_load_b32 v164, v157, s[56:59], s37 offen
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v165, v157, s[12:15], s37 offen offset:4
+	buffer_load_b32 v165, v157, s[56:59], s37 offen offset:4
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v166, v157, s[12:15], s37 offen offset:8
+	buffer_load_b32 v166, v157, s[56:59], s37 offen offset:8
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v167, v157, s[12:15], s37 offen offset:12
+	buffer_load_b32 v167, v157, s[56:59], s37 offen offset:12
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v168, v157, s[12:15], s37 offen offset:16
+	buffer_load_b32 v168, v157, s[56:59], s37 offen offset:16
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v169, v157, s[12:15], s37 offen offset:20
+	buffer_load_b32 v169, v157, s[56:59], s37 offen offset:20
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v170, v157, s[12:15], s37 offen offset:24
+	buffer_load_b32 v170, v157, s[56:59], s37 offen offset:24
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v171, v157, s[12:15], s37 offen offset:28
+	buffer_load_b32 v171, v157, s[56:59], s37 offen offset:28
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	s_mov_b32 s42, s22
@@ -8250,56 +8250,56 @@ gemm_mq6g256v2_residual_pm_gfx1100_w8:
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(7)
 	v_add_f32_e32 v86, v86, v164
-	buffer_store_b32 v86, v157, s[12:15], s37 offen
+	buffer_store_b32 v86, v157, s[56:59], s37 offen
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(6)
 	v_add_f32_e32 v87, v87, v165
-	buffer_store_b32 v87, v157, s[12:15], s37 offen offset:4
+	buffer_store_b32 v87, v157, s[56:59], s37 offen offset:4
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(5)
 	v_add_f32_e32 v88, v88, v166
-	buffer_store_b32 v88, v157, s[12:15], s37 offen offset:8
+	buffer_store_b32 v88, v157, s[56:59], s37 offen offset:8
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(4)
 	v_add_f32_e32 v89, v89, v167
-	buffer_store_b32 v89, v157, s[12:15], s37 offen offset:12
+	buffer_store_b32 v89, v157, s[56:59], s37 offen offset:12
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(3)
 	v_add_f32_e32 v90, v90, v168
-	buffer_store_b32 v90, v157, s[12:15], s37 offen offset:16
+	buffer_store_b32 v90, v157, s[56:59], s37 offen offset:16
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(2)
 	v_add_f32_e32 v91, v91, v169
-	buffer_store_b32 v91, v157, s[12:15], s37 offen offset:20
+	buffer_store_b32 v91, v157, s[56:59], s37 offen offset:20
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(1)
 	v_add_f32_e32 v92, v92, v170
-	buffer_store_b32 v92, v157, s[12:15], s37 offen offset:24
+	buffer_store_b32 v92, v157, s[56:59], s37 offen offset:24
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(0)
 	v_add_f32_e32 v93, v93, v171
-	buffer_store_b32 v93, v157, s[12:15], s37 offen offset:28
+	buffer_store_b32 v93, v157, s[56:59], s37 offen offset:28
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	s_sub_i32 s41, s24, 0xa0
@@ -8307,42 +8307,42 @@ gemm_mq6g256v2_residual_pm_gfx1100_w8:
 	s_mov_b32 s42, s22
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v164, v158, s[12:15], s37 offen
+	buffer_load_b32 v164, v158, s[56:59], s37 offen
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v165, v158, s[12:15], s37 offen offset:4
+	buffer_load_b32 v165, v158, s[56:59], s37 offen offset:4
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v166, v158, s[12:15], s37 offen offset:8
+	buffer_load_b32 v166, v158, s[56:59], s37 offen offset:8
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v167, v158, s[12:15], s37 offen offset:12
+	buffer_load_b32 v167, v158, s[56:59], s37 offen offset:12
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v168, v158, s[12:15], s37 offen offset:16
+	buffer_load_b32 v168, v158, s[56:59], s37 offen offset:16
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v169, v158, s[12:15], s37 offen offset:20
+	buffer_load_b32 v169, v158, s[56:59], s37 offen offset:20
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v170, v158, s[12:15], s37 offen offset:24
+	buffer_load_b32 v170, v158, s[56:59], s37 offen offset:24
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v171, v158, s[12:15], s37 offen offset:28
+	buffer_load_b32 v171, v158, s[56:59], s37 offen offset:28
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	s_mov_b32 s42, s22
@@ -8350,56 +8350,56 @@ gemm_mq6g256v2_residual_pm_gfx1100_w8:
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(7)
 	v_add_f32_e32 v94, v94, v164
-	buffer_store_b32 v94, v158, s[12:15], s37 offen
+	buffer_store_b32 v94, v158, s[56:59], s37 offen
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(6)
 	v_add_f32_e32 v95, v95, v165
-	buffer_store_b32 v95, v158, s[12:15], s37 offen offset:4
+	buffer_store_b32 v95, v158, s[56:59], s37 offen offset:4
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(5)
 	v_add_f32_e32 v96, v96, v166
-	buffer_store_b32 v96, v158, s[12:15], s37 offen offset:8
+	buffer_store_b32 v96, v158, s[56:59], s37 offen offset:8
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(4)
 	v_add_f32_e32 v97, v97, v167
-	buffer_store_b32 v97, v158, s[12:15], s37 offen offset:12
+	buffer_store_b32 v97, v158, s[56:59], s37 offen offset:12
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(3)
 	v_add_f32_e32 v98, v98, v168
-	buffer_store_b32 v98, v158, s[12:15], s37 offen offset:16
+	buffer_store_b32 v98, v158, s[56:59], s37 offen offset:16
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(2)
 	v_add_f32_e32 v99, v99, v169
-	buffer_store_b32 v99, v158, s[12:15], s37 offen offset:20
+	buffer_store_b32 v99, v158, s[56:59], s37 offen offset:20
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(1)
 	v_add_f32_e32 v100, v100, v170
-	buffer_store_b32 v100, v158, s[12:15], s37 offen offset:24
+	buffer_store_b32 v100, v158, s[56:59], s37 offen offset:24
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(0)
 	v_add_f32_e32 v101, v101, v171
-	buffer_store_b32 v101, v158, s[12:15], s37 offen offset:28
+	buffer_store_b32 v101, v158, s[56:59], s37 offen offset:28
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	s_sub_i32 s41, s24, 0xb0
@@ -8407,42 +8407,42 @@ gemm_mq6g256v2_residual_pm_gfx1100_w8:
 	s_mov_b32 s42, s22
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v164, v159, s[12:15], s37 offen
+	buffer_load_b32 v164, v159, s[56:59], s37 offen
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v165, v159, s[12:15], s37 offen offset:4
+	buffer_load_b32 v165, v159, s[56:59], s37 offen offset:4
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v166, v159, s[12:15], s37 offen offset:8
+	buffer_load_b32 v166, v159, s[56:59], s37 offen offset:8
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v167, v159, s[12:15], s37 offen offset:12
+	buffer_load_b32 v167, v159, s[56:59], s37 offen offset:12
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v168, v159, s[12:15], s37 offen offset:16
+	buffer_load_b32 v168, v159, s[56:59], s37 offen offset:16
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v169, v159, s[12:15], s37 offen offset:20
+	buffer_load_b32 v169, v159, s[56:59], s37 offen offset:20
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v170, v159, s[12:15], s37 offen offset:24
+	buffer_load_b32 v170, v159, s[56:59], s37 offen offset:24
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v171, v159, s[12:15], s37 offen offset:28
+	buffer_load_b32 v171, v159, s[56:59], s37 offen offset:28
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	s_mov_b32 s42, s22
@@ -8450,56 +8450,56 @@ gemm_mq6g256v2_residual_pm_gfx1100_w8:
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(7)
 	v_add_f32_e32 v102, v102, v164
-	buffer_store_b32 v102, v159, s[12:15], s37 offen
+	buffer_store_b32 v102, v159, s[56:59], s37 offen
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(6)
 	v_add_f32_e32 v103, v103, v165
-	buffer_store_b32 v103, v159, s[12:15], s37 offen offset:4
+	buffer_store_b32 v103, v159, s[56:59], s37 offen offset:4
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(5)
 	v_add_f32_e32 v104, v104, v166
-	buffer_store_b32 v104, v159, s[12:15], s37 offen offset:8
+	buffer_store_b32 v104, v159, s[56:59], s37 offen offset:8
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(4)
 	v_add_f32_e32 v105, v105, v167
-	buffer_store_b32 v105, v159, s[12:15], s37 offen offset:12
+	buffer_store_b32 v105, v159, s[56:59], s37 offen offset:12
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(3)
 	v_add_f32_e32 v106, v106, v168
-	buffer_store_b32 v106, v159, s[12:15], s37 offen offset:16
+	buffer_store_b32 v106, v159, s[56:59], s37 offen offset:16
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(2)
 	v_add_f32_e32 v107, v107, v169
-	buffer_store_b32 v107, v159, s[12:15], s37 offen offset:20
+	buffer_store_b32 v107, v159, s[56:59], s37 offen offset:20
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(1)
 	v_add_f32_e32 v108, v108, v170
-	buffer_store_b32 v108, v159, s[12:15], s37 offen offset:24
+	buffer_store_b32 v108, v159, s[56:59], s37 offen offset:24
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(0)
 	v_add_f32_e32 v109, v109, v171
-	buffer_store_b32 v109, v159, s[12:15], s37 offen offset:28
+	buffer_store_b32 v109, v159, s[56:59], s37 offen offset:28
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	s_sub_i32 s41, s24, 0xc0
@@ -8507,42 +8507,42 @@ gemm_mq6g256v2_residual_pm_gfx1100_w8:
 	s_mov_b32 s42, s22
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v164, v160, s[12:15], s37 offen
+	buffer_load_b32 v164, v160, s[56:59], s37 offen
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v165, v160, s[12:15], s37 offen offset:4
+	buffer_load_b32 v165, v160, s[56:59], s37 offen offset:4
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v166, v160, s[12:15], s37 offen offset:8
+	buffer_load_b32 v166, v160, s[56:59], s37 offen offset:8
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v167, v160, s[12:15], s37 offen offset:12
+	buffer_load_b32 v167, v160, s[56:59], s37 offen offset:12
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v168, v160, s[12:15], s37 offen offset:16
+	buffer_load_b32 v168, v160, s[56:59], s37 offen offset:16
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v169, v160, s[12:15], s37 offen offset:20
+	buffer_load_b32 v169, v160, s[56:59], s37 offen offset:20
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v170, v160, s[12:15], s37 offen offset:24
+	buffer_load_b32 v170, v160, s[56:59], s37 offen offset:24
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v171, v160, s[12:15], s37 offen offset:28
+	buffer_load_b32 v171, v160, s[56:59], s37 offen offset:28
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	s_mov_b32 s42, s22
@@ -8550,56 +8550,56 @@ gemm_mq6g256v2_residual_pm_gfx1100_w8:
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(7)
 	v_add_f32_e32 v110, v110, v164
-	buffer_store_b32 v110, v160, s[12:15], s37 offen
+	buffer_store_b32 v110, v160, s[56:59], s37 offen
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(6)
 	v_add_f32_e32 v111, v111, v165
-	buffer_store_b32 v111, v160, s[12:15], s37 offen offset:4
+	buffer_store_b32 v111, v160, s[56:59], s37 offen offset:4
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(5)
 	v_add_f32_e32 v112, v112, v166
-	buffer_store_b32 v112, v160, s[12:15], s37 offen offset:8
+	buffer_store_b32 v112, v160, s[56:59], s37 offen offset:8
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(4)
 	v_add_f32_e32 v113, v113, v167
-	buffer_store_b32 v113, v160, s[12:15], s37 offen offset:12
+	buffer_store_b32 v113, v160, s[56:59], s37 offen offset:12
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(3)
 	v_add_f32_e32 v114, v114, v168
-	buffer_store_b32 v114, v160, s[12:15], s37 offen offset:16
+	buffer_store_b32 v114, v160, s[56:59], s37 offen offset:16
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(2)
 	v_add_f32_e32 v115, v115, v169
-	buffer_store_b32 v115, v160, s[12:15], s37 offen offset:20
+	buffer_store_b32 v115, v160, s[56:59], s37 offen offset:20
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(1)
 	v_add_f32_e32 v116, v116, v170
-	buffer_store_b32 v116, v160, s[12:15], s37 offen offset:24
+	buffer_store_b32 v116, v160, s[56:59], s37 offen offset:24
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(0)
 	v_add_f32_e32 v117, v117, v171
-	buffer_store_b32 v117, v160, s[12:15], s37 offen offset:28
+	buffer_store_b32 v117, v160, s[56:59], s37 offen offset:28
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	s_sub_i32 s41, s24, 0xd0
@@ -8607,42 +8607,42 @@ gemm_mq6g256v2_residual_pm_gfx1100_w8:
 	s_mov_b32 s42, s22
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v164, v161, s[12:15], s37 offen
+	buffer_load_b32 v164, v161, s[56:59], s37 offen
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v165, v161, s[12:15], s37 offen offset:4
+	buffer_load_b32 v165, v161, s[56:59], s37 offen offset:4
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v166, v161, s[12:15], s37 offen offset:8
+	buffer_load_b32 v166, v161, s[56:59], s37 offen offset:8
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v167, v161, s[12:15], s37 offen offset:12
+	buffer_load_b32 v167, v161, s[56:59], s37 offen offset:12
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v168, v161, s[12:15], s37 offen offset:16
+	buffer_load_b32 v168, v161, s[56:59], s37 offen offset:16
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v169, v161, s[12:15], s37 offen offset:20
+	buffer_load_b32 v169, v161, s[56:59], s37 offen offset:20
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v170, v161, s[12:15], s37 offen offset:24
+	buffer_load_b32 v170, v161, s[56:59], s37 offen offset:24
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v171, v161, s[12:15], s37 offen offset:28
+	buffer_load_b32 v171, v161, s[56:59], s37 offen offset:28
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	s_mov_b32 s42, s22
@@ -8650,56 +8650,56 @@ gemm_mq6g256v2_residual_pm_gfx1100_w8:
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(7)
 	v_add_f32_e32 v118, v118, v164
-	buffer_store_b32 v118, v161, s[12:15], s37 offen
+	buffer_store_b32 v118, v161, s[56:59], s37 offen
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(6)
 	v_add_f32_e32 v119, v119, v165
-	buffer_store_b32 v119, v161, s[12:15], s37 offen offset:4
+	buffer_store_b32 v119, v161, s[56:59], s37 offen offset:4
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(5)
 	v_add_f32_e32 v120, v120, v166
-	buffer_store_b32 v120, v161, s[12:15], s37 offen offset:8
+	buffer_store_b32 v120, v161, s[56:59], s37 offen offset:8
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(4)
 	v_add_f32_e32 v121, v121, v167
-	buffer_store_b32 v121, v161, s[12:15], s37 offen offset:12
+	buffer_store_b32 v121, v161, s[56:59], s37 offen offset:12
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(3)
 	v_add_f32_e32 v122, v122, v168
-	buffer_store_b32 v122, v161, s[12:15], s37 offen offset:16
+	buffer_store_b32 v122, v161, s[56:59], s37 offen offset:16
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(2)
 	v_add_f32_e32 v123, v123, v169
-	buffer_store_b32 v123, v161, s[12:15], s37 offen offset:20
+	buffer_store_b32 v123, v161, s[56:59], s37 offen offset:20
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(1)
 	v_add_f32_e32 v124, v124, v170
-	buffer_store_b32 v124, v161, s[12:15], s37 offen offset:24
+	buffer_store_b32 v124, v161, s[56:59], s37 offen offset:24
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(0)
 	v_add_f32_e32 v125, v125, v171
-	buffer_store_b32 v125, v161, s[12:15], s37 offen offset:28
+	buffer_store_b32 v125, v161, s[56:59], s37 offen offset:28
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	s_sub_i32 s41, s24, 0xe0
@@ -8707,42 +8707,42 @@ gemm_mq6g256v2_residual_pm_gfx1100_w8:
 	s_mov_b32 s42, s22
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v164, v162, s[12:15], s37 offen
+	buffer_load_b32 v164, v162, s[56:59], s37 offen
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v165, v162, s[12:15], s37 offen offset:4
+	buffer_load_b32 v165, v162, s[56:59], s37 offen offset:4
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v166, v162, s[12:15], s37 offen offset:8
+	buffer_load_b32 v166, v162, s[56:59], s37 offen offset:8
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v167, v162, s[12:15], s37 offen offset:12
+	buffer_load_b32 v167, v162, s[56:59], s37 offen offset:12
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v168, v162, s[12:15], s37 offen offset:16
+	buffer_load_b32 v168, v162, s[56:59], s37 offen offset:16
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v169, v162, s[12:15], s37 offen offset:20
+	buffer_load_b32 v169, v162, s[56:59], s37 offen offset:20
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v170, v162, s[12:15], s37 offen offset:24
+	buffer_load_b32 v170, v162, s[56:59], s37 offen offset:24
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v171, v162, s[12:15], s37 offen offset:28
+	buffer_load_b32 v171, v162, s[56:59], s37 offen offset:28
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	s_mov_b32 s42, s22
@@ -8750,56 +8750,56 @@ gemm_mq6g256v2_residual_pm_gfx1100_w8:
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(7)
 	v_add_f32_e32 v126, v126, v164
-	buffer_store_b32 v126, v162, s[12:15], s37 offen
+	buffer_store_b32 v126, v162, s[56:59], s37 offen
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(6)
 	v_add_f32_e32 v127, v127, v165
-	buffer_store_b32 v127, v162, s[12:15], s37 offen offset:4
+	buffer_store_b32 v127, v162, s[56:59], s37 offen offset:4
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(5)
 	v_add_f32_e32 v128, v128, v166
-	buffer_store_b32 v128, v162, s[12:15], s37 offen offset:8
+	buffer_store_b32 v128, v162, s[56:59], s37 offen offset:8
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(4)
 	v_add_f32_e32 v129, v129, v167
-	buffer_store_b32 v129, v162, s[12:15], s37 offen offset:12
+	buffer_store_b32 v129, v162, s[56:59], s37 offen offset:12
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(3)
 	v_add_f32_e32 v130, v130, v168
-	buffer_store_b32 v130, v162, s[12:15], s37 offen offset:16
+	buffer_store_b32 v130, v162, s[56:59], s37 offen offset:16
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(2)
 	v_add_f32_e32 v131, v131, v169
-	buffer_store_b32 v131, v162, s[12:15], s37 offen offset:20
+	buffer_store_b32 v131, v162, s[56:59], s37 offen offset:20
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(1)
 	v_add_f32_e32 v132, v132, v170
-	buffer_store_b32 v132, v162, s[12:15], s37 offen offset:24
+	buffer_store_b32 v132, v162, s[56:59], s37 offen offset:24
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(0)
 	v_add_f32_e32 v133, v133, v171
-	buffer_store_b32 v133, v162, s[12:15], s37 offen offset:28
+	buffer_store_b32 v133, v162, s[56:59], s37 offen offset:28
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	s_sub_i32 s41, s24, 0xf0
@@ -8807,42 +8807,42 @@ gemm_mq6g256v2_residual_pm_gfx1100_w8:
 	s_mov_b32 s42, s22
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v164, v163, s[12:15], s37 offen
+	buffer_load_b32 v164, v163, s[56:59], s37 offen
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v165, v163, s[12:15], s37 offen offset:4
+	buffer_load_b32 v165, v163, s[56:59], s37 offen offset:4
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v166, v163, s[12:15], s37 offen offset:8
+	buffer_load_b32 v166, v163, s[56:59], s37 offen offset:8
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v167, v163, s[12:15], s37 offen offset:12
+	buffer_load_b32 v167, v163, s[56:59], s37 offen offset:12
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v168, v163, s[12:15], s37 offen offset:16
+	buffer_load_b32 v168, v163, s[56:59], s37 offen offset:16
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v169, v163, s[12:15], s37 offen offset:20
+	buffer_load_b32 v169, v163, s[56:59], s37 offen offset:20
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v170, v163, s[12:15], s37 offen offset:24
+	buffer_load_b32 v170, v163, s[56:59], s37 offen offset:24
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
-	buffer_load_b32 v171, v163, s[12:15], s37 offen offset:28
+	buffer_load_b32 v171, v163, s[56:59], s37 offen offset:28
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	s_mov_b32 s42, s22
@@ -8850,56 +8850,56 @@ gemm_mq6g256v2_residual_pm_gfx1100_w8:
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(7)
 	v_add_f32_e32 v134, v134, v164
-	buffer_store_b32 v134, v163, s[12:15], s37 offen
+	buffer_store_b32 v134, v163, s[56:59], s37 offen
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(6)
 	v_add_f32_e32 v135, v135, v165
-	buffer_store_b32 v135, v163, s[12:15], s37 offen offset:4
+	buffer_store_b32 v135, v163, s[56:59], s37 offen offset:4
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(5)
 	v_add_f32_e32 v136, v136, v166
-	buffer_store_b32 v136, v163, s[12:15], s37 offen offset:8
+	buffer_store_b32 v136, v163, s[56:59], s37 offen offset:8
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(4)
 	v_add_f32_e32 v137, v137, v167
-	buffer_store_b32 v137, v163, s[12:15], s37 offen offset:12
+	buffer_store_b32 v137, v163, s[56:59], s37 offen offset:12
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(3)
 	v_add_f32_e32 v138, v138, v168
-	buffer_store_b32 v138, v163, s[12:15], s37 offen offset:16
+	buffer_store_b32 v138, v163, s[56:59], s37 offen offset:16
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(2)
 	v_add_f32_e32 v139, v139, v169
-	buffer_store_b32 v139, v163, s[12:15], s37 offen offset:20
+	buffer_store_b32 v139, v163, s[56:59], s37 offen offset:20
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(1)
 	v_add_f32_e32 v140, v140, v170
-	buffer_store_b32 v140, v163, s[12:15], s37 offen offset:24
+	buffer_store_b32 v140, v163, s[56:59], s37 offen offset:24
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	v_cmp_gt_i32_e64 s46, s42, v9
 	s_and_b32 exec_lo, s44, s46
 	s_waitcnt vmcnt(0)
 	v_add_f32_e32 v141, v141, v171
-	buffer_store_b32 v141, v163, s[12:15], s37 offen offset:28
+	buffer_store_b32 v141, v163, s[56:59], s37 offen offset:28
 	s_mov_b32 exec_lo, -1
 	s_add_i32 s42, s42, -1
 	.Lmq6g11w8y_end:
@@ -8912,7 +8912,7 @@ gemm_mq6g256v2_residual_pm_gfx1100_w8:
 	.amdhsa_group_segment_fixed_size 40960
 	.amdhsa_private_segment_fixed_size 0
 	.amdhsa_kernarg_size 36
-	.amdhsa_user_sgpr_count 2
+	.amdhsa_user_sgpr_count 14
 	.amdhsa_user_sgpr_dispatch_ptr 0
 	.amdhsa_user_sgpr_queue_ptr 0
 	.amdhsa_user_sgpr_kernarg_segment_ptr 1

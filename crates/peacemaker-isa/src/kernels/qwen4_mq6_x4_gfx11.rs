@@ -393,13 +393,37 @@ fn lbl(spec: &Cfg, name: &str) -> String {
 }
 
 // ----------------------------------------------------------------------- SGPRs
-// s0:1 kernarg pointer; s2, s3 workgroup ids (after the two user SGPRs).
+// s0:1 kernarg pointer; the workgroup ids follow the DECLARED user SGPRs: s2, s3 on gfx1151, but on
+// gfx1100 `FeatureUserSGPRInit16Bug` (LLVM) the kernarg pointer is padded with dead user SGPRs up to
+// `user + system (workgroup ids x, y) = 16`, i.e. 14 declared user SGPRs: ids s14, s15 (and the output
+// descriptor `SRD_Y`, which would overlap them, moves out of s[12:15]).
+/// Real user SGPRs (the kernarg pointer) and enabled system SGPRs (workgroup ids x, y).
+const USER_SGPRS: u8 = 2;
+const SYSTEM_SGPRS: u8 = 2;
+/// `.amdhsa_user_sgpr_count` of `arch` (`Arch::declared_user_sgprs`: user + system >= 16 on gfx1100).
+const fn declared_user_sgprs(arch: Arch) -> u8 {
+    arch.declared_user_sgprs(USER_SGPRS, SYSTEM_SGPRS)
+}
 const KARG: u8 = 0;
-const WGX_IN: u8 = 2;
-const WGY_IN: u8 = 3;
+/// Workgroup id x / y: the first two system SGPRs, after the declared user SGPRs.
+const fn wgx_in(arch: Arch) -> u8 {
+    declared_user_sgprs(arch)
+}
+const fn wgy_in(arch: Arch) -> u8 {
+    declared_user_sgprs(arch) + 1
+}
 const SRD_A: u8 = 4;
 const SRD_X: u8 = 8;
-const SRD_Y: u8 = 12;
+/// Output (Y) buffer descriptor `s[SRD_Y:SRD_Y+3]`: s[12:15] on gfx1151; on gfx1100 s[56:59] (s14 / s15
+/// are the workgroup ids; the residual entries use none of the region / HCW scalars at s[56:79]).
+const fn srd_y(arch: Arch) -> u8 {
+    if wgy_in(arch) >= SRD_Y_GFX1151 {
+        56
+    } else {
+        SRD_Y_GFX1151
+    }
+}
+const SRD_Y_GFX1151: u8 = 12;
 const PA: u8 = 16;
 const PX: u8 = 18;
 const PY: u8 = 20;
@@ -599,9 +623,9 @@ fn plan(spec: &Cfg) -> Result<RegPlan, String> {
         }
     }
     p.s::<2>("kernarg_ptr", KARG, w())?;
-    p.s::<1>("wg_x_in", WGX_IN, w())?;
-    p.s::<1>("wg_y_in", WGY_IN, w())?;
-    for srd in [SRD_A, SRD_X, SRD_Y] {
+    p.s::<1>("wg_x_in", wgx_in(spec.arch), w())?;
+    p.s::<1>("wg_y_in", wgy_in(spec.arch), w())?;
+    for srd in [SRD_A, SRD_X, srd_y(spec.arch)] {
         p.s::<4>("srd", srd, w())?;
     }
     p.s::<8>("kernargs", PA, w())?;
@@ -1132,9 +1156,9 @@ fn select_region(b: &mut Builder, spec: &Cfg) -> R {
     // region's first row block.
     sop(
         b,
-        format!("s_cmp_lt_i32 s{WGX_IN}, s{SSEL}"),
+        format!("s_cmp_lt_i32 s{}, s{SSEL}", wgx_in(spec.arch)),
         &[],
-        &[WGX_IN, SSEL],
+        &[wgx_in(spec.arch), SSEL],
     )?;
     op(
         b,
@@ -1172,9 +1196,9 @@ fn select_region(b: &mut Builder, spec: &Cfg) -> R {
     )?;
     sop(
         b,
-        format!("s_cmp_lt_i32 s{WGX_IN}, s{ST0}"),
+        format!("s_cmp_lt_i32 s{}, s{ST0}", wgx_in(spec.arch)),
         &[],
-        &[WGX_IN, ST0],
+        &[wgx_in(spec.arch), ST0],
     )?;
     op(
         b,
@@ -1212,9 +1236,9 @@ fn select_region(b: &mut Builder, spec: &Cfg) -> R {
     )?;
     sop(
         b,
-        format!("s_sub_i32 s{WGX}, s{WGX_IN}, s{WGX}"),
+        format!("s_sub_i32 s{WGX}, s{}, s{WGX}", wgx_in(spec.arch)),
         &[WGX],
-        &[WGX_IN, WGX],
+        &[wgx_in(spec.arch), WGX],
     )?;
     op(
         b,
@@ -1400,9 +1424,19 @@ fn prologue(b: &mut Builder, spec: &Cfg) -> R {
         )?;
         sop(b, format!("s_cmp_lt_i32 s{ST0}, 1"), &[], &[ST0])?;
         op(b, format!("s_cbranch_scc1 {}", lbl(spec, "end")), &[], &[])?;
-        sop(b, format!("s_mov_b32 s{WGX}, s{WGX_IN}"), &[WGX], &[WGX_IN])?;
+        sop(
+            b,
+            format!("s_mov_b32 s{WGX}, s{}", wgx_in(spec.arch)),
+            &[WGX],
+            &[wgx_in(spec.arch)],
+        )?;
     }
-    sop(b, format!("s_mov_b32 s{WGY}, s{WGY_IN}"), &[WGY], &[WGY_IN])?;
+    sop(
+        b,
+        format!("s_mov_b32 s{WGY}, s{}", wgy_in(spec.arch)),
+        &[WGY],
+        &[wgy_in(spec.arch)],
+    )?;
     sop(b, format!("s_lshr_b32 s{GPR}, s{SK}, 8"), &[GPR], &[SK])?;
     sop(b, format!("s_lshr_b32 s{NCHM1}, s{SK}, 5"), &[NCHM1], &[SK])?;
     sop(
@@ -1426,7 +1460,7 @@ fn prologue(b: &mut Builder, spec: &Cfg) -> R {
         &[ST1],
         &[SN, SK2],
     )?;
-    let mut srds = vec![(SRD_A, PA), (SRD_X, PX), (SRD_Y, PY)];
+    let mut srds = vec![(SRD_A, PA), (SRD_X, PX), (srd_y(spec.arch), PY)];
     if spec.hcw() {
         srds.extend([(SRD_S, HS), (SRD_G, HG)]);
     }
@@ -1883,9 +1917,9 @@ fn plain_epilogue(b: &mut Builder, spec: &Cfg) -> R {
             &[],
             &[s(MASK0), s(MASK1)],
         )?;
-        bstore(b, 4, a, e.offs + t, SRD_Y, SZERO, 0)?;
+        bstore(b, 4, a, e.offs + t, srd_y(spec.arch), SZERO, 0)?;
         if !bf16 {
-            bstore(b, 4, a + 4, e.offs + t, SRD_Y, SZERO, 16)?;
+            bstore(b, 4, a + 4, e.offs + t, srd_y(spec.arch), SZERO, 16)?;
         }
         op(b, "s_mov_b32 exec_lo, -1", &[], &[])?;
         sop(b, format!("s_add_i32 s{SNB}, s{SNB}, -16"), &[SNB], &[SNB])?;
@@ -1930,9 +1964,25 @@ fn plain_epilogue(b: &mut Builder, spec: &Cfg) -> R {
                 &[s(MASK0), s(MASK1)],
             )?;
             if bf16 {
-                bstore(b, 0, a + n, e.offs + t, SRD_Y, SZERO, 2 * u32::from(n))?;
+                bstore(
+                    b,
+                    0,
+                    a + n,
+                    e.offs + t,
+                    srd_y(spec.arch),
+                    SZERO,
+                    2 * u32::from(n),
+                )?;
             } else {
-                bstore(b, 1, a + n, e.offs + t, SRD_Y, SZERO, 4 * u32::from(n))?;
+                bstore(
+                    b,
+                    1,
+                    a + n,
+                    e.offs + t,
+                    srd_y(spec.arch),
+                    SZERO,
+                    4 * u32::from(n),
+                )?;
             }
             op(b, "s_mov_b32 exec_lo, -1", &[], &[])?;
             sop(b, format!("s_add_i32 s{SMJ}, s{SMJ}, -1"), &[SMJ], &[SMJ])?;
@@ -2231,8 +2281,8 @@ fn hcw_epilogue(b: &mut Builder, spec: &Cfg) -> R {
                 &[],
                 &[s(MASK0), s(MASK1)],
             )?;
-            bstore(b, 4, a, e.offs + bt, SRD_Y, SZERO, 0)?;
-            bstore(b, 4, a + 4, e.offs + bt, SRD_Y, SZERO, 16)?;
+            bstore(b, 4, a, e.offs + bt, srd_y(spec.arch), SZERO, 0)?;
+            bstore(b, 4, a + 4, e.offs + bt, srd_y(spec.arch), SZERO, 16)?;
             op(b, "s_mov_b32 exec_lo, -1", &[], &[])?;
             sop(b, format!("s_add_i32 s{SNB}, s{SNB}, -16"), &[SNB], &[SNB])?;
             // hcw_pack8: word p = bf16(r[2p]) | bf16(r[2p+1]) << 16.
@@ -2339,8 +2389,16 @@ fn resid_epilogue(b: &mut Builder, spec: &Cfg) -> R {
         for k in 0..YG {
             let t = g * YG + k;
             tile_exec(b, t)?;
-            bload(b, 4, e.yb + 8 * k, e.offs + t, SRD_Y, SZERO, 0)?;
-            bload(b, 4, e.yb + 8 * k + 4, e.offs + t, SRD_Y, SZERO, 16)?;
+            bload(b, 4, e.yb + 8 * k, e.offs + t, srd_y(spec.arch), SZERO, 0)?;
+            bload(
+                b,
+                4,
+                e.yb + 8 * k + 4,
+                e.offs + t,
+                srd_y(spec.arch),
+                SZERO,
+                16,
+            )?;
             op(b, "s_mov_b32 exec_lo, -1", &[], &[])?;
         }
         for k in 0..YG {
@@ -2355,8 +2413,8 @@ fn resid_epilogue(b: &mut Builder, spec: &Cfg) -> R {
                     &[v(a + i), v(e.yb + 8 * k + i)],
                 )?;
             }
-            bstore(b, 4, a, e.offs + t, SRD_Y, SZERO, 0)?;
-            bstore(b, 4, a + 4, e.offs + t, SRD_Y, SZERO, 16)?;
+            bstore(b, 4, a, e.offs + t, srd_y(spec.arch), SZERO, 0)?;
+            bstore(b, 4, a + 4, e.offs + t, srd_y(spec.arch), SZERO, 16)?;
             op(b, "s_mov_b32 exec_lo, -1", &[], &[])?;
         }
     }
@@ -2394,7 +2452,15 @@ fn resid_epilogue(b: &mut Builder, spec: &Cfg) -> R {
                     &[s(MASK0), s(MASK1)],
                 )?;
                 if phase == 0 {
-                    bload(b, 1, e.yb + n, e.offs + t, SRD_Y, SZERO, 4 * u32::from(n))?;
+                    bload(
+                        b,
+                        1,
+                        e.yb + n,
+                        e.offs + t,
+                        srd_y(spec.arch),
+                        SZERO,
+                        4 * u32::from(n),
+                    )?;
                 } else {
                     op(
                         b,
@@ -2402,7 +2468,15 @@ fn resid_epilogue(b: &mut Builder, spec: &Cfg) -> R {
                         &[v(a + n)],
                         &[v(a + n), v(e.yb + n)],
                     )?;
-                    bstore(b, 1, a + n, e.offs + t, SRD_Y, SZERO, 4 * u32::from(n))?;
+                    bstore(
+                        b,
+                        1,
+                        a + n,
+                        e.offs + t,
+                        srd_y(spec.arch),
+                        SZERO,
+                        4 * u32::from(n),
+                    )?;
                 }
                 op(b, "s_mov_b32 exec_lo, -1", &[], &[])?;
                 sop(b, format!("s_add_i32 s{SMJ}, s{SMJ}, -1"), &[SMJ], &[SMJ])?;
@@ -2478,7 +2552,7 @@ pub fn emit_cfg(spec: Cfg) -> Result<Emitted, String> {
         arch: spec.arch,
         symbol: spec.symbol(),
         kernargs,
-        user_sgpr_count: 2,
+        user_sgpr_count: USER_SGPRS,
         system_sgpr_workgroup_id_y: true,
         workgroup_size: spec.threads(),
         group_segment_fixed_size: GROUP_BYTES,

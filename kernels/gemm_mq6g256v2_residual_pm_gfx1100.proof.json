@@ -3,7 +3,7 @@
   "arch": "gfx1100",
   "builder_crate_version": "0.4.1",
   "builder_git_sha": "unknown",
-  "s_text_sha256": "d54b16a8e57b8e01fd38511e70474133a2bfee0241bc89da1ae3e91ea5b2877f",
+  "s_text_sha256": "1b610758214194c1d4074093d97f2e4c0e259eef28fa8ca3d30f842316ea3743",
   "kernels": [
     {
       "kernel_id": "qwen4_mq6_x4",
@@ -944,14 +944,14 @@
         {
           "name": "wg_x_in",
           "kind": "s",
-          "base": 2,
+          "base": 14,
           "len": 1,
           "live": "Whole"
         },
         {
           "name": "wg_y_in",
           "kind": "s",
-          "base": 3,
+          "base": 15,
           "len": 1,
           "live": "Whole"
         },
@@ -972,7 +972,7 @@
         {
           "name": "srd",
           "kind": "s",
-          "base": 12,
+          "base": 56,
           "len": 4,
           "live": "Whole"
         },
@@ -7361,7 +7361,7 @@
         "s_waitcnt (gfx12)",
         "scratch_*"
       ],
-      "s_text_sha256": "06a25c8c14956fa2498d63a8950017c691d424d18861c3104952477888d538a9"
+      "s_text_sha256": "4d0dbfb9ac20889ed8f8794a385fb355923f2cdde247414d91974edd8f5bfff9"
     },
     {
       "kernel_id": "qwen4_mq6_x4",
@@ -8233,14 +8233,14 @@
         {
           "name": "wg_x_in",
           "kind": "s",
-          "base": 2,
+          "base": 14,
           "len": 1,
           "live": "Whole"
         },
         {
           "name": "wg_y_in",
           "kind": "s",
-          "base": 3,
+          "base": 15,
           "len": 1,
           "live": "Whole"
         },
@@ -8261,7 +8261,7 @@
         {
           "name": "srd",
           "kind": "s",
-          "base": 12,
+          "base": 56,
           "len": 4,
           "live": "Whole"
         },
@@ -14214,7 +14214,7 @@
         "s_waitcnt (gfx12)",
         "scratch_*"
       ],
-      "s_text_sha256": "d1ae67928f0a14cf9bd0d80df337fade2f4f5a9c6ee3462f2eabcddb3512b1ca"
+      "s_text_sha256": "1efa35adb06c9a8fedd7f1db705977853a0f1a29dad48680dc14b40cdef3a750"
     }
   ]
 }

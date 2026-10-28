@@ -5,11 +5,13 @@
 //! gfx1100 MQ6 residual twin (`qwen4_mq6_x4_gfx11`, `Kind::Resid`): exact twin of hipcc's
 //! `gemm_mq6g256v2_residual_wmma_gfx11_mw8_lds` (`Y[col * M + row] += W @ X`, F32).
 //!
-//! CPU only. Emission and ABI tests run on gfx1100; the numeric differential runs the same builder
-//! output on the PeaceMaker emulator, which has WMMA f16 fragment semantics for gfx1151 (not gfx1100;
-//! `emu/wmma.rs` refuses to approximate it): the gfx1100 and gfx1151 instruction streams are asserted
-//! identical, so the emulated program is the gfx1100 program. The reference chain is the emulator's
-//! own gfx11 WMMA model (`emu::mma`), bit for bit.
+//! CPU only. Emission and ABI tests run on gfx1100; the numeric differential runs the gfx1100 object
+//! itself (lifted from the native image) on the PeaceMaker emulator with gfx1151 numerics
+//! (`Emulator::gfx1100_as_gfx1151`: the emulator has WMMA f16 fragment semantics for gfx1151, not gfx1100;
+//! `emu/wmma.rs` refuses to approximate it) next to the gfx1151 object, both against the same CPU
+//! reference. The gfx1100 and gfx1151 instruction streams are asserted identical up to the gfx1100
+//! `FeatureUserSGPRInit16Bug` SGPR renaming (workgroup ids s2/s3 -> s14/s15, output descriptor
+//! s[12:15] -> s[56:59]). The reference chain is the emulator's own gfx11 WMMA model (`emu::mma`), bit for bit.
 use peacemaker_ir::emu::{mma, Emulator, Launch, Memory};
 use peacemaker_ir::inst::Frontend;
 use peacemaker_ir::Arch as IrArch;
@@ -99,10 +101,65 @@ fn residual_is_gfx1100_and_gfx1151_only_with_two_entries() {
     }
 }
 
-/// The gfx1100 and gfx1151 residual programs are the same instruction stream: only the target header
-/// differs, so the emulator differential below (gfx1151 semantics) covers the gfx1100 object.
+/// The scalar-register renaming from the gfx1151 residual program to the gfx1100 one: gfx1100 needs
+/// `user + system >= 16` SGPRs (LLVM `FeatureUserSGPRInit16Bug`), so the kernarg pointer is padded to 14
+/// declared user SGPRs and the workgroup ids move s2/s3 -> s14/s15; the output buffer descriptor
+/// s[12:15] (which would overlap them) moves to s[56:59].
+fn gfx1151_to_gfx1100_sgpr(n: u32) -> u32 {
+    match n {
+        2 => 14,
+        3 => 15,
+        12..=15 => n + 44,
+        _ => n,
+    }
+}
+
+/// `line` with every scalar register operand (`sN`, `s[N:M]`) renamed by `f`.
+fn rename_sgprs(line: &str, f: impl Fn(u32) -> u32) -> String {
+    let b = line.as_bytes();
+    let (mut out, mut i) = (String::new(), 0);
+    let num = |from: usize| {
+        let len = b[from..].iter().take_while(|c| c.is_ascii_digit()).count();
+        (len, line[from..from + len].parse::<u32>().ok())
+    };
+    while i < b.len() {
+        let boundary =
+            i == 0 || !(b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_' || b[i - 1] == b'.');
+        if boundary && b[i] == b's' && i + 1 < b.len() {
+            if b[i + 1] == b'[' {
+                let (l1, lo) = num(i + 2);
+                if let (true, Some(lo)) = (l1 > 0 && b.get(i + 2 + l1) == Some(&b':'), lo) {
+                    let (l2, hi) = num(i + 3 + l1);
+                    if let (true, Some(hi)) = (l2 > 0 && b.get(i + 3 + l1 + l2) == Some(&b']'), hi)
+                    {
+                        let (nlo, nhi) = (f(lo), f(hi));
+                        assert_eq!(nhi - nlo, hi - lo, "register range broken: {line}");
+                        out.push_str(&format!("s[{nlo}:{nhi}]"));
+                        i += 4 + l1 + l2;
+                        continue;
+                    }
+                }
+            } else {
+                let (l, n) = num(i + 1);
+                let after = b.get(i + 1 + l).copied();
+                if l > 0 && !after.is_some_and(|c| c.is_ascii_alphanumeric() || c == b'_') {
+                    out.push_str(&format!("s{}", f(n.unwrap())));
+                    i += 1 + l;
+                    continue;
+                }
+            }
+        }
+        out.push(b[i] as char);
+        i += 1;
+    }
+    out
+}
+
+/// The gfx1100 and gfx1151 residual programs are the same instruction stream up to the target header and
+/// the gfx1100 SGPR renaming (`gfx1151_to_gfx1100_sgpr`): renaming the gfx1151 instructions gives the
+/// gfx1100 ones line for line, and the descriptors differ only in `.amdhsa_user_sgpr_count` (2 -> 14).
 #[test]
-fn residual_gfx1100_and_gfx1151_instruction_streams_are_identical() {
+fn residual_gfx1100_and_gfx1151_instruction_streams_differ_only_by_the_sgpr_renaming() {
     for wr in [4u8, 8] {
         let a = mq6::emit_cfg(cfg(Arch::Gfx1100, wr)).unwrap().s_text;
         let b = mq6::emit_cfg(cfg(Arch::Gfx1151, wr)).unwrap().s_text;
@@ -112,7 +169,22 @@ fn residual_gfx1100_and_gfx1151_instruction_streams_are_identical() {
                 .map(str::to_owned)
                 .collect()
         };
-        assert_eq!(body(&a), body(&b), "w{wr}");
+        let (a, b) = (body(&a), body(&b));
+        assert_eq!(a.len(), b.len(), "w{wr}");
+        let mut renamed = 0;
+        for (i, (x, y)) in a.iter().zip(&b).enumerate() {
+            let is_insn = y.starts_with('\t') && !y.starts_with("\t.");
+            let want = if is_insn {
+                rename_sgprs(y, gfx1151_to_gfx1100_sgpr)
+            } else if y.trim() == ".amdhsa_user_sgpr_count 2" {
+                y.replace("count 2", "count 14")
+            } else {
+                y.clone()
+            };
+            renamed += usize::from(want != *y);
+            assert_eq!(*x, want, "w{wr} line {i}");
+        }
+        assert!(renamed > 300, "w{wr}: {renamed} renamed lines");
     }
 }
 
@@ -285,10 +357,11 @@ impl Problem {
     }
 }
 
-/// Runs the whole launch grid of the gfx1151-labelled residual program; returns `Y`.
-fn run(p: &Problem, wr: u8) -> Result<Vec<f32>, String> {
-    let e = mq6::emit_cfg(cfg(Arch::Gfx1151, wr))?;
-    let elf = peacemaker_isa::native::assemble(&e.s_text, Arch::Gfx1151)?;
+/// Runs the whole launch grid of the `arch` residual program (the gfx1100 object runs with gfx1151
+/// numerics, `Emulator::gfx1100_as_gfx1151`); returns `Y`.
+fn run(p: &Problem, wr: u8, arch: Arch) -> Result<Vec<f32>, String> {
+    let e = mq6::emit_cfg(cfg(arch, wr))?;
+    let elf = peacemaker_isa::native::assemble(&e.s_text, arch)?;
     let lifted = peacemaker_lift::lift_object(
         &elf,
         peacemaker_lift::Options {
@@ -296,10 +369,7 @@ fn run(p: &Problem, wr: u8) -> Result<Vec<f32>, String> {
         },
     )
     .map_err(|e| format!("lift: {e:?}"))?;
-    let emu = Emulator::new(
-        &lifted.program,
-        &format!("gemm_mq6g256v2_residual_pm_gfx1151_w{wr}"),
-    )?;
+    let emu = Emulator::new(&lifted.program, &cfg(arch, wr).symbol())?.gfx1100_as_gfx1151();
     let (kva, ava, xva, yva) = (
         0x1000_0000u64,
         0x2000_0000u64,
@@ -352,8 +422,14 @@ fn run(p: &Problem, wr: u8) -> Result<Vec<f32>, String> {
 }
 
 fn check(p: &Problem, wr: u8) {
+    for arch in [Arch::Gfx1100, Arch::Gfx1151] {
+        check_arch(p, wr, arch);
+    }
+}
+
+fn check_arch(p: &Problem, wr: u8, arch: Arch) {
     let (m, n, k) = (p.m, p.n, p.k);
-    let got = run(p, wr).unwrap_or_else(|e| panic!("M{m} N{n} K{k} w{wr}: {e}"));
+    let got = run(p, wr, arch).unwrap_or_else(|e| panic!("{arch:?} M{m} N{n} K{k} w{wr}: {e}"));
     let want = p.reference();
     let bad: Vec<_> = got
         .iter()
@@ -364,7 +440,7 @@ fn check(p: &Problem, wr: u8) {
         .collect();
     assert!(
         bad.is_empty(),
-        "M{m} N{n} K{k} w{wr}: {} mismatches, first (col,row,got,want) {:?}",
+        "{arch:?} M{m} N{n} K{k} w{wr}: {} mismatches, first (col,row,got,want) {:?}",
         bad.len(),
         &bad[..bad.len().min(4)]
     );
