@@ -1318,14 +1318,18 @@
     {
      "module": "gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1s",
      "kind": "embedded",
-     "sha256": "473810c8b33a40c8166fb7fbdd913090a5c1d0471b4bcea47443ec93393f6889",
+     "sha256": "b952699f05d513c3374c6ea22326deb64a92c481cf08d7d6d1398fbcd0659c40",
      "flags": null,
      "scheduler_profile": null,
      "symbols": [
       "gemm_mq4g256v2_gate_up_silu_mmq_iu4_b1s",
       "gemm_mq4g256v2_residual_mmq_iu4_full_add_b1s",
       "gemm_mq4g256v2_residual_mmq_iu4_full_set_b1s",
-      "gemm_mq4g256v2_residual_mmq_iu4_qkvzagdn_b1s"
+      "gemm_mq4g256v2_residual_mmq_iu4_qkvzagdn_b1s",
+      "gemm_mq4g256v2_gate_up_silu_mmq_iu4_b1s_v64",
+      "gemm_mq4g256v2_residual_mmq_iu4_full_add_b1s_v64",
+      "gemm_mq4g256v2_residual_mmq_iu4_full_set_b1s_v64",
+      "gemm_mq4g256v2_residual_mmq_iu4_qkvzaset_b1s_v64"
      ]
     },
     {
@@ -1365,7 +1369,7 @@
      ]
     }
    ],
-   "symbol_count": 120
+   "symbol_count": 124
   },
   "native_mtp": {
    "entries": [
@@ -3171,14 +3175,18 @@
     {
      "module": "gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1s",
      "kind": "embedded",
-     "sha256": "473810c8b33a40c8166fb7fbdd913090a5c1d0471b4bcea47443ec93393f6889",
+     "sha256": "b952699f05d513c3374c6ea22326deb64a92c481cf08d7d6d1398fbcd0659c40",
      "flags": null,
      "scheduler_profile": null,
      "symbols": [
       "gemm_mq4g256v2_gate_up_silu_mmq_iu4_b1s",
       "gemm_mq4g256v2_residual_mmq_iu4_full_add_b1s",
       "gemm_mq4g256v2_residual_mmq_iu4_full_set_b1s",
-      "gemm_mq4g256v2_residual_mmq_iu4_qkvzagdn_b1s"
+      "gemm_mq4g256v2_residual_mmq_iu4_qkvzagdn_b1s",
+      "gemm_mq4g256v2_gate_up_silu_mmq_iu4_b1s_v64",
+      "gemm_mq4g256v2_residual_mmq_iu4_full_add_b1s_v64",
+      "gemm_mq4g256v2_residual_mmq_iu4_full_set_b1s_v64",
+      "gemm_mq4g256v2_residual_mmq_iu4_qkvzaset_b1s_v64"
      ]
     },
     {
@@ -3228,7 +3236,7 @@
      ]
     }
    ],
-   "symbol_count": 149,
+   "symbol_count": 153,
    "mtp_only_modules": [
     "add_inplace",
     "argmax_token_chain",
@@ -4284,7 +4292,7 @@
     "module": "gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1s",
     "symbol": "gemm_mq4g256v2_gate_up_silu_mmq_iu4_b1s",
     "kind": "embedded",
-    "sha256": "473810c8b33a40c8166fb7fbdd913090a5c1d0471b4bcea47443ec93393f6889",
+    "sha256": "b952699f05d513c3374c6ea22326deb64a92c481cf08d7d6d1398fbcd0659c40",
     "flags": null,
     "scheduler_profile": null
    },
@@ -4292,7 +4300,7 @@
     "module": "gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1s",
     "symbol": "gemm_mq4g256v2_residual_mmq_iu4_full_add_b1s",
     "kind": "embedded",
-    "sha256": "473810c8b33a40c8166fb7fbdd913090a5c1d0471b4bcea47443ec93393f6889",
+    "sha256": "b952699f05d513c3374c6ea22326deb64a92c481cf08d7d6d1398fbcd0659c40",
     "flags": null,
     "scheduler_profile": null
    },
@@ -4300,7 +4308,7 @@
     "module": "gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1s",
     "symbol": "gemm_mq4g256v2_residual_mmq_iu4_full_set_b1s",
     "kind": "embedded",
-    "sha256": "473810c8b33a40c8166fb7fbdd913090a5c1d0471b4bcea47443ec93393f6889",
+    "sha256": "b952699f05d513c3374c6ea22326deb64a92c481cf08d7d6d1398fbcd0659c40",
     "flags": null,
     "scheduler_profile": null
    },
@@ -4308,7 +4316,7 @@
     "module": "gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1s",
     "symbol": "gemm_mq4g256v2_residual_mmq_iu4_qkvzagdn_b1s",
     "kind": "embedded",
-    "sha256": "473810c8b33a40c8166fb7fbdd913090a5c1d0471b4bcea47443ec93393f6889",
+    "sha256": "b952699f05d513c3374c6ea22326deb64a92c481cf08d7d6d1398fbcd0659c40",
     "flags": null,
     "scheduler_profile": null
    }
@@ -5510,7 +5518,7 @@
     "module": "gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1s",
     "symbol": "gemm_mq4g256v2_gate_up_silu_mmq_iu4_b1s",
     "kind": "embedded",
-    "sha256": "473810c8b33a40c8166fb7fbdd913090a5c1d0471b4bcea47443ec93393f6889",
+    "sha256": "b952699f05d513c3374c6ea22326deb64a92c481cf08d7d6d1398fbcd0659c40",
     "flags": null,
     "scheduler_profile": null
    },
@@ -5518,7 +5526,7 @@
     "module": "gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1s",
     "symbol": "gemm_mq4g256v2_residual_mmq_iu4_full_add_b1s",
     "kind": "embedded",
-    "sha256": "473810c8b33a40c8166fb7fbdd913090a5c1d0471b4bcea47443ec93393f6889",
+    "sha256": "b952699f05d513c3374c6ea22326deb64a92c481cf08d7d6d1398fbcd0659c40",
     "flags": null,
     "scheduler_profile": null
    },
@@ -5526,7 +5534,7 @@
     "module": "gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1s",
     "symbol": "gemm_mq4g256v2_residual_mmq_iu4_full_set_b1s",
     "kind": "embedded",
-    "sha256": "473810c8b33a40c8166fb7fbdd913090a5c1d0471b4bcea47443ec93393f6889",
+    "sha256": "b952699f05d513c3374c6ea22326deb64a92c481cf08d7d6d1398fbcd0659c40",
     "flags": null,
     "scheduler_profile": null
    },
@@ -5534,7 +5542,7 @@
     "module": "gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1s",
     "symbol": "gemm_mq4g256v2_residual_mmq_iu4_qkvzagdn_b1s",
     "kind": "embedded",
-    "sha256": "473810c8b33a40c8166fb7fbdd913090a5c1d0471b4bcea47443ec93393f6889",
+    "sha256": "b952699f05d513c3374c6ea22326deb64a92c481cf08d7d6d1398fbcd0659c40",
     "flags": null,
     "scheduler_profile": null
    }

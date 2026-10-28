@@ -197,6 +197,108 @@ impl std::str::FromStr for FoldOp {
     }
 }
 
+/// What the fused GDN projection's QKV row tiles do with their accumulators
+/// (`Epi::QkvzaGdn` only). `Gdn` (the shipped kernel) runs `gdn_chunk_prep` on them
+/// (`gdn_epilogue`) and stores only the raw rows its completion pass reads. `Set`
+/// stores every QKV row like the plain SET kernel (stride `M0`, into the pointer
+/// the kernel's `X` argument names) and skips the GDN preparation: one launch over
+/// the QKV weight and the Z fold with the verify path's plain consumers
+/// (symbol `..._qkvzaset`). The per-element math is the SET kernel's, so the
+/// outputs equal the separate launches' bit for bit.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum QkvStore {
+    #[default]
+    Gdn,
+    Set,
+}
+impl QkvStore {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Gdn => "gdn",
+            Self::Set => "set",
+        }
+    }
+}
+impl std::str::FromStr for QkvStore {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, String> {
+        match s {
+            "gdn" => Ok(Self::Gdn),
+            "set" => Ok(Self::Set),
+            _ => Err(format!("unknown qkv store {s} (gdn|set)")),
+        }
+    }
+}
+
+/// Where the weight (W) slab fetches of a K128 block issue relative to each other.
+/// `Split` (the shipped schedule) fetches the next block's slab 0 after the B1
+/// rendezvous and its slab 1 after the B2 signal, a fold's length later. `PairW`
+/// issues both slabs' weight loads back to back (a block's 64 B of payload per row
+/// leave the memory system as one burst; the activation loads keep their places) into
+/// a third 4-VGPR weight set that holds slab 1 until its publish. Scheduling only:
+/// every result bit is unchanged.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum FetchPlace {
+    #[default]
+    Split,
+    PairW,
+}
+impl FetchPlace {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Split => "split",
+            Self::PairW => "pairw",
+        }
+    }
+}
+impl std::str::FromStr for FetchPlace {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, String> {
+        match s {
+            "split" => Ok(Self::Split),
+            "pairw" => Ok(Self::PairW),
+            _ => Err(format!("unknown fetch placement {s} (split|pairw)")),
+        }
+    }
+}
+
+/// What the waves of a 128x128x8 workgroup do when the tile's second token half
+/// (tokens 64..127, the waves with `tok_half = 1`) holds no token (`N - bs <= 64`):
+/// those waves compute only zeros whose stores are masked. `Off` (the shipped
+/// schedule) computes them anyway; `Skip` branches each barrier-free compute run
+/// (fragment loads, WMMA groups, scale loads, fold) of those waves over (the LDS
+/// stores, global fetches, waits and barriers stay on every wave); `SkipHi`
+/// additionally remaps the waves so the token half is `wave >> 2` and the row
+/// pair `wave & 3` (dead waves 4..7 instead of the odd ones), whatever
+/// wave-to-SIMD placement the hardware uses. Every stored byte is unchanged.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum IdleHalf {
+    #[default]
+    Off,
+    Skip,
+    SkipHi,
+}
+impl IdleHalf {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Skip => "skip",
+            Self::SkipHi => "skiphi",
+        }
+    }
+}
+impl std::str::FromStr for IdleHalf {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, String> {
+        match s {
+            "off" => Ok(Self::Off),
+            "skip" => Ok(Self::Skip),
+            "skiphi" => Ok(Self::SkipHi),
+            _ => Err(format!("unknown idle-half policy {s} (off|skip|skiphi)")),
+        }
+    }
+}
+
 /// Generator knobs that leave the product's math unchanged (`ring`, `wait`)
 /// or change it on purpose (`fold_op`). The default is today's exact codegen:
 /// every emitted byte of a default-`Tune` spec is unchanged.
@@ -205,6 +307,13 @@ pub struct Tune {
     pub ring: RingDepth,
     pub wait: WaitPlace,
     pub fold_op: FoldOp,
+    pub fetch: FetchPlace,
+    pub idle: IdleHalf,
+    pub qkv: QkvStore,
+    /// Naming only: marks the small-N (`n <= 128` rows, verify/short batch) export of a
+    /// symbol (`_v64`) so it can sit beside the shipped one in the same module. Emits no
+    /// different code by itself; the schedule is the other knobs.
+    pub n64: bool,
 }
 impl Tune {
     pub fn is_default(self) -> bool {
@@ -453,6 +562,10 @@ impl Spec {
             (Tile::T256x128x16, _) => "_b1t256",
         }
     }
+    /// The fused projection's QKV tiles run the GDN preparation (`gdn_epilogue`).
+    pub fn gdn_prep(self) -> bool {
+        self.epi == Epi::QkvzaGdn && self.tune.qkv == QkvStore::Gdn
+    }
     pub fn module(self) -> String {
         format!("gemm_mq4g256v2_residual_mmq_iu4_gfx12{}", self.suffix())
     }
@@ -462,10 +575,13 @@ impl Spec {
             Epi::Add => "gemm_mq4g256v2_residual_mmq_iu4_full_add",
             Epi::AddSigmoid => "gemm_mq4g256v2_residual_mmq_iu4_full_add_sigmoid",
             Epi::GateUpSilu | Epi::GateUpSiluBf16 => "gemm_mq4g256v2_gate_up_silu_mmq_iu4",
+            Epi::QkvzaGdn if self.tune.qkv == QkvStore::Set => {
+                "gemm_mq4g256v2_residual_mmq_iu4_qkvzaset"
+            }
             Epi::QkvzaGdn => "gemm_mq4g256v2_residual_mmq_iu4_qkvzagdn",
         };
         format!(
-            "{stem}{}{}{}",
+            "{stem}{}{}{}{}",
             self.suffix(),
             if self.epi == Epi::GateUpSiluBf16 {
                 "_bf16"
@@ -476,7 +592,8 @@ impl Spec {
                 format!("_{}", self.mma.name())
             } else {
                 String::new()
-            }
+            },
+            if self.tune.n64 { "_v64" } else { "" }
         )
     }
     /// The fused projection's ABI: pointers Wqkv, Wzfold, Xq, Yz, Ybeta,
@@ -588,6 +705,18 @@ impl Spec {
         }
         if t.fold_op != FoldOp::Fma {
             s += &format!("-f{}", t.fold_op.name());
+        }
+        if t.fetch != FetchPlace::Split {
+            s += &format!("-x{}", t.fetch.name());
+        }
+        if t.idle != IdleHalf::Off {
+            s += &format!("-idle{}", t.idle.name());
+        }
+        if t.qkv != QkvStore::Gdn {
+            s += &format!("-q{}", t.qkv.name());
+        }
+        if t.n64 {
+            s += "-n64";
         }
         s
     }
@@ -746,6 +875,77 @@ impl Spec {
                 return Err(format!(
                     "wait placement window is generated for Tile::T128x128x8 only (tile axis is {:?})",
                     self.tile
+                ));
+            }
+        }
+        if self.tune.n64
+            && (self.tile != Tile::T128x128x8 || self.act != ALayout::Slab || self.mma.is_sparse())
+        {
+            return Err(format!(
+                "the n64 (`_v64`) export is generated for the dense slab Tile::T128x128x8 module only (tile axis is {:?}, activation layout axis is {:?}, mma axis is {})",
+                self.tile,
+                self.act,
+                self.mma.name()
+            ));
+        }
+        if self.tune.qkv == QkvStore::Set && self.epi != Epi::QkvzaGdn {
+            return Err(format!(
+                "qkv store set is a knob of the fused GDN projection only (epilogue axis is {:?})",
+                self.epi
+            ));
+        }
+        if self.tune.fetch == FetchPlace::PairW {
+            if self.mma.is_sparse() {
+                return Err(format!(
+                    "fetch placement pairw is generated for the dense K-loop block only (mma axis is {})",
+                    self.mma.name()
+                ));
+            }
+            if self.tune.ring != RingDepth::Two {
+                return Err("fetch placement pairw is generated at ring depth 2 only".into());
+            }
+            if self.tile != Tile::T128x128x8 || self.epi == Epi::QkvzaGdn {
+                return Err(format!(
+                    "fetch placement pairw is generated for the Tile::T128x128x8 SET/ADD/SiLU kernels only (tile axis is {:?}, epilogue axis is {:?})",
+                    self.tile, self.epi
+                ));
+            }
+            let vgprs = super::Gen::build(self).vgprs();
+            if vgprs > VGPR_CEILING {
+                return Err(format!(
+                    "fetch placement pairw needs {vgprs} VGPRs, the occupancy ceiling is {VGPR_CEILING}"
+                ));
+            }
+        }
+        if self.tune.idle != IdleHalf::Off {
+            let idle = self.tune.idle.name();
+            if self.mma.is_sparse() {
+                return Err(format!(
+                    "idle-half {idle} is generated for the dense K-loop block only (mma axis is {})",
+                    self.mma.name()
+                ));
+            }
+            if self.tile != Tile::T128x128x8 {
+                return Err(format!(
+                    "idle-half {idle} is generated for Tile::T128x128x8 only (tile axis is {:?}): it skips the token-half-1 waves of the 8-wave tile",
+                    self.tile
+                ));
+            }
+            if self.tune.ring != RingDepth::Two {
+                return Err(format!(
+                    "idle-half {idle} is generated at ring depth 2 only (the depth-3 schedule is not wrapped)"
+                ));
+            }
+            if !matches!(self.tune.wait, WaitPlace::AfterMma | WaitPlace::Window) {
+                return Err(format!(
+                    "idle-half {idle} needs wait placement after or window (mid/before interleave the LDS publish between WMMA groups; wait axis is {})",
+                    self.tune.wait.name()
+                ));
+            }
+            if self.epi == Epi::QkvzaGdn && self.tune.qkv != QkvStore::Set {
+                return Err(format!(
+                    "idle-half {idle} is not generated for the GDN-preparation projection: its epilogue exchanges across waves through LDS (qkv store axis is {}; use qkv set)",
+                    self.tune.qkv.name()
                 ));
             }
         }

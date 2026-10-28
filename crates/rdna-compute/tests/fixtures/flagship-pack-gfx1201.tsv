@@ -73,13 +73,13 @@
 27b-ar	gfx1201	embedded	fused_gate_up_hfq4g256_mq4v2	fused_gate_up_mq4g256v2			e694451d02f97e3c0c4a18f9491c91850ba73f16b8ed966fe412e7c80a4da710
 27b-ar	gfx1201	embedded	fused_qkv_hfq4g256_mq4v2	fused_qkv_mq4g256v2			fba77d765b1e946f555e915d6ed8e723207e0d81690e3c22aac79950e648cbfb
 27b-ar	gfx1201	embedded	fused_qkvza_hfq4g256_mq4v2	fused_qkvza_mq4g256v2			30caae27eb058e5c0c5b2c27c65fa243096e37edec1c0e810ea3f8e88f7fdb89
-27b-ar	gfx1201	embedded	gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1s	gemm_mq4g256v2_gate_up_silu_mmq_iu4_b1s			473810c8b33a40c8166fb7fbdd913090a5c1d0471b4bcea47443ec93393f6889
+27b-ar	gfx1201	embedded	gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1s	gemm_mq4g256v2_gate_up_silu_mmq_iu4_b1s			b952699f05d513c3374c6ea22326deb64a92c481cf08d7d6d1398fbcd0659c40
 27b-ar	gfx1201	embedded	gemv_hfq4g256_multirow_default_mq4v2	gemv_mq4g256v2_multirow_r2			1f1a0c2cd407307024c685513332b93c27b415165d625fd4787930298846cf55
 27b-ar	gfx1201	embedded	gemv_hfq4g256_multirow_xbatch_mq4v2_pm	gemv_mq4g256v2_multirow_r2_xbatch_pm			fadb665f00c35bea787fda7c6956d9af61f5f6d1e60f759c2c7f2c23a1ddd9bf
 27b-ar	gfx1201	embedded	gemv_hfq4g256_residual_mq4v2	gemv_mq4g256v2_residual			7c98a6a0071b28817224deeec6a28ffac1aeccab2286382377902e47e8df7f2d
 27b-ar	gfx1201	embedded	gemv_hfq4g256_residual_xbatch_mq4v2_pm	gemv_mq4g256v2_residual_xbatch			7ad33f79e552f550a46a96c0863760bb3ac31ac8d7223e256a59ade20eb4ade1
 27b-ar	gfx1201	embedded	gemv_hfq4g256_xbatch_mq4v2_pm	gemv_mq4g256v2_xbatch_pm			97c2872246c123a03bbb4751fed75b2f7235654482c96b007eb69c2ffbb41b59
-#route 27b-dflash-default	model=qwen3.8:27b-mq4-xts	default (DFlash)	arch=gfx1201	modules_loaded=66	hip=59	embedded=7
+#route 27b-dflash-default	model=qwen3.8:27b-mq4-xts	default (DFlash)	arch=gfx1201	modules_loaded=67	hip=60	embedded=7
 27b-dflash-default	gfx1201	hip	add	add_f32	--genco --offload-arch=gfx1201 -O3 --no-offload-compress -fuse-cuid=none -mcode-object-version=6 -DIU4_A4_CANDIDATES=2	default	b0561ebf265bfbf523e63f43f4d1544d1ceaf593f476438009635f15662121dd
 27b-dflash-default	gfx1201	hip	attention_dflash_sliding_f32	attention_dflash_sliding_f32	--genco --offload-arch=gfx1201 -O3 --no-offload-compress -fuse-cuid=none -mcode-object-version=6 -DIU4_A4_CANDIDATES=2	default	16511db54a58b4e1f634c7c00b160fba234938fb8fc82f0ef08a84fca1fd3d5d
 27b-dflash-default	gfx1201	hip	attention_flash_fp8_e4m3_tile_gqa_gfx1201	attention_flash_fp8_e4m3_tile_gqa_gfx1201	--genco --offload-arch=gfx1201 -O3 --no-offload-compress -fuse-cuid=none -mcode-object-version=6 -DIU4_A4_CANDIDATES=2	default	9f85fe9377f81d2d7f158364898da70e4a5cee9c4f8c66a23cb1f123cf98c9f5
@@ -138,15 +138,16 @@
 27b-dflash-default	gfx1201	hip	sigmoid_mul	sigmoid_mul_f32	--genco --offload-arch=gfx1201 -O3 --no-offload-compress -fuse-cuid=none -mcode-object-version=6 -DIU4_A4_CANDIDATES=2	default	89f5c9ce5a2767ad1f089e67bd4c3ef085fb660ea063adc34146f1effb9287d5
 27b-dflash-default	gfx1201	hip	sigmoid_mul_mq_rotate_f16	sigmoid_mul_mq_rotate_awq_f16_batched_gfx1100	--genco --offload-arch=gfx1201 -O3 --no-offload-compress -fuse-cuid=none -mcode-object-version=6 -DIU4_A4_CANDIDATES=2	default	17a729c6e946fdff51211c4dc662e7b73a06a9813ebc01fc33846af18a920896
 27b-dflash-default	gfx1201	hip	silu_mul	silu_mul_f32	--genco --offload-arch=gfx1201 -O3 --no-offload-compress -fuse-cuid=none -mcode-object-version=6 -DIU4_A4_CANDIDATES=2	default	ce3a8a16d37262193749f540de891c9a13b14877da0ed4f274d0307f42b12719
+27b-dflash-default	gfx1201	hip	split_mq4v2_z_betaalpha	split_mq4v2_z_betaalpha_g12	--genco --offload-arch=gfx1201 -O3 --no-offload-compress -fuse-cuid=none -mcode-object-version=6 -DIU4_A4_CANDIDATES=2	default	ef6e4ef8a37fea50e838d94c22f424746372988e26039ee42f6cc3c0eae0b062
 27b-dflash-default	gfx1201	hip	topk_values_fixup_f32	topk_values_fixup_f32	--genco --offload-arch=gfx1201 -O3 --no-offload-compress -fuse-cuid=none -mcode-object-version=6 -DIU4_A4_CANDIDATES=2	default	e7bf334802df6fee6933a5921ed06d431daa0df9ea165ba95f1e96f12eb15b95
 27b-dflash-default	gfx1201	embedded	fused_gate_up_hfq4g256_mq4v2	fused_gate_up_mq4g256v2			e694451d02f97e3c0c4a18f9491c91850ba73f16b8ed966fe412e7c80a4da710
 27b-dflash-default	gfx1201	embedded	fused_qkv_hfq4g256_mq4v2	fused_qkv_mq4g256v2			fba77d765b1e946f555e915d6ed8e723207e0d81690e3c22aac79950e648cbfb
 27b-dflash-default	gfx1201	embedded	fused_qkvza_hfq4g256_mq4v2	fused_qkvza_mq4g256v2			30caae27eb058e5c0c5b2c27c65fa243096e37edec1c0e810ea3f8e88f7fdb89
 27b-dflash-default	gfx1201	embedded	gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1	gemm_mq4g256v2_residual_mmq_iu4_full_add_b1			49cc18eedd9507b868ecce6b05bd2993688354ed4180e1df456cafe45f34c297
-27b-dflash-default	gfx1201	embedded	gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1s	gemm_mq4g256v2_residual_mmq_iu4_qkvzagdn_b1s			473810c8b33a40c8166fb7fbdd913090a5c1d0471b4bcea47443ec93393f6889
+27b-dflash-default	gfx1201	embedded	gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1s	gemm_mq4g256v2_residual_mmq_iu4_qkvzagdn_b1s			b952699f05d513c3374c6ea22326deb64a92c481cf08d7d6d1398fbcd0659c40
 27b-dflash-default	gfx1201	embedded	gemv_hfq4g256_multirow_default_mq4v2	gemv_mq4g256v2_multirow_r2			1f1a0c2cd407307024c685513332b93c27b415165d625fd4787930298846cf55
 27b-dflash-default	gfx1201	embedded	gemv_hfq4g256_residual_mq4v2	gemv_mq4g256v2_residual			7c98a6a0071b28817224deeec6a28ffac1aeccab2286382377902e47e8df7f2d
-#route 27b-mtp	model=qwen3.8:27b-mq4-xts	--spec mtp	arch=gfx1201	modules_loaded=102	hip=92	embedded=10
+#route 27b-mtp	model=qwen3.8:27b-mq4-xts	--spec mtp	arch=gfx1201	modules_loaded=103	hip=93	embedded=10
 27b-mtp	gfx1201	hip	add_inplace	add_inplace_f32	--genco --offload-arch=gfx1201 -O3 --no-offload-compress -fuse-cuid=none -mcode-object-version=6 -DIU4_A4_CANDIDATES=2	default	c4adc723548a0b0f15615ee030e225dc60419423cb88fb0eb75c20346acad753
 27b-mtp	gfx1201	hip	argmax_token_chain	argmax_token_chain_f32	--genco --offload-arch=gfx1201 -O3 --no-offload-compress -fuse-cuid=none -mcode-object-version=6 -DIU4_A4_CANDIDATES=2	default	cf8802a468d2180e630313b7b2589480f10eaa45de7ed839cefe403fc9eab581
 27b-mtp	gfx1201	hip	attention_flash_asym_reduce_batched	attention_flash_asym_reduce_batched	--genco --offload-arch=gfx1201 -O3 --no-offload-compress -fuse-cuid=none -mcode-object-version=6 -DIU4_A4_CANDIDATES=2	default	c5aa6b1c05f04b38f108ea69d8c4c7e14312075db72e457e1072692eeaab8506
@@ -239,11 +240,12 @@
 27b-mtp	gfx1201	hip	sigmoid_mul_rotate_x_mq_awq_i4_gil_gfx12_slab	sigmoid_mul_rotate_x_mq_awq_i4_gil_gfx12_slab	--genco --offload-arch=gfx1201 -O3 --no-offload-compress -fuse-cuid=none -mcode-object-version=6 -DIU4_A4_CANDIDATES=2	default	6378649fa7849b188c2f2dedc3453c5a0fa85b21164ed34dabf89ca6ced980af
 27b-mtp	gfx1201	hip	silu_mul	silu_mul_f32	--genco --offload-arch=gfx1201 -O3 --no-offload-compress -fuse-cuid=none -mcode-object-version=6 -DIU4_A4_CANDIDATES=2	default	ce3a8a16d37262193749f540de891c9a13b14877da0ed4f274d0307f42b12719
 27b-mtp	gfx1201	hip	softmax_temp_topp_batched	softmax_temp_topp_batched_f32	--genco --offload-arch=gfx1201 -O3 --no-offload-compress -fuse-cuid=none -mcode-object-version=6 -DIU4_A4_CANDIDATES=2	default	b8f2c67796574a5d1e4e4bfd147244a6e931869557ecd2e9f4d34a352dfd2e21
+27b-mtp	gfx1201	hip	split_mq4v2_z_betaalpha	split_mq4v2_z_betaalpha_g12	--genco --offload-arch=gfx1201 -O3 --no-offload-compress -fuse-cuid=none -mcode-object-version=6 -DIU4_A4_CANDIDATES=2	default	ef6e4ef8a37fea50e838d94c22f424746372988e26039ee42f6cc3c0eae0b062
 27b-mtp	gfx1201	embedded	fused_gate_up_hfq4g256_mq4v2	fused_gate_up_mq4g256v2			e694451d02f97e3c0c4a18f9491c91850ba73f16b8ed966fe412e7c80a4da710
 27b-mtp	gfx1201	embedded	fused_qkv_hfq4g256_mq4v2	fused_qkv_mq4g256v2			fba77d765b1e946f555e915d6ed8e723207e0d81690e3c22aac79950e648cbfb
 27b-mtp	gfx1201	embedded	fused_qkvza_hfq4g256_mq4v2	fused_qkvza_mq4g256v2			30caae27eb058e5c0c5b2c27c65fa243096e37edec1c0e810ea3f8e88f7fdb89
 27b-mtp	gfx1201	embedded	gemm_hfq4g256_rows_pm	gemm_hfq4g256_rows_pm			657eb7c1828fdb80f078c239f17527b4b6e249023824d7864178840bfe2129cb
-27b-mtp	gfx1201	embedded	gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1s	gemm_mq4g256v2_gate_up_silu_mmq_iu4_b1s			473810c8b33a40c8166fb7fbdd913090a5c1d0471b4bcea47443ec93393f6889
+27b-mtp	gfx1201	embedded	gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1s	gemm_mq4g256v2_gate_up_silu_mmq_iu4_b1s			b952699f05d513c3374c6ea22326deb64a92c481cf08d7d6d1398fbcd0659c40
 27b-mtp	gfx1201	embedded	gemv_hfq4g256_multirow_default_mq4v2	gemv_mq4g256v2_multirow_r2			1f1a0c2cd407307024c685513332b93c27b415165d625fd4787930298846cf55
 27b-mtp	gfx1201	embedded	gemv_hfq4g256_multirow_xbatch_mq4v2_pm	gemv_mq4g256v2_multirow_r2_xbatch_pm			fadb665f00c35bea787fda7c6956d9af61f5f6d1e60f759c2c7f2c23a1ddd9bf
 27b-mtp	gfx1201	embedded	gemv_hfq4g256_residual_mq4v2	gemv_mq4g256v2_residual			7c98a6a0071b28817224deeec6a28ffac1aeccab2286382377902e47e8df7f2d

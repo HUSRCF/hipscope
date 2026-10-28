@@ -9,7 +9,8 @@
 //! to a production kernel and must be intentional.
 
 use peacemaker_isa::kernels::iu4_gemm::{
-    emit, emit_module, module_tune, ALayout, Cacc, Epi, Fold, Mma, Spec, Tile, Tune, WaitPlace,
+    emit, emit_module, module_tune, verify64_tune, ALayout, Cacc, Epi, Fold, Mma, QkvStore, Spec,
+    Tile, Tune, WaitPlace,
 };
 use peacemaker_isa::Arch;
 use sha2::{Digest, Sha256};
@@ -205,6 +206,49 @@ fn only_the_gate_up_slab_export_takes_the_window_tune() {
                     tile == Tile::T128x128x8 && act == ALayout::Slab && epi == Epi::GateUpSilu;
                 assert_eq!(tune.is_default(), !windowed, "{}", e.proof.variant);
                 assert_eq!(e.s_text, emit(spec).unwrap().s_text, "{}", e.proof.variant);
+            }
+            // The slab module's extra export: the fused projection with plain QKV stores.
+            if tile == Tile::T128x128x8 && act == ALayout::Slab {
+                let spec = Spec {
+                    epi: Epi::QkvzaGdn,
+                    tile,
+                    act,
+                    tune: Tune {
+                        qkv: QkvStore::Set,
+                        ..Tune::default()
+                    },
+                    ..gate_up_slab(Tune::default())
+                };
+                let e = emitted
+                    .iter()
+                    .find(|e| e.proof.variant == spec.variant_name())
+                    .expect("the slab module exports the qkvzaset kernel");
+                matched += 1;
+                assert_eq!(e.s_text, emit(spec).unwrap().s_text, "{}", e.proof.variant);
+                // The small-N `_v64` exports: the four N-keyed schedules of `verify64_tune`.
+                for (epi, qkv_set) in [
+                    (Epi::GateUpSilu, false),
+                    (Epi::Add, false),
+                    (Epi::Set, false),
+                    (Epi::QkvzaGdn, true),
+                ] {
+                    let tune = verify64_tune(epi, qkv_set);
+                    assert!(tune.n64 && !tune.is_default());
+                    let spec = Spec {
+                        epi,
+                        tile,
+                        act,
+                        tune,
+                        ..gate_up_slab(Tune::default())
+                    };
+                    assert!(spec.symbol().ends_with("_b1s_v64"), "{}", spec.symbol());
+                    let e = emitted
+                        .iter()
+                        .find(|e| e.proof.variant == spec.variant_name())
+                        .expect("the slab module exports the v64 kernels");
+                    matched += 1;
+                    assert_eq!(e.s_text, emit(spec).unwrap().s_text, "{}", e.proof.variant);
+                }
             }
             assert_eq!(
                 matched,

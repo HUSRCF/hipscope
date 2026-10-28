@@ -36,7 +36,10 @@ use peacemaker_author::{
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-pub use spec::{ALayout, Cacc, Epi, Fold, FoldOp, Mma, RingDepth, Spec, Tile, Tune, WaitPlace};
+pub use spec::{
+    ALayout, Cacc, Epi, FetchPlace, Fold, FoldOp, IdleHalf, Mma, QkvStore, RingDepth, Spec, Tile,
+    Tune, WaitPlace,
+};
 
 /// The program's first label (the kernel entry); `Live` ranges start here.
 pub const ENTRY: &str = "entry";
@@ -130,6 +133,9 @@ pub struct Gen {
     /// WMMA accumulators from `cacc[3][1]` instead of `magic8`. Empty at depth 2.
     pub(crate) a_pf1: Vec<u8>,
     pub(crate) w_pf1: Vec<u8>,
+    /// `FetchPlace::PairW` only: the third weight set (the next block's slab 1 W
+    /// payload, fetched back to back with its slab 0). Empty otherwise.
+    pub(crate) w_x: Vec<u8>,
     pub(crate) ds_nx: u8,
     pub(crate) sz_nx: u8,
     pub(crate) fr_a: [u8; 2],
@@ -163,6 +169,10 @@ pub struct Gen {
     /// `ALayout::Slab` only: the SGPR holding `32 * N`, the byte distance
     /// from a token's slab-0 plane entry to its slab-1 entry.
     pub(crate) a_slab1: Option<u8>,
+    /// `IdleHalf::Skip`/`SkipHi` only (else the plan's unused scratch s55): the
+    /// wave-uniform "this wave's token half is empty" flag, 1 or 0, set once in the
+    /// prologue and read by the K-loop's skip branches and the epilogue's.
+    pub(crate) idle: u8,
 }
 
 pub(crate) const PRO_TEMPS: u8 = 24;
@@ -188,7 +198,7 @@ impl Gen {
     /// The register assignment's VGPR count: one past the highest register any
     /// phase names.
     pub fn vgprs(&self) -> u16 {
-        let sets = [&self.a_pf, &self.w_pf, &self.a_pf1, &self.w_pf1];
+        let sets = [&self.a_pf, &self.w_pf, &self.a_pf1, &self.w_pf1, &self.w_x];
         let top_pf = sets
             .iter()
             .filter_map(|v| v.last())
@@ -220,7 +230,7 @@ impl Gen {
     /// `cacc acc magic d f0 f1 ds_nx sz_nx fr_a0 fr_a1 fr_w0 fr_w1 st_lds st_a
     /// meta_ds meta_sz ds_voff sz_voff sc_addr d_addr`, `a_pf<i> w_pf<i>
     /// pf1_a<i> pf1_w<i> (depth 3) st_w<i>`, SGPRs `karg srd_w srd_z srd_a0 srd_a1 srd_y step2 goff trips
-    /// rs bs wave gpr136 mm1 hs tmp epi_s a_slab1` and kernel arguments
+    /// rs bs wave gpr136 mm1 hs tmp epi_s a_slab1 idle` and kernel arguments
     /// `arg_a arg_u arg_gate arg_xq arg_y arg_m arg_k arg_n arg_bcx arg_bcy`. `None`
     /// for an unknown name and for an absent optional register (`arg_u`
     /// outside gate/up, `arg_gate` outside the sigmoid ADD, `a_slab1` outside
@@ -271,6 +281,7 @@ impl Gen {
             "epi_s" => self.epi_s,
             "a_slab1" => return self.a_slab1,
             "arg_a" => a.a,
+            "idle" => self.idle,
             "arg_u" => return a.u,
             "arg_gate" => return a.gate,
             "arg_xq" => a.xq,
@@ -285,6 +296,7 @@ impl Gen {
                     .or_else(|| indexed("pf1_w", &self.w_pf1))
                     .or_else(|| indexed("a_pf", &self.a_pf))
                     .or_else(|| indexed("w_pf", &self.w_pf))
+                    .or_else(|| indexed("w_x", &self.w_x))
                     .or_else(|| indexed("st_w", &self.st_w))
             }
         })
@@ -407,6 +419,13 @@ impl Gen {
         let sz_voff = take(1);
         let sc_addr = take(1);
         let d_addr = take(1);
+        let w_x = (0..if spec.tune.fetch == FetchPlace::PairW {
+            tile.w_rounds()
+        } else {
+            0
+        })
+            .map(|_| take(2))
+            .collect::<Vec<_>>();
         let silu = spec.epi.is_silu();
         Self {
             spec,
@@ -422,6 +441,7 @@ impl Gen {
             w_pf,
             a_pf1,
             w_pf1,
+            w_x,
             ds_nx,
             sz_nx,
             fr_a,
@@ -451,6 +471,7 @@ impl Gen {
             hs: 53,
             tmp: 56,
             epi_s: 64,
+            idle: 55,
             a_slab1: (spec.act == ALayout::Slab).then_some(2),
         }
     }
@@ -460,7 +481,10 @@ impl Gen {
     /// The fused projection ends the K-loop/store registers at its GDN label,
     /// where `gdn_epilogue` reuses them.
     pub fn plan(&self) -> Result<RegPlan, String> {
-        let gdn = self.spec.epi == Epi::QkvzaGdn;
+        // The fused projection's segment arguments (`fused`) and its GDN preparation
+        // (`gdn`, absent when the QKV tiles store like SET: `QkvStore::Set`).
+        let fused = self.spec.epi == Epi::QkvzaGdn;
+        let gdn = self.spec.gdn_prep();
         let mut p = RegPlan::new(spec::VGPR_CEILING, 104)?;
         let pro = || Live::Between(ENTRY.into(), K_BEGIN.into());
         let kl = || Live::Between(K_BEGIN.into(), EPI.into());
@@ -493,6 +517,19 @@ impl Gen {
             p.v::<8>("magic8", self.magic, kernel())?;
         }
         p.v::<4>("d_x", self.d, kl())?;
+        if self.spec.tune.idle != IdleHalf::Off {
+            // The idle-half skip bodies define and read these in different, correlated
+            // branches, which the definedness check cannot pair: `kloop::define_dead_regs`
+            // defines them once at the K-loop entry (the fragment sets F0/F1 are
+            // block-scoped ranges that start later).
+            for i in 0..3u8 {
+                p.v::<8>(
+                    "idle_init_f",
+                    self.f[0] + 8 * i,
+                    Live::Between(K_BEGIN.into(), K_LOOP.into()),
+                )?;
+            }
+        }
         for &r in &self.a_pf {
             p.v::<2>("a_pf", r, kernel())?;
         }
@@ -501,6 +538,9 @@ impl Gen {
         }
         for &r in &self.a_pf1 {
             p.v::<2>("a_pf1", r, kernel())?;
+        }
+        for &r in &self.w_x {
+            p.v::<2>("w_x", r, kernel())?;
         }
         for &r in &self.w_pf1 {
             p.v::<2>("w_pf1", r, kernel())?;
@@ -543,7 +583,7 @@ impl Gen {
         if self.srd_z != self.srd_w {
             p.s::<4>("srd_z", self.srd_z, Live::Whole)?;
         }
-        if gdn {
+        if fused {
             p.s::<4>("block_counts_segment", 28, shared())?;
         }
         p.s::<4>("srd_a0", self.srd_a[0], shared())?;
@@ -563,7 +603,14 @@ impl Gen {
             ("m_minus_1", self.mm1),
             ("hs", self.hs),
             ("rows", 54),
-            ("scratch_s55", 55),
+            (
+                if self.spec.tune.idle == IdleHalf::Off {
+                    "scratch_s55"
+                } else {
+                    "idle_half"
+                },
+                55,
+            ),
         ] {
             // rs, bs and the wave index stay live into the GDN path.
             p.s::<1>(
@@ -737,7 +784,7 @@ pub fn emit(spec: Spec) -> Result<Emitted, String> {
     blocks::epilogue(&mut wg, &g, &end)?;
     // Only the fused projection reuses the LDS after the K loop: its QKV
     // tiles continue at the GDN label the epilogue's exit branch skips to.
-    if spec.epi == Epi::QkvzaGdn {
+    if spec.gdn_prep() {
         blocks::gdn_epilogue(&mut wg, &g, lds)?;
     }
     wg.end(end)?;
@@ -778,8 +825,15 @@ pub fn module(emitted: &[Emitted], name: &str) -> Result<(String, ModuleProof), 
         }
         bodies.push_str(".text\n");
         // Local labels are per-kernel names; qualify them by epilogue so the
-        // kernels can share one assembler unit.
-        let tag = e.proof.variant.rsplit('-').next().unwrap_or("k");
+        // kernels can share one assembler unit. The `_v64` exports repeat the shipped
+        // exports' epilogues, so they qualify by the whole variant name.
+        let owned_tag;
+        let tag = if e.proof.variant.contains("-n64") || e.proof.variant.contains("-idle") {
+            owned_tag = e.proof.variant.replace('-', "_");
+            owned_tag.as_str()
+        } else {
+            e.proof.variant.rsplit('-').next().unwrap_or("k")
+        };
         // A symbol that itself starts with `iu4_` (`iu4_c8_*_pm_gfx1201`) owns an end label `.Liu4_<symbol>_end` that
         // `pm_check` looks up by name: keep it out of the per-kernel qualification.
         let symbol_end = e
@@ -829,6 +883,43 @@ pub fn module_tune(tile: Tile, act: ALayout, epi: Epi) -> Tune {
     }
 }
 
+/// The schedule of the small-N (`n <= 128` rows: verify / short batch) `_v64` export of
+/// `epi` in the slab module (`qkv_set` selects the fused projection's SET-store export). The
+/// outputs are byte-identical to the shipped export's; only the schedule differs: the B1
+/// rendezvous window, PairW weight fetches (not generated for the fused projection), and
+/// the dead token-half skip with the wave remap that puts one dead and one live wave on
+/// every SIMD ([`IdleHalf::SkipHi`]; the predicate is false when more than 64 tokens are
+/// live, so up to 128 rows the dead waves compute exactly as before). Ring depth 3 is not
+/// used: the independent wait replay (`ledger_replay`) rejects its ledger. These values
+/// come from the pm_loop N=64 measurements; this is the one place they live.
+pub fn verify64_tune(epi: Epi, qkv_set: bool) -> Tune {
+    let base = Tune {
+        n64: true,
+        wait: WaitPlace::Window,
+        ..Tune::default()
+    };
+    match epi {
+        Epi::QkvzaGdn => Tune {
+            qkv: if qkv_set {
+                QkvStore::Set
+            } else {
+                QkvStore::Gdn
+            },
+            idle: if qkv_set {
+                IdleHalf::SkipHi
+            } else {
+                IdleHalf::Off
+            },
+            ..base
+        },
+        _ => Tune {
+            fetch: FetchPlace::PairW,
+            idle: IdleHalf::SkipHi,
+            ..base
+        },
+    }
+}
+
 /// All original epilogue symbols plus packed bf16 h and the fused GDN input
 /// projection for the production tile.
 pub fn emit_module(
@@ -847,9 +938,30 @@ pub fn emit_module(
             epis.push(Epi::AddSigmoid);
         }
     }
-    let emitted = epis
+    let mut specs: Vec<(Epi, Tune)> = epis
         .into_iter()
-        .map(|epi| {
+        .map(|epi| (epi, module_tune(tile, act, epi)))
+        .collect();
+    // The slab module also exports the fused projection with plain QKV stores
+    // (`..._qkvzaset_b1s`): one launch over the QKV weight and the Z fold for the verify
+    // path, whose consumers read the SET outputs (`QkvStore::Set`).
+    if tile == Tile::T128x128x8 && act == ALayout::Slab {
+        specs.push((
+            Epi::QkvzaGdn,
+            Tune {
+                qkv: QkvStore::Set,
+                ..Tune::default()
+            },
+        ));
+        // The small-N `_v64` exports (see `verify64_tune`).
+        specs.push((Epi::GateUpSilu, verify64_tune(Epi::GateUpSilu, false)));
+        specs.push((Epi::Add, verify64_tune(Epi::Add, false)));
+        specs.push((Epi::Set, verify64_tune(Epi::Set, false)));
+        specs.push((Epi::QkvzaGdn, verify64_tune(Epi::QkvzaGdn, true)));
+    }
+    let emitted = specs
+        .into_iter()
+        .map(|(epi, tune)| {
             emit(Spec {
                 fold,
                 tile,
@@ -858,7 +970,7 @@ pub fn emit_module(
                 act,
                 arch,
                 mma: Mma::Dense,
-                tune: module_tune(tile, act, epi),
+                tune,
             })
         })
         .collect::<Result<Vec<_>, _>>()?;

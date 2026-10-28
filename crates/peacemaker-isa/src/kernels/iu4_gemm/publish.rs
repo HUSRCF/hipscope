@@ -6,7 +6,7 @@
 //! token/row metadata. Staging map (hipcc K1's, bank-swizzled): lane `tid`
 //! moves 8 bytes of slab row `R = r * round_rows + tid / 4`, quad `tid % 4`,
 //! to fragment-order slot `st_ldsoff + r * round_rows * 32`.
-use super::{ds_offset, ds_offsets, Gen, MetaD, MetaS, PayA, PayW, Staged, Tile, Wv};
+use super::{ds_offset, ds_offsets, FetchPlace, Gen, MetaD, MetaS, PayA, PayW, Staged, Tile, Wv};
 use crate::kernels::{
     common::{mem, op, s, sr, v, vr},
     iu4_fold::{GROUP_BYTES, XBLK_BYTES},
@@ -82,6 +82,22 @@ pub(crate) fn fetch_slab1(b: &mut Builder, g: &Gen, h: usize) -> Result<(), Stri
     fetch_slab1_at(b, g, h, h as u32 * 64 + 40)
 }
 
+/// Block 0's slab 1 (the prologue's seed of the K-loop's fetch chain). Under
+/// `FetchPlace::PairW` the weights go to `W_x` ahead of the activation slab, the order the
+/// loop's own blocks leave them in (`fetch_next`, then `fetch_slab1`), so the loop's
+/// entry and back-edge load ledgers agree.
+pub(crate) fn fetch_slab1_prologue(b: &mut Builder, g: &Gen) -> Result<(), String> {
+    if g.spec.tune.fetch == FetchPlace::PairW {
+        b.clause(|b| {
+            for (r, &dst) in g.w_x.iter().enumerate() {
+                vload(b, dst, 2, g.st_w[r], g.srd_w, Some(g.goff), 8 + 32)?;
+            }
+            Ok(())
+        })?;
+    }
+    fetch_slab1(b, g, 0)
+}
+
 /// Fetch the next group's even block before `goff` advances at trip end.
 pub(crate) fn fetch_slab1_next_group(b: &mut Builder, g: &Gen) -> Result<(), String> {
     fetch_slab1_at(b, g, 0, GROUP_BYTES + 40)
@@ -93,8 +109,12 @@ fn fetch_slab1_at(b: &mut Builder, g: &Gen, h: usize, weight_offset: u32) -> Res
             let (soff, offset) = a_offset(g, 1, r);
             vload(b, dst, 2, g.st_a, g.srd_a[h], soff, offset)?;
         }
-        for (r, &dst) in g.w_pf.iter().enumerate() {
-            vload(b, dst, 2, g.st_w[r], g.srd_w, Some(g.goff), weight_offset)?;
+        // `FetchPlace::PairW`: the block's slab-1 weights were fetched with its slab 0
+        // (`fetch_next` / the prologue); only the activation slab is fetched here.
+        if g.spec.tune.fetch != FetchPlace::PairW {
+            for (r, &dst) in g.w_pf.iter().enumerate() {
+                vload(b, dst, 2, g.st_w[r], g.srd_w, Some(g.goff), weight_offset)?;
+            }
         }
         Ok(())
     })
@@ -181,6 +201,10 @@ pub(crate) fn fetch_next(b: &mut Builder, g: &Gen, h: usize) -> Result<(), Strin
         for (r, &dst) in g.w_pf.iter().enumerate() {
             vload(b, dst, 2, g.st_w[r], g.srd_w, Some(g.goff), next + 8)?;
         }
+        // `FetchPlace::PairW`: slab 1's weights go out back to back with slab 0's.
+        for (r, &dst) in g.w_x.iter().enumerate() {
+            vload(b, dst, 2, g.st_w[r], g.srd_w, Some(g.goff), next + 8 + 32)?;
+        }
         Ok(())
     })
 }
@@ -189,6 +213,10 @@ pub(crate) fn fetch_next(b: &mut Builder, g: &Gen, h: usize) -> Result<(), Strin
 /// prefetch set `set`.
 pub(crate) fn flip_weights_set(b: &mut Builder, g: &Gen, set: usize) -> Result<(), String> {
     let (_, w_pf) = pf_set(g, set)?;
+    flip_weights(b, w_pf)
+}
+
+fn flip_weights(b: &mut Builder, w_pf: &[u8]) -> Result<(), String> {
     for &w in w_pf {
         for r in [w, w + 1] {
             op(
@@ -221,9 +249,32 @@ pub(crate) fn publish_slab_set<C: State, const D: usize>(
     ra: Ring<PayA, C, Free, D>,
     rw: Ring<PayW, C, Free, D>,
 ) -> Result<(Staged<PayA, C, D>, Staged<PayW, C, D>), String> {
+    publish_slab_regs(w, g, set, false, ra, rw)
+}
+
+/// Publish a block's slab 1 (ring depth 2): the slab staged in `A_pf` and, under
+/// `FetchPlace::PairW`, the weights its slab 0 fetch brought along in `W_x`.
+pub(crate) fn publish_slab1<C: State, const D: usize>(
+    w: &mut Wv,
+    g: &Gen,
+    ra: Ring<PayA, C, Free, D>,
+    rw: Ring<PayW, C, Free, D>,
+) -> Result<(Staged<PayA, C, D>, Staged<PayW, C, D>), String> {
+    publish_slab_regs(w, g, 0, g.spec.tune.fetch == FetchPlace::PairW, ra, rw)
+}
+
+fn publish_slab_regs<C: State, const D: usize>(
+    w: &mut Wv,
+    g: &Gen,
+    set: usize,
+    w_from_x: bool,
+    ra: Ring<PayA, C, Free, D>,
+    rw: Ring<PayW, C, Free, D>,
+) -> Result<(Staged<PayA, C, D>, Staged<PayW, C, D>), String> {
     let slot = ra.next_index();
     let (a_pf, w_pf) = pf_set(g, set)?;
-    flip_weights_set(w.isa(), g, set)?;
+    let w_pf: &[u8] = if w_from_x { &g.w_x } else { w_pf };
+    flip_weights(w.isa(), w_pf)?;
     let l = g.layout;
     let step = g.tile.round_rows() / 16; // 512-byte units per staging round
     let (a, wo) = (l.a[slot] / 512, l.w[slot] / 512);

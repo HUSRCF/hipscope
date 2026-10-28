@@ -61,6 +61,14 @@
 //! chooses its own tune (its `const RING`, read from the source, sets the
 //! candidate's ring depth, i.e. the generator the script is compared with).
 //!
+//! `idle` (`off`|`skip`|`skiphi`, `iu4_gemm::IdleHalf`), as `--idle skip` (baseline override
+//! `--base-idle`): at `N - bs <= 64` the 128x128x8 tile's token-half-1 waves compute zeros whose
+//! stores are masked; `skip` branches those waves over their barrier-free compute (fragment loads,
+//! WMMA groups, scale loads, fold) and their epilogue, `skiphi` also remaps the waves so the dead
+//! ones are 4..7 (the token half is `wave >> 2`). Scheduling only: the candidate must stay
+//! `identical_to_baseline`. Dense 128x128x8 ring-2 `wait after|window` only (`Spec::validate`
+//! refuses the rest with the reason).
+//!
 //! # Extra knobs
 //! `ref-rows`: `full` (default while `M*N*K <= 2e9` MACs) or `sample:<n>`
 //! (default `sample:192` beyond that): rows `0..64`, the last 64, and `n`
@@ -452,6 +460,8 @@ struct Strs {
     ring: String,
     wait: String,
     fold_op: String,
+    fetch: String,
+    idle: String,
 }
 
 impl Strs {
@@ -463,6 +473,8 @@ impl Strs {
             ("ring", &self.ring, "2"),
             ("wait", &self.wait, "after"),
             ("fold-op", &self.fold_op, "fma"),
+            ("fetch", &self.fetch, "split"),
+            ("idle", &self.idle, "off"),
         ] {
             if val != default {
                 v[key] = json!(val);
@@ -475,6 +487,9 @@ impl Strs {
             ring: self.ring.parse()?,
             wait: self.wait.parse()?,
             fold_op: self.fold_op.parse()?,
+            fetch: self.fetch.parse()?,
+            idle: self.idle.parse()?,
+            ..Tune::default()
         })
     }
     fn spec(&self) -> Result<Spec> {
@@ -658,6 +673,8 @@ pub fn new_with_rip(
         ring: knobs.take_or("ring", "2"),
         wait: knobs.take_or("wait", "after"),
         fold_op: knobs.take_or("fold-op", "fma"),
+        fetch: knobs.take_or("fetch", "split"),
+        idle: knobs.take_or("idle", "off"),
     };
     let mut cand = cand_strs.spec()?;
     let mut cand_strs = cand_strs;
@@ -687,6 +704,8 @@ pub fn new_with_rip(
         ring: "2".into(),
         wait: "after".into(),
         fold_op: "fma".into(),
+        fetch: "split".into(),
+        idle: "off".into(),
         ..cand_strs.clone()
     };
     let mut base_emitted = false;
@@ -699,6 +718,8 @@ pub fn new_with_rip(
         ("base-ring", &mut base_strs.ring),
         ("base-wait", &mut base_strs.wait),
         ("base-fold-op", &mut base_strs.fold_op),
+        ("base-fetch", &mut base_strs.fetch),
+        ("base-idle", &mut base_strs.idle),
     ] {
         if let Some(v) = knobs.take(key) {
             *slot = v;
@@ -717,6 +738,8 @@ pub fn new_with_rip(
             ring: "2".into(),
             wait: "after".into(),
             fold_op: "fma".into(),
+            fetch: "split".into(),
+            idle: "off".into(),
             ..cand_strs.clone()
         };
         Spec {

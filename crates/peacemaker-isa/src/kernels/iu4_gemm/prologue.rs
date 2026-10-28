@@ -5,7 +5,7 @@
 //! Prologue: kernel arguments, banded raster (hipcc `IU4_G12_RASTER`, band 8),
 //! buffer descriptors, hoisted lane offsets, block-0 staging and the first
 //! rendezvous. Workgroup ids on gfx1201 are `ttmp9` (x) and `ttmp7[15:0]` (y).
-use super::{publish, Epi, Gen, Lds, MetaD, MetaS, PayA, PayW, Tile, Wg};
+use super::{publish, Epi, Gen, IdleHalf, Lds, MetaD, MetaS, PayA, PayW, Tile, Wg};
 use crate::kernels::common::{lit, mem, op, s, sop, sr, v};
 use crate::{
     insn::{Instruction, MemoryClass},
@@ -528,18 +528,52 @@ fn setup(wg: &mut Wg, g: &Gen, end: &End) -> Result<(), String> {
     )?;
     // Fragment bases: A frag (tok_half*4+nb)*2+sb, W frag (wt_pair*2+rg)*2+sb.
     let (th, wp, x) = (t[0], t[1], t[2]);
+    // `IdleHalf::SkipHi`: the token half is the wave's high bit and the row pair its
+    // low two bits, so the dead (token half 1) waves are 4..7. Every consumer of the
+    // wave's token half / row pair is derived from `th` / `wp` here, from `wave & 3`
+    // in the SiLU and fused beta/alpha epilogues (`epilogue.rs`). The LDS staging
+    // roles are by `tid` and unchanged.
+    let hi = g.spec.tune.idle == IdleHalf::SkipHi;
     sop(
         b,
-        format!("s_and_b32 s{th}, s{}, 1", g.wave),
+        if hi {
+            format!("s_lshr_b32 s{th}, s{}, 2", g.wave)
+        } else {
+            format!("s_and_b32 s{th}, s{}, 1", g.wave)
+        },
         &[th],
         &[g.wave],
     )?;
     sop(
         b,
-        format!("s_lshr_b32 s{wp}, s{}, 1", g.wave),
+        if hi {
+            format!("s_and_b32 s{wp}, s{}, 3", g.wave)
+        } else {
+            format!("s_lshr_b32 s{wp}, s{}, 1", g.wave)
+        },
         &[wp],
         &[g.wave],
     )?;
+    if g.spec.tune.idle != IdleHalf::Off {
+        // idle = (token half == 1) && (N - bs <= 64): workgroup-uniform second term
+        // (`bs` is the tile's first token and `bs < N` was checked above), so a
+        // wave-uniform flag; no wave skips a barrier by it.
+        let flag = g.idle;
+        sop(
+            b,
+            format!("s_sub_co_i32 s{flag}, s{}, s{}", a.n, g.bs),
+            &[flag],
+            &[a.n, g.bs],
+        )?;
+        sop(b, format!("s_cmp_le_u32 s{flag}, 64"), &[], &[flag])?;
+        sop(b, format!("s_cselect_b32 s{flag}, 1, 0"), &[flag], &[])?;
+        sop(
+            b,
+            format!("s_and_b32 s{flag}, s{flag}, s{th}"),
+            &[flag],
+            &[flag, th],
+        )?;
+    }
     for (base, shift, dst) in [(th, 11u32, g.fr_a), (wp, 10, g.fr_w)] {
         sop(
             b,
@@ -983,6 +1017,6 @@ fn block0_publish(
     let arrived = wg.signal((prime(ra, da), prime(rw, dw), prime(rd, dd), prime(rs, ds)))?;
     // Seed the ring: every subsequent slab-1 fetch is issued by its
     // predecessor after the slab-0 payload has been published.
-    publish::fetch_slab1(wg.isa(), g, 0)?;
+    publish::fetch_slab1_prologue(wg.isa(), g)?;
     wg.wait_arrived(arrived)
 }

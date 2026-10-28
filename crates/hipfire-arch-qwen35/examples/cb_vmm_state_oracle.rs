@@ -4972,6 +4972,10 @@ struct WideExpect {
     /// at `dflash_block` 8): every non-refused chunk launches IU4 GEMMs and
     /// no F16 wide verify symbol, at any row count.
     iu4: bool,
+    /// The IU4 verify runs each DeltaNet layer's input projection (QKV, Z, beta, alpha) as ONE merged
+    /// SET launch plus a copy kernel (`HIPFIRE_GDN_ZBA_FOLD`, default on at n <= 128 rows on gfx1201):
+    /// 4 IU4 GEMMs per DeltaNet layer instead of 7.
+    zba_fold: bool,
 }
 
 impl WideExpect {
@@ -5008,6 +5012,8 @@ impl WideExpect {
                 &slot.weights,
                 &slot.config,
             ),
+            zba_fold: gpu.arch == "gfx1201"
+                && hipfire_config::developer_bool("HIPFIRE_GDN_ZBA_FOLD", true),
         }
     }
 
@@ -5111,10 +5117,12 @@ fn assert_wide(
     let silent_when_refused = !refused || launches.is_empty();
     // Every shared chunk runs one qkvza launch per DeltaNet layer on the F16
     // routes; under the IU4 verify it runs 7 IU4 GEMMs per DeltaNet layer
-    // (qkvza 4 SET, F1-lite gate/up+SwiGLU, down, wo) and 6 per FullAttention
+    // (qkvza 4 SET, F1-lite gate/up+SwiGLU, down, wo; 4 in total when the merged
+    // QKV+Z-fold SET replaces the four qkvza SETs) and 6 per FullAttention
     // layer (qkv 3 SET, gate/up+SwiGLU, down, wo).
     let (per_chunk, seen) = if exp.iu4 {
-        (7 * exp.n_dn + 6 * exp.n_fa, iu4_n)
+        let per_dn = if exp.zba_fold { 4 } else { 7 };
+        (per_dn * exp.n_dn + 6 * exp.n_fa, iu4_n)
     } else {
         (exp.n_dn, qkvza_all)
     };

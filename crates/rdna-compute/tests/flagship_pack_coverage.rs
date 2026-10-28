@@ -136,8 +136,8 @@ fn fixture_holds_complete_measured_sets_for_all_six_routes() {
         );
         let measured = match route {
             "27b-ar" => (64, 9),
-            "27b-dflash-default" => (59, 7),
-            "27b-mtp" => (92, 10),
+            "27b-dflash-default" => (60, 7),
+            "27b-mtp" => (93, 10),
             "fn-ar" => (68, 4),
             "fn-mtp" => (69, 4),
             "a3b-ar" => (38, 10),
@@ -224,6 +224,29 @@ fn a3b_ar_post_measurement_decode_modules_ship_in_the_gfx1201_pack() {
             rows.iter()
                 .any(|r| r.route == "a3b-ar" && r.kind == "hip" && r.module == module),
             "{module}: missing from the a3b-ar route of flagship-pack-gfx1201.tsv"
+        );
+    }
+}
+
+/// The gfx1201 Z/beta/alpha fold split the dense 27B verify batch
+/// (`gemm_zba_fold_g12_iu4_prepared`) launches after the v0.4.4 measurement:
+/// it must be registered for gfx1201 and listed in both verify routes.
+#[test]
+fn zba_fold_split_module_ships_in_the_gfx1201_pack() {
+    let module = "split_mq4v2_z_betaalpha";
+    let registry = entries("gfx1201", EXTRA_FLAGS).unwrap();
+    assert!(
+        registry
+            .iter()
+            .any(|e| e.module == module && e.symbols.contains(&"split_mq4v2_z_betaalpha_g12")),
+        "{module}: g12 split not registered for gfx1201 (a pack-only host cannot bind it)"
+    );
+    let rows = rows();
+    for route in ["27b-dflash-default", "27b-mtp"] {
+        assert!(
+            rows.iter()
+                .any(|r| r.route == route && r.kind == "hip" && r.module == module),
+            "{module}: missing from the {route} route of flagship-pack-gfx1201.tsv"
         );
     }
 }

@@ -335,3 +335,4 @@ gfx1201	sigmoid_mul_rotate_x_mq_awq_i4_gfx12_slab	sigmoid_mul_rotate_x_mq_awq_i4
 gfx1201	sigmoid_scaled_residual_add_batched	sigmoid_scaled_residual_add_batched_f32
 gfx1201	silu_mul	silu_mul_f32
 gfx1201	softmax	softmax_f32
+gfx1201	split_mq4v2_z_betaalpha	split_mq4v2_z_betaalpha_g12

@@ -1393,7 +1393,7 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
         add!(
             "split_mq4v2_z_betaalpha",
             kernels::SPLIT_MQ4V2_Z_BETAALPHA_SRC,
-            ["split_mq4v2_z_betaalpha"]
+            ["split_mq4v2_z_betaalpha", "split_mq4v2_z_betaalpha_g12"]
         );
         add!(
             "topk_logsumexp_batched",
@@ -1411,6 +1411,13 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
         );
     }
     if arch == "gfx1201" {
+        // Z/beta/alpha fold split of the non-fused IU4 verify GDN projection
+        // (`gemm_zba_fold_g12_iu4_prepared`); shares the halo split's source.
+        add!(
+            "split_mq4v2_z_betaalpha",
+            kernels::SPLIT_MQ4V2_Z_BETAALPHA_SRC,
+            ["split_mq4v2_z_betaalpha_g12", "split_mq4v2_z_betaalpha"]
+        );
         // Dense 27B DFlash cold helpers; retain runtime source preambles and
         // historical gfx1100 module/symbol names on gfx1201.
         add!(
@@ -6743,13 +6750,21 @@ const QWEN36_27B_GFX1201_B1S_SYMBOLS: &[&str] = &[
     "gemm_mq4g256v2_residual_mmq_iu4_full_add_b1s",
     "gemm_mq4g256v2_residual_mmq_iu4_full_set_b1s",
     "gemm_mq4g256v2_residual_mmq_iu4_qkvzagdn_b1s",
+    "gemm_mq4g256v2_gate_up_silu_mmq_iu4_b1s_v64",
+    "gemm_mq4g256v2_residual_mmq_iu4_full_add_b1s_v64",
+    "gemm_mq4g256v2_residual_mmq_iu4_full_set_b1s_v64",
+    "gemm_mq4g256v2_residual_mmq_iu4_qkvzaset_b1s_v64",
 ];
 /// [`QWEN36_27B_GFX1201_B1S_SYMBOLS`] minus the gate_up export a PM tune
-/// variant replaces (`pm_tune`).
+/// variant replaces (`pm_tune`); the small-N `_v64` gate_up export stays.
 const QWEN36_27B_GFX1201_B1S_SYMBOLS_NO_GATE_UP: &[&str] = &[
     "gemm_mq4g256v2_residual_mmq_iu4_full_add_b1s",
     "gemm_mq4g256v2_residual_mmq_iu4_full_set_b1s",
     "gemm_mq4g256v2_residual_mmq_iu4_qkvzagdn_b1s",
+    "gemm_mq4g256v2_gate_up_silu_mmq_iu4_b1s_v64",
+    "gemm_mq4g256v2_residual_mmq_iu4_full_add_b1s_v64",
+    "gemm_mq4g256v2_residual_mmq_iu4_full_set_b1s_v64",
+    "gemm_mq4g256v2_residual_mmq_iu4_qkvzaset_b1s_v64",
 ];
 const QWEN36_27B_GFX1201_B1S_MODULE: &str = "gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1s";
 const QWEN36_27B_GATE_UP_B1S_SYMBOLS: &[&str] = &[crate::pm_tune::GATE_UP_B1S_SYMBOL];
@@ -10501,6 +10516,22 @@ mod tests {
                 "{module} must not be a P0 module"
             );
         }
+        // The gfx1201 Z/beta/alpha fold split of the non-fused IU4 verify GDN projection
+        // (`gemm_zba_fold_g12_iu4_prepared`) is its own module on gfx1201 (the gfx1100/gfx1151
+        // halo split of the same name is a P0 module there).
+        const ZBA_FOLD_SPLIT_ADDED_MODULES: [&str; 1] = ["split_mq4v2_z_betaalpha"];
+        for module in ZBA_FOLD_SPLIT_ADDED_MODULES {
+            assert!(
+                by_name.contains_key(module),
+                "missing gfx1201 ZBA fold split module {module}"
+            );
+            assert!(
+                !expected
+                    .lines()
+                    .any(|l| l.split('\t').next() == Some(module)),
+                "{module} must not be a P0 module"
+            );
+        }
         assert_eq!(
             registry.len(),
             count
@@ -10518,7 +10549,8 @@ mod tests {
                 + HD64_FLASH_TILE_ADDED_MODULES.len()
                 + FP8_SPLIT_LSE_ADDED_MODULES.len()
                 + SHARED_LAUNCHER_ADDED_MODULES.len()
-                + VMM_EXACT_MTP_SEGS_ADDED_MODULES.len(),
+                + VMM_EXACT_MTP_SEGS_ADDED_MODULES.len()
+                + ZBA_FOLD_SPLIT_ADDED_MODULES.len(),
             "unexpected gfx1201 inventory size"
         );
         let default_prefill = by_name

@@ -20,7 +20,8 @@
 use super::{
     blocks, fold,
     publish::{self, ds_load},
-    Gen, Lds, MetaD, MetaS, Mma, PayA, PayW, Staged, WaitPlace, Wg, Wv, EPI, K_LOOP, K_LOOP_END,
+    Gen, IdleHalf, Lds, MetaD, MetaS, Mma, PayA, PayW, Staged, WaitPlace, Wg, Wv, EPI, K_LOOP,
+    K_LOOP_END,
 };
 use crate::kernels::common::{op, s, sr, v, vr};
 use crate::{
@@ -110,8 +111,33 @@ fn mma_block(
     }
 }
 
+/// `IdleHalf` only: define the K-loop's per-block registers (the int32 accumulators
+/// `cacc` v0-63, the fragment sets F0/F1 and the token scales `d`, v136-163) once, at the
+/// K-loop entry. A block writes them in one skip body and reads them in a later one
+/// (e.g. the WMMA accumulate in `ia`, its fold in `id`); both branch on the same wave-uniform
+/// flag, but the definedness check pairs no branches, so on the skip path they would read
+/// as undefined. A dead wave never uses their values.
+fn define_dead_regs(b: &mut Builder, g: &Gen) -> Result<(), String> {
+    let [f0, _] = g.f;
+    for base in [g.cacc, f0] {
+        let len = if base == g.cacc { 64 } else { g.d + 4 - f0 };
+        for r in (base..base + len).step_by(2) {
+            op(
+                b,
+                format!("v_dual_mov_b32 v{r}, 0 :: v_dual_mov_b32 v{}, 0", r + 1),
+                &[v(r), v(r + 1)],
+                &[],
+            )?;
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn emit(wg: &mut Wg, g: &Gen, lds: Lds) -> Result<Lds, String> {
     wg.label(super::K_BEGIN)?;
+    if g.spec.tune.idle != IdleHalf::Off {
+        define_dead_regs(wg.isa(), g)?;
+    }
     // K == 256: no full trip; go straight to the peeled group.
     let no_trip = blocks::trips_cmp(wg, g, "s_cmp_eq_u32")?;
     let lds = wg.wg_skip_if(no_trip, &blocks::tail_label(0), lds, |wg, lds| {
@@ -199,6 +225,32 @@ pub(crate) fn sub_labels(tag: &str) -> (String, String, String) {
     )
 }
 
+/// Run `body`, a barrier-free compute run of block `tag` (`part` names it), on the live
+/// waves only: under `Tune::idle` the waves of an empty token half (`g.idle`, set in
+/// the prologue: token half 1 and `N - bs <= 64`) branch over it. `body` holds
+/// registers and LDS loads only: every LDS store, `flip_weights`, global fetch,
+/// `s_wait_*` and barrier stays outside, on all waves, so the workgroup's barrier
+/// counts and LDS protocol are unchanged and the dead waves' registers (never stored)
+/// are the only thing skipped. `IdleHalf::Off` emits `body` unconditionally.
+fn live<'b>(
+    wg: &mut Wg<'b>,
+    g: &Gen,
+    tag: &str,
+    part: &str,
+    body: impl FnOnce(&mut Wv<'b>) -> Result<(), String>,
+) -> Result<(), String> {
+    if g.spec.tune.idle == IdleHalf::Off {
+        return body(&mut **wg);
+    }
+    // One fresh compare per branch: `skip_if` refuses a stale SCC.
+    let idle = wg.scmp(Instruction::new(
+        format!("s_cmp_lg_u32 s{}, 0", g.idle),
+        vec![],
+        vec![s(g.idle)],
+    ))?;
+    wg.skip_if(idle, &label(&format!("{tag}_{part}")), (), |w, ()| body(w))
+}
+
 /// One K128 block on token/row plane `h`; `after_slab1_fetch` runs when its
 /// preceding fetch has issued. `entry_label`: emit the block's label (the
 /// peeled group's first block is the K-loop skip target, which emits it).
@@ -234,42 +286,51 @@ pub(crate) fn block_with(
     let (_, x0, x1) = sub_labels(tag);
 
     let place = g.spec.tune.wait;
+    let window = place == WaitPlace::Window;
+    // The skippable runs are the barrier-free ones of the `AfterMma`/`Window` schedules
+    // (`Spec::validate`): `MidMma`/`BeforeMma` interleave the LDS publishes between WMMA groups.
+    let skippable = matches!(place, WaitPlace::AfterMma | WaitPlace::Window);
+    if g.spec.tune.idle != IdleHalf::Off && !skippable {
+        return Err(format!(
+            "block {tag}: idle-half skipping needs wait placement after or window"
+        ));
+    }
     // Phase A: slab 0 from slot 0, slab 1 staged into slot 1. The publish
     // (`WaitPlace`) writes the free next buffer, so it may precede the reads
     // of the current one.
     after_slab1_fetch(wg.isa())?;
-    fragments(wg, g, &ra, &rw)?;
-    let window = place == WaitPlace::Window;
-    if window {
-        // The token-scale loads issue here, ahead of the rendezvous, so phase B's
-        // post-rendezvous LDS burst carries two fewer loads.
-        d_loads(wg, g, &rd)?;
+    if skippable {
+        // The token-scale loads of `Window` issue right after the fragment loads, ahead
+        // of the rendezvous, so phase B's post-rendezvous LDS burst carries two fewer loads.
+        live(wg, g, tag, "ia", |w| {
+            fragments(w, g, &ra, &rw)?;
+            if window {
+                d_loads(w, g, &rd)?;
+            }
+            // `AfterMma`: both sub-blocks' groups, then the publish. `Window`: slab 0's
+            // group, then the publish; sub-block 1's group runs inside the B1 window.
+            for sb in 0..if window { 1 } else { 2 } {
+                wmma_group(w.isa(), g, sb, sb == 0, false)?;
+            }
+            Ok(())
+        })?;
+    } else {
+        fragments(wg, g, &ra, &rw)?;
     }
     let ((ra, pa), (rw, pw)) = match place {
-        WaitPlace::AfterMma => {
-            for sb in 0..2 {
-                wmma_group(wg.isa(), g, sb, sb == 0, false)?;
-            }
-            publish::publish_slab(wg, g, ra, rw)?
-        }
+        WaitPlace::AfterMma | WaitPlace::Window => publish::publish_slab1(wg, g, ra, rw)?,
         WaitPlace::MidMma => {
             wmma_group(wg.isa(), g, 0, true, false)?;
-            let staged = publish::publish_slab(wg, g, ra, rw)?;
+            let staged = publish::publish_slab1(wg, g, ra, rw)?;
             wmma_group(wg.isa(), g, 1, false, false)?;
             staged
         }
         WaitPlace::BeforeMma => {
-            let staged = publish::publish_slab(wg, g, ra, rw)?;
+            let staged = publish::publish_slab1(wg, g, ra, rw)?;
             for sb in 0..2 {
                 wmma_group(wg.isa(), g, sb, sb == 0, false)?;
             }
             staged
-        }
-        // Slab 0's group, then the slab-1 publish; sub-block 1's group runs inside
-        // the B1 rendezvous window below.
-        WaitPlace::Window => {
-            wmma_group(wg.isa(), g, 0, true, false)?;
-            publish::publish_slab(wg, g, ra, rw)?
         }
     };
     // The next block's scale/header registers are independent of the
@@ -282,7 +343,9 @@ pub(crate) fn block_with(
         // Split B1: arrive once the stores drained, run sub-block 1's WMMAs (registers
         // only) while the slowest wave catches up, then wait.
         let b1 = wg.signal((rotate(ra, da), rotate(rw, dw)))?;
-        wmma_group(wg.isa(), g, 1, false, false)?;
+        live(wg, g, tag, "ib", |w| {
+            wmma_group(w.isa(), g, 1, false, false)
+        })?;
         wg.wait_arrived(b1)?
     } else {
         wg.barrier((rotate(ra, da), rotate(rw, dw)))?
@@ -293,31 +356,40 @@ pub(crate) fn block_with(
         publish::fetch_next(wg.isa(), g, h)?;
     }
     if !fetch_next {
-        fragments(wg, g, &ra, &rw)?;
-        if !window {
-            d_loads(wg, g, &rd)?;
-        }
-        wmma_group(wg.isa(), g, 0, false, false)?;
-        scale_loads(wg, g, &x0, &rs)?;
-        wmma_group(wg.isa(), g, 1, false, true)?;
-        scale_tail(wg, g, &x1, &rs)?;
-        fold::scale(wg.isa(), g)?;
+        live(wg, g, tag, "ic", |w| {
+            fragments(w, g, &ra, &rw)?;
+            if !window {
+                d_loads(w, g, &rd)?;
+            }
+            wmma_group(w.isa(), g, 0, false, false)?;
+            scale_loads(w, g, &x0, &rs)?;
+            wmma_group(w.isa(), g, 1, false, true)?;
+            scale_tail(w, g, &x1, &rs)?;
+            fold::scale(w.isa(), g)
+        })?;
         return Ok((ra, rw, rd, rs));
     }
     // Next block's slab 0 and metadata publish (`WaitPlace`): the stores go to
     // the free next buffers; the B2 signal needs them drained after the last read.
-    fragments(wg, g, &ra, &rw)?;
-    if !window {
-        d_loads(wg, g, &rd)?;
+    if skippable {
+        live(wg, g, tag, "ic", |w| {
+            fragments(w, g, &ra, &rw)?;
+            if !window {
+                d_loads(w, g, &rd)?;
+            }
+            wmma_group(w.isa(), g, 0, false, false)?;
+            scale_loads(w, g, &x0, &rs)?;
+            wmma_group(w.isa(), g, 1, false, true)?;
+            scale_tail(w, g, &x1, &rs)
+        })?;
+    } else {
+        fragments(wg, g, &ra, &rw)?;
+        if !window {
+            d_loads(wg, g, &rd)?;
+        }
     }
     let ((ra, pa), (rw, pw), (rd, pd), (rs, ps)) = match place {
-        WaitPlace::AfterMma | WaitPlace::Window => {
-            wmma_group(wg.isa(), g, 0, false, false)?;
-            scale_loads(wg, g, &x0, &rs)?;
-            wmma_group(wg.isa(), g, 1, false, true)?;
-            scale_tail(wg, g, &x1, &rs)?;
-            publish_next(wg, g, ra, rw, rd, rs)?
-        }
+        WaitPlace::AfterMma | WaitPlace::Window => publish_next(wg, g, ra, rw, rd, rs)?,
         WaitPlace::MidMma => {
             wmma_group(wg.isa(), g, 0, false, false)?;
             scale_loads(wg, g, &x0, &rs)?;
@@ -351,7 +423,7 @@ pub(crate) fn block_with(
     } else {
         publish::fetch_slab1_next_group(wg.isa(), g)?;
     }
-    fold::scale(wg.isa(), g)?;
+    live(wg, g, tag, "id", |w| fold::scale(w.isa(), g))?;
     wg.wait_arrived(b2)
 }
 

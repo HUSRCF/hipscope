@@ -1104,6 +1104,10 @@ name = "prefill_iu4_producer_oracle"
 required-features = ["lab"]
 
 [[example]]
+name = "zba_fold_oracle"
+required-features = ["lab"]
+
+[[example]]
 name = "shared_down_sigmoid_epi_oracle"
 required-features = ["lab"]
 

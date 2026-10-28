@@ -5494,8 +5494,17 @@ pub const GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_B1_CONTROL: &[u8] =
 /// the slab activation layout (`peacemaker-isa emit --alayout slab`), fed only
 /// by the slab producer twins (`Gpu::a4_slab_active`), including the fused
 /// GDN input projection `gemm_mq4g256v2_residual_mmq_iu4_qkvzagdn_b1s`.
-/// SHA-256 473810c8b33a40c8166fb7fbdd913090a5c1d0471b4bcea47443ec93393f6889
-/// (previously 7613fc64b6639d51aaea042ee9fe94a0e0a323efe51eda8da20cba36961b58e7 with the 27B gate/up
+/// SHA-256 b952699f05d513c3374c6ea22326deb64a92c481cf08d7d6d1398fbcd0659c40
+/// (previously f6bb37eff7b7f70c0fc6a980251692b56a2416d60835e8f06e5e244ad1d7057a without the four
+/// small-N `_v64` exports `gemm_mq4g256v2_gate_up_silu_mmq_iu4_b1s_v64`, `..._full_add_b1s_v64`,
+/// `..._full_set_b1s_v64` and `..._qkvzaset_b1s_v64` (`iu4_gemm::verify64_tune`: per-shape schedules
+/// for launches of at most 128 rows, byte-identical to the shipped exports); the six other exports
+/// are byte-identical to the previous bundle's; that bundle replaced
+/// 473810c8b33a40c8166fb7fbdd913090a5c1d0471b4bcea47443ec93393f6889 without the sixth export
+/// `gemm_mq4g256v2_residual_mmq_iu4_qkvzaset_b1s`: the fused projection with plain QKV stores
+/// (`iu4_gemm::Tune { qkv: QkvStore::Set }`), one launch over the QKV weight and the Z fold for the
+/// 64-row verify; the five other exports are byte-identical to the previous bundle's;
+/// 7613fc64b6639d51aaea042ee9fe94a0e0a323efe51eda8da20cba36961b58e7 with the 27B gate/up
 /// export `gemm_mq4g256v2_gate_up_silu_mmq_iu4_b1s` on the earlier schedule, code sha256 080eb282…
 /// -> c9f1efc5…: its phase-A rendezvous is split and sub-block 1's WMMA group runs inside the
 /// window, the slab-1 publish follows slab 0's group, and the token-scale loads move ahead into

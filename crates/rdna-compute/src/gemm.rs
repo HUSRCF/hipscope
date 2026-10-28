@@ -1051,6 +1051,20 @@ fn g12_iu4_b1s_image() -> HipResult<&'static [u8]> {
 /// under the 300 W cap. Parsed once so a producer and its consumers agree.
 static A4_SLAB: LazyLock<bool> =
     LazyLock::new(|| hipfire_config::developer_bool("HIPFIRE_A4_SLAB", true));
+/// gfx1201 GDN input projection merge on the non-fused IU4 verify path
+/// (`HIPFIRE_GDN_ZBA_FOLD`, default on; `=0` restores the four separate QKV,
+/// Z, beta and alpha SETs): one QKV + Z fold launch, or the Z fold SET +
+/// split. Byte-identical outputs.
+static GDN_ZBA_FOLD: LazyLock<bool> =
+    LazyLock::new(|| hipfire_config::developer_bool("HIPFIRE_GDN_ZBA_FOLD", true));
+/// gfx1201 small-N verify schedules (`HIPFIRE_VERIFY_V64`, default on; `=0` kills): slab
+/// launches of at most [`VERIFY_V64_MAX_N`] rows load the `_v64` exports of the `_b1s`
+/// bundle (full_add/full_set/qkvzaset/gate_up_silu) instead of the shipped ones.
+/// Byte-identical outputs.
+static VERIFY_V64: LazyLock<bool> =
+    LazyLock::new(|| hipfire_config::developer_bool("HIPFIRE_VERIFY_V64", true));
+/// Largest launch row count (`n`) that takes the `_v64` slab exports.
+const VERIFY_V64_MAX_N: usize = 128;
 /// Token-fastest grid for the slab HIN producer (`HIPFIRE_A4_HIN_TOKFAST`,
 /// default on; `=0` opts out): `fused_silu_mul_mq_rotate_awq_i4_hin_gfx12_slab_tokfast`
 /// on grid [N, K/256] instead of the group-fastest `_slab` twin on [K/256, N].
@@ -21909,10 +21923,11 @@ impl Gpu {
                 (
                     "gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1s",
                     "",
-                    if add {
-                        "gemm_mq4g256v2_residual_mmq_iu4_full_add_b1s"
-                    } else {
-                        "gemm_mq4g256v2_residual_mmq_iu4_full_set_b1s"
+                    match (add, *VERIFY_V64 && batch_size <= VERIFY_V64_MAX_N) {
+                        (true, false) => "gemm_mq4g256v2_residual_mmq_iu4_full_add_b1s",
+                        (false, false) => "gemm_mq4g256v2_residual_mmq_iu4_full_set_b1s",
+                        (true, true) => "gemm_mq4g256v2_residual_mmq_iu4_full_add_b1s_v64",
+                        (false, true) => "gemm_mq4g256v2_residual_mmq_iu4_full_set_b1s_v64",
                     },
                 )
             } else if isa {
@@ -34485,6 +34500,286 @@ impl Gpu {
         Ok(())
     }
 
+    /// gfx1201 non-fused verify/short-batch Z + beta + alpha: ONE `_b1s` SET
+    /// over the loader's Z fold (`z_m + 128` rows, beta at row `z_m`, alpha at
+    /// `z_m + 64`; [`Self::iu4_gdn_fold_rows`]) into `y_z_fold`
+    /// (`Y[token * (z_m + 128) + row]`), then a copy kernel scatters Z, beta
+    /// and alpha. Pure copies of the rows the separate SET launches would
+    /// produce, so the outputs are byte-identical. Returns `Ok(false)` without
+    /// launching when not admitted: exact gfx1201, the fold predicate holds,
+    /// the weight buffer really is the fold, `0 < n <= 128`, the scratch and
+    /// outputs are large enough and 16-byte aligned, and
+    /// `HIPFIRE_GDN_ZBA_FOLD` != `0`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_zba_fold_g12_iu4_prepared(
+        &mut self,
+        a_z_fold: &GpuTensor,
+        prepared: &crate::scratch::Int4MmqPrepared,
+        y_z_fold: &GpuTensor,
+        y_z: &GpuTensor,
+        y_beta: &GpuTensor,
+        y_alpha: &GpuTensor,
+        qkv_m: usize,
+        z_m: usize,
+        k: usize,
+        n: usize,
+    ) -> HipResult<bool> {
+        if self.arch != "gfx1201" || !*GDN_ZBA_FOLD {
+            return Ok(false);
+        }
+        self.bind_thread()?;
+        let folded_m = Self::iu4_gdn_fold_rows(z_m).0;
+        let aligned = |t: &GpuTensor| (t.buf.as_ptr() as usize) % 16 == 0;
+        if !(self.iu4_gdn_fold_active([qkv_m, z_m, 48, 48], k)
+            && n > 0
+            && n <= 128
+            && a_z_fold.buf.size() == folded_m * (k / 256) * crate::dispatch::MQ4V2_GROUP_BYTES
+            && y_z_fold.buf.size() >= n * folded_m * 4
+            && y_z.buf.size() >= n * z_m * 4
+            && [y_beta, y_alpha].iter().all(|t| t.buf.size() >= n * 48 * 4)
+            && [a_z_fold, y_z_fold, y_z, y_beta, y_alpha]
+                .into_iter()
+                .all(aligned))
+        {
+            return Ok(false);
+        }
+        self.flush_residual_fold()?;
+        let xq = self.int4_mmq_prepared_ptr(prepared, k, n)?;
+        self.gemm_mq4g256v2_mmq_set_prequant_iu4(a_z_fold, xq, y_z_fold, folded_m, k, n)?;
+        const NAME: &str = "split_mq4v2_z_betaalpha_g12";
+        self.ensure_kernel(
+            "split_mq4v2_z_betaalpha",
+            kernels::SPLIT_MQ4V2_Z_BETAALPHA_SRC,
+            NAME,
+        )?;
+        let mut src = y_z_fold.buf.as_ptr();
+        let mut z = y_z.buf.as_ptr();
+        let mut beta = y_beta.buf.as_ptr();
+        let mut alpha = y_alpha.buf.as_ptr();
+        let mut zm = z_m as i32;
+        let mut fm = folded_m as i32;
+        let mut nv = n as i32;
+        let mut params: [*mut c_void; 7] = [
+            &mut src as *mut _ as *mut c_void,
+            &mut z as *mut _ as *mut c_void,
+            &mut beta as *mut _ as *mut c_void,
+            &mut alpha as *mut _ as *mut c_void,
+            &mut zm as *mut _ as *mut c_void,
+            &mut fm as *mut _ as *mut c_void,
+            &mut nv as *mut _ as *mut c_void,
+        ];
+        let timer =
+            crate::profile::begin_timer(&self.hip, "gemm", NAME, n * (folded_m + z_m + 96) * 4);
+        let result =
+            self.launch_maybe_blob(NAME, [n as u32, 1, 1], [256, 1, 1], 0, &mut params, || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(src);
+                b.push_ptr(z);
+                b.push_ptr(beta);
+                b.push_ptr(alpha);
+                b.push_i32(zm);
+                b.push_i32(fm);
+                b.push_i32(nv);
+                b
+            });
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result.map(|()| true)
+    }
+
+    /// gfx1201 verify-batch GDN input projection in ONE launch: the
+    /// `gemm_mq4g256v2_residual_mmq_iu4_qkvzaset_b1s` twin of the fused
+    /// QKV + Z-fold kernel with the GDN preparation removed. QKV row tiles
+    /// store every row like the plain SET kernel into `y_qkv`
+    /// (`Y[token * qkv_m + row]`), Z tiles into `y_z`, and the beta/alpha tile
+    /// into `y_beta`/`y_alpha` (stride 48). `a_z_fold` is the loader's Z fold.
+    /// Byte-identical to the separate SET launches. Returns `Ok(false)`
+    /// without launching unless: exact gfx1201, slab activations,
+    /// `HIPFIRE_GDN_ZBA_FOLD` != `0`, [`Self::iu4_gdn_fold_active`],
+    /// `0 < n <= 128`, and weights/outputs are large enough and 16-byte aligned.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_qkvza_set_g12_iu4_prepared(
+        &mut self,
+        a_qkv: &GpuTensor,
+        a_z_fold: &GpuTensor,
+        prepared: &crate::scratch::Int4MmqPrepared,
+        y_qkv: &GpuTensor,
+        y_z: &GpuTensor,
+        y_beta: &GpuTensor,
+        y_alpha: &GpuTensor,
+        dims: [usize; 4],
+        k: usize,
+        n: usize,
+    ) -> HipResult<bool> {
+        if self.arch != "gfx1201" || !*GDN_ZBA_FOLD {
+            return Ok(false);
+        }
+        self.bind_thread()?;
+        let row_bytes = k / 256 * crate::dispatch::MQ4V2_GROUP_BYTES;
+        let aligned = |t: &GpuTensor| (t.buf.as_ptr() as usize) % 16 == 0;
+        if !(self.iu4_gdn_fold_active(dims, k)
+            && n > 0
+            && n <= 128
+            && a_qkv.buf.size() >= dims[0] * row_bytes
+            && a_z_fold.buf.size() == Self::iu4_gdn_fold_rows(dims[1]).0 * row_bytes
+            && y_qkv.buf.size() >= n * dims[0] * 4
+            && y_z.buf.size() >= n * dims[1] * 4
+            && [y_beta, y_alpha].iter().all(|t| t.buf.size() >= n * 48 * 4)
+            && [a_qkv, a_z_fold, y_qkv, y_z, y_beta, y_alpha]
+                .into_iter()
+                .all(aligned))
+        {
+            return Ok(false);
+        }
+        let xq = self.int4_mmq_prepared_ptr(prepared, k, n)?;
+        if !self.scratch.int4_mmq_slab_at(xq) {
+            return Ok(false);
+        }
+        let module = "gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1s";
+        let symbol = if *VERIFY_V64 {
+            "gemm_mq4g256v2_residual_mmq_iu4_qkvzaset_b1s_v64"
+        } else {
+            "gemm_mq4g256v2_residual_mmq_iu4_qkvzaset_b1s"
+        };
+        // An owed residual add must land before any further GEMM.
+        self.flush_residual_fold()?;
+        self.ensure_embedded_kernel(module, g12_iu4_b1s_image()?, symbol)?;
+        self.iu4_verify_note_iu4(n);
+        let mut ptrs = [a_qkv, a_z_fold].map(|t| t.buf.as_ptr());
+        let mut xq_ptr = xq;
+        let mut outs = [y_z, y_beta, y_alpha].map(|t| t.buf.as_ptr());
+        let mut ints = [dims[0] as i32, dims[1] as i32, k as i32, n as i32];
+        // The five GDN pointer slots are never read; `y_qkv` is the `X` slot.
+        let mut gdn_ptrs = [y_z, y_z, y_z, y_z, y_z, y_qkv].map(|t| t.buf.as_ptr());
+        let mut scales = [0.0f32, 0.0f32];
+        let [p0, p1] = &mut ptrs;
+        let [o0, o1, o2] = &mut outs;
+        let [i0, i1, i2, i3] = &mut ints;
+        let [g0, g1, g2, g3, g4, g5] = &mut gdn_ptrs;
+        let [f0, f1] = &mut scales;
+        let mut params: Vec<*mut c_void> = vec![
+            p0 as *mut _ as *mut c_void,
+            p1 as *mut _ as *mut c_void,
+            &mut xq_ptr as *mut _ as *mut c_void,
+            o0 as *mut _ as *mut c_void,
+            o1 as *mut _ as *mut c_void,
+            o2 as *mut _ as *mut c_void,
+            i0 as *mut _ as *mut c_void,
+            i1 as *mut _ as *mut c_void,
+            i2 as *mut _ as *mut c_void,
+            i3 as *mut _ as *mut c_void,
+            g0 as *mut _ as *mut c_void,
+            g1 as *mut _ as *mut c_void,
+            g2 as *mut _ as *mut c_void,
+            g3 as *mut _ as *mut c_void,
+            g4 as *mut _ as *mut c_void,
+            g5 as *mut _ as *mut c_void,
+            f0 as *mut _ as *mut c_void,
+            f1 as *mut _ as *mut c_void,
+        ];
+        let fold_rows = Self::iu4_gdn_fold_rows(dims[1]).0;
+        let row_tiles = (dims[0] + fold_rows).div_ceil(128);
+        let bytes = (dims[0] + dims[1] + 96) * row_bytes + n * (dims[0] + dims[1] + 96) * 4;
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", symbol, bytes);
+        let blob_ptrs = (ptrs, xq, outs, ints, gdn_ptrs, scales);
+        let result = self.launch_maybe_blob(
+            symbol,
+            [row_tiles as u32, n.div_ceil(128) as u32, 1],
+            [256, 1, 1],
+            20480,
+            &mut params,
+            || {
+                let (ptrs, xq, outs, ints, gdn_ptrs, scales) = blob_ptrs;
+                let mut b = hip_bridge::KernargBlob::new();
+                for p in ptrs {
+                    b.push_ptr(p);
+                }
+                b.push_ptr(xq);
+                for p in outs {
+                    b.push_ptr(p);
+                }
+                for i in ints {
+                    b.push_i32(i);
+                }
+                for p in gdn_ptrs {
+                    b.push_ptr(p);
+                }
+                for f in scales {
+                    b.push_f32(f);
+                }
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result.map(|()| true)
+    }
+
+    /// [`Self::gemm_qkvza_mq4g256v2_wmma_iu4_prepared`] with the gfx1201 Z fold
+    /// SET + split ([`Self::gemm_zba_fold_g12_iu4_prepared`]) replacing the
+    /// separate Z / beta / alpha SETs when admitted. QKV SET is issued once
+    /// either way; `a_z` is the loader's Z fold buffer when the fold applies.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_qkvza_mq4g256v2_wmma_iu4_prepared_zba(
+        &mut self,
+        a_qkv: &GpuTensor,
+        a_z: &GpuTensor,
+        a_beta: &GpuTensor,
+        a_alpha: &GpuTensor,
+        x: &GpuTensor,
+        prepared: &crate::scratch::Int4MmqPrepared,
+        y_qkv: &GpuTensor,
+        y_z_fold: &GpuTensor,
+        y_z: &GpuTensor,
+        y_beta: &GpuTensor,
+        y_alpha: &GpuTensor,
+        qkv_m: usize,
+        z_m: usize,
+        beta_m: usize,
+        alpha_m: usize,
+        k: usize,
+        n: usize,
+    ) -> HipResult<()> {
+        if self.arch != "gfx1201" {
+            return self.gemm_qkvza_mq4g256v2_wmma_iu4_prepared(
+                a_qkv, a_z, a_beta, a_alpha, x, prepared, y_qkv, y_z, y_beta, y_alpha, qkv_m, z_m,
+                beta_m, alpha_m, k, n,
+            );
+        }
+        if beta_m == 48
+            && alpha_m == 48
+            && self.gemm_qkvza_set_g12_iu4_prepared(
+                a_qkv,
+                a_z,
+                prepared,
+                y_qkv,
+                y_z,
+                y_beta,
+                y_alpha,
+                [qkv_m, z_m, beta_m, alpha_m],
+                k,
+                n,
+            )?
+        {
+            return Ok(());
+        }
+        let xq = self.int4_mmq_prepared_ptr(prepared, k, n)?;
+        self.gemm_mq4g256v2_mmq_set_prequant_iu4(a_qkv, xq, y_qkv, qkv_m, k, n)?;
+        if beta_m == 48
+            && alpha_m == 48
+            && self.gemm_zba_fold_g12_iu4_prepared(
+                a_z, prepared, y_z_fold, y_z, y_beta, y_alpha, qkv_m, z_m, k, n,
+            )?
+        {
+            return Ok(());
+        }
+        self.gemm_mq4g256v2_mmq_set_prequant_iu4(a_z, xq, y_z, z_m, k, n)?;
+        self.gemm_mq4g256v2_mmq_set_prequant_iu4(a_beta, xq, y_beta, beta_m, k, n)?;
+        self.gemm_mq4g256v2_mmq_set_prequant_iu4(a_alpha, xq, y_alpha, alpha_m, k, n)
+    }
+
     /// gfx1201 A4 fused GDN input projection is admitted for these weights:
     /// the certified `_b1` bundle (not the control), symmetric MQ4V2, the
     /// Qwen3.5 GDN geometry the epilogue hard-codes (q/k/v = 16 + 16 + 48
@@ -36981,6 +37276,18 @@ impl Gpu {
                 "",
                 if bf16_h_a4_enabled() {
                     "gemm_mq4g256v2_gate_up_silu_mmq_iu4_b1s_bf16"
+                } else if *VERIFY_V64
+                    && n <= VERIFY_V64_MAX_N
+                    && crate::pm_tune::lookup(
+                        &self.arch,
+                        crate::pm_tune::GATE_UP_B1S_SYMBOL,
+                        m,
+                        k,
+                        g12_iu4_b1s_image()?,
+                    )?
+                    .is_none()
+                {
+                    "gemm_mq4g256v2_gate_up_silu_mmq_iu4_b1s_v64"
                 } else {
                     "gemm_mq4g256v2_gate_up_silu_mmq_iu4_b1s"
                 },

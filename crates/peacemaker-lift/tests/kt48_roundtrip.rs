@@ -270,7 +270,7 @@ fn selected_kernel_stream_is_reencoded_not_copied() {
     );
 }
 
-/// F2 builder bundle (12 kernels) and the iu4 token (6 kernels: with the sigmoid residual ADD) and slab (5) bundles round trip through `lift_object`/`emit` byte for byte.
+/// F2 builder bundle (12 kernels) and the iu4 token (6 kernels: with the sigmoid residual ADD) and slab (10: with the four `_v64` exports) bundles round trip through `lift_object`/`emit` byte for byte.
 #[test]
 fn builder_bundles_round_trip() {
     for (relative, sha, kernels, bytes) in [
@@ -288,9 +288,9 @@ fn builder_bundles_round_trip() {
         ),
         (
             "../../kernels/gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1s.hxaco",
-            "473810c8b33a40c8166fb7fbdd913090a5c1d0471b4bcea47443ec93393f6889",
-            5,
-            83_584,
+            "b952699f05d513c3374c6ea22326deb64a92c481cf08d7d6d1398fbcd0659c40",
+            10,
+            149_328,
         ),
     ] {
         let input = load(relative, sha);

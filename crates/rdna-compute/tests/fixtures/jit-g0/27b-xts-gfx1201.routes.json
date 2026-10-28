@@ -43,7 +43,7 @@
       "kind": "embedded",
       "module": "gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1s",
       "path": "/home/kaden/ClaudeCode/warpfront/wt-jit/kernels/gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1s.hxaco",
-      "sha256": "473810c8b33a40c8166fb7fbdd913090a5c1d0471b4bcea47443ec93393f6889",
+      "sha256": "b952699f05d513c3374c6ea22326deb64a92c481cf08d7d6d1398fbcd0659c40",
       "symbols": [
         "gemm_mq4g256v2_gate_up_silu_mmq_iu4_b1s",
         "gemm_mq4g256v2_residual_mmq_iu4_full_add_b1s",

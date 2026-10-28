@@ -682,7 +682,10 @@ pub fn batch_chunk_delta_net_input_projection(
                     return Ok(true);
                 }
             }
-            gpu.gemm_qkvza_mq4g256v2_wmma_iu4_prepared(
+            // gfx1201 verify (n <= 128): one SET over the Z fold + a copy
+            // kernel instead of separate Z / beta / alpha SETs; other shapes
+            // and archs run the unchanged four-GEMM sequence.
+            gpu.gemm_qkvza_mq4g256v2_wmma_iu4_prepared_zba(
                 &layer.wqkv.buf,
                 &layer.wz.buf,
                 &layer.w_beta.buf,
@@ -690,6 +693,7 @@ pub fn batch_chunk_delta_net_input_projection(
                 &pbs.x_rot_batch,
                 prep,
                 &pbs.dn_qkv_batch,
+                &pbs.dn_z_fold_batch,
                 &pbs.dn_z_batch,
                 &pbs.dn_beta_batch,
                 &pbs.dn_alpha_batch,
