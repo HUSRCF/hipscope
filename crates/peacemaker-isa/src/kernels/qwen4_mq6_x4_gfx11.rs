@@ -59,8 +59,8 @@
 //! token < N, row < M mask), `v_add_f32 acc, acc, y` (hipcc: `v_add_f32_e32 v1, v1, v14`, acc is
 //! src0) and stored; no `0 + acc`. Tails: rows >= M and tokens >= N are neither loaded nor
 //! stored; `M % 8 != 0` takes a per-element path. Launch: block `32*wr`, grid
-//! `[ceil(M/(16*wr)), ceil(N/256), 1]`, static LDS 40960; the symbol is the incumbent's
-//! (`Cfg::symbol`), one kernel per object, kernargs `A X Y M K N` (36 bytes). Residual entries
+//! `[ceil(M/(16*wr)), ceil(N/256), 1]`, static LDS 40960; the symbols are
+//! `gemm_mq6g256v2_residual_pm_<arch>_w<wr>` (`Cfg::symbol`), both in one object (`emit_resid_module`), kernargs `A X Y M K N` (36 bytes). Residual entries
 //! assemble for gfx1100 (the product) and gfx1151 (the emulator differential: the instruction
 //! streams are identical); every other arch refuses. A K < 256 call adds an all-zero
 //! accumulator to Y exactly as hipcc does; K <= 0 exits without touching Y.
@@ -190,11 +190,12 @@ impl Cfg {
             Kind::Resid => "_resid",
         }
     }
-    /// Exported symbol. The residual twin exports hipcc's incumbent symbol so its object is a
-    /// drop-in for `gemm_mq6g256v2_residual_wmma_gfx11_mw8_lds` (one kernel per object).
+    /// Exported symbol. The residual twin of hipcc's `gemm_mq6g256v2_residual_wmma_gfx11_mw8_lds`
+    /// is `gemm_mq6g256v2_residual_pm_<arch>_w<wr>`: distinct from hipcc's so both can be
+    /// loaded in one product process.
     pub fn symbol(&self) -> String {
         if self.kind == Kind::Resid {
-            return "gemm_mq6g256v2_residual_wmma_gfx11_mw8_lds".into();
+            return format!("gemm_mq6g256v2_residual_pm_{}_w{}", self.arch.name(), self.wr);
         }
         format!(
             "qwen4_{}_x4_pm_{}_w{}{}",
@@ -206,6 +207,10 @@ impl Cfg {
     }
     pub fn module(fmt: Fmt, arch: Arch) -> String {
         format!("qwen4_{}_x4_pm_{}", fmt.tag(), arch.name())
+    }
+    /// Module name of the residual twin object (both `wr` entries).
+    pub fn resid_module(arch: Arch) -> String {
+        format!("gemm_mq6g256v2_residual_pm_{}", arch.name())
     }
     pub fn validate(&self) -> R {
         if self.kind == Kind::Resid {
@@ -2490,6 +2495,25 @@ pub fn emit_cfg(spec: Cfg) -> Result<Emitted, String> {
     b.loop_(&lbl(&spec, "loop"), |b| body(b, &spec))?;
     epilogue(&mut b, &spec)?;
     b.finish()
+}
+
+/// Both residual twin entries (`Cfg::RESID`) as one code object (`Cfg::resid_module`).
+pub fn emit_resid_module(
+    arch: Arch,
+) -> Result<(Vec<Emitted>, String, super::iu4_gemm::ModuleProof), String> {
+    let emitted = Cfg::RESID
+        .into_iter()
+        .map(|wr| {
+            emit_cfg(Cfg {
+                arch,
+                wr,
+                kind: Kind::Resid,
+                fmt: Fmt::Mq6,
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let (text, proof) = super::iu4_gemm::module(&emitted, &Cfg::resid_module(arch))?;
+    Ok((emitted, text, proof))
 }
 
 /// Every MQ6 entry as one code object (`Spec::module`).

@@ -5366,6 +5366,15 @@ pub const GEMM_MQ4G256V2_RESIDUAL_IU4_V2C_GFX11_SRC: &str =
 /// loads another bundle, e.g. the previous `00c4747c…`, for same-binary A/B).
 pub const GEMM_MQ4G256V2_RESIDUAL_IU4_PM_GFX1100: &[u8] =
     include_bytes!("../../../kernels/gemm_mq4g256v2_residual_iu4_pm_gfx1100.hxaco");
+/// gfx1100 MQ6 residual PM twin: `gemm_mq6g256v2_residual_pm_gfx1100_w{4,8}`, exact twins of hipcc's
+/// `gemm_mq6g256v2_residual_wmma_gfx11_mw8_lds` (same A,X,Y,M,K,N kernargs, bytes identical),
+/// emitted by `mq6_resid_gfx1100_emit` (native == ROCm `.text`, M7 obligation-free).
+/// Selected by `mq6_resid_pm_gfx1100_waves` (`HIPFIRE_MQ6_RESID_PM_GFX1100=0` restores hipcc).
+pub const GEMM_MQ6G256V2_RESIDUAL_PM_GFX1100: &[u8] =
+    include_bytes!("../../../kernels/gemm_mq6g256v2_residual_pm_gfx1100.hxaco");
+/// Bare lowercase SHA-256 of [`GEMM_MQ6G256V2_RESIDUAL_PM_GFX1100`], without a newline.
+pub const GEMM_MQ6G256V2_RESIDUAL_PM_GFX1100_SHA256: &str =
+    include_str!("../../../kernels/gemm_mq6g256v2_residual_pm_gfx1100.hxaco.sha256");
 /// gfx11 GEMM v2 "V2B" symmetric IU4 prefill tile (M256xN256, 16 waves, two
 /// 32 KiB K128 LDS slots, 1 CTA/WGP), dispatched on gfx1151. Same production
 /// operand layouts, staging permutation, fold numerics and 6-argument

@@ -1135,6 +1135,36 @@ fn gfx1100_pm_gemm(m: usize) -> bool {
     *GFX1100_PM_GEMM && m < (1 << 22)
 }
 
+/// gfx1100 MQ6 residual PM twin (`HIPFIRE_MQ6_RESID_PM_GFX1100`, default on; `=0` restores the
+/// hipcc `gemm_mq6g256v2_residual_wmma_gfx11_mw8_lds` for every shape). Parsed once.
+static MQ6_RESID_PM_GFX1100: LazyLock<bool> =
+    LazyLock::new(|| hipfire_config::developer_bool("HIPFIRE_MQ6_RESID_PM_GFX1100", true));
+
+/// Waves of the gfx1100 MQ6 residual PM twin for an MQ6 residual with `batch_size` tokens and
+/// `m` output rows, or `None` to keep hipcc. Only where hipcc selects MW8 (`batch_size >= 464`)
+/// on exact gfx1100: `m >= 6144` -> w8, `2560 <= m < 6144` -> w4, smaller `m` stays hipcc.
+/// Card ratios PM/hipcc at N=768: M10240 0.521, M6144 0.542, M12288 0.496 (w8); M2560 K6144
+/// 0.692 (w4).
+fn mq6_resid_pm_gfx1100_waves(
+    arch: &str,
+    bits: u8,
+    batch_size: usize,
+    m: usize,
+    enabled: bool,
+) -> Option<usize> {
+    if !enabled || bits != 6 {
+        return None;
+    }
+    if mqv2_mw_waves(arch, bits, MqV2PrefillProjection::Residual, batch_size) != Some(8) {
+        return None;
+    }
+    match m {
+        6144.. => Some(8),
+        2560..=6143 => Some(4),
+        _ => None,
+    }
+}
+
 /// Developer A/B of the gfx1100 builder bundle with one binary (for example
 /// the previous certified bundle as a same-binary opt-out):
 /// `HIPFIRE_GFX1100_PM_BUNDLE=<path>` loads it from a file instead of the
@@ -41211,6 +41241,18 @@ impl Gpu {
         if self.replay.is_recording() || self.graphs.capture_mode {
             return Ok(false);
         }
+        if bits == 6 && k % 256 == 0 {
+            if let Some(waves) = mq6_resid_pm_gfx1100_waves(
+                self.arch.as_str(),
+                bits,
+                batch_size,
+                m,
+                *MQ6_RESID_PM_GFX1100,
+            ) {
+                self.gemm_mq6_residual_pm_gfx1100(waves, a_raw, x, y, m, k, batch_size)?;
+                return Ok(true);
+            }
+        }
         if let Some(waves) = mqv2_mw_waves(
             self.arch.as_str(),
             bits,
@@ -42053,6 +42095,99 @@ impl Gpu {
         let result = self.launch_maybe_blob(
             func_name,
             [row_tiles as u32, batch_tiles as u32, 1],
+            [(32 * waves) as u32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr);
+                b.push_ptr(x_ptr);
+                b.push_ptr(y_ptr);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b.push_i32(n_val);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
+    /// gfx1100 MQ6 residual twin (`gemm_mq6g256v2_residual_pm_gfx1100_w{4,8}`, embedded
+    /// certified builder object `kernels/gemm_mq6g256v2_residual_pm_gfx1100.hxaco`): same
+    /// `A X Y M K N` kernargs, WMMA chain and `Y += acc` epilogue as the hipcc
+    /// `gemm_mq6g256v2_residual_wmma_gfx11_mw8_lds`, so bytes are identical. Block `32 * waves`,
+    /// grid `[ceil(M / (16 * waves)), ceil(N / 256), 1]`, static LDS 40960, dynamic 0.
+    /// Selected by [`mq6_resid_pm_gfx1100_waves`].
+    pub fn gemm_mq6_residual_pm_gfx1100(
+        &mut self,
+        waves: usize,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        let func_name: &'static str = match waves {
+            4 => "gemm_mq6g256v2_residual_pm_gfx1100_w4",
+            8 => "gemm_mq6g256v2_residual_pm_gfx1100_w8",
+            _ => {
+                return Err(hip_bridge::HipError::new(
+                    1,
+                    "gemm_mq6_residual_pm_gfx1100: unsupported waves",
+                ));
+            }
+        };
+        if m == 0 || batch_size == 0 || k == 0 {
+            return Ok(());
+        }
+        if k % 256 != 0 {
+            return Err(hip_bridge::HipError::new(
+                1,
+                "gemm_mq6_residual_pm_gfx1100: K must be a multiple of 256",
+            ));
+        }
+        if self.arch.as_str() != "gfx1100" {
+            return Err(hip_bridge::HipError::new(
+                1,
+                "gemm_mq6_residual_pm_gfx1100: exact gfx1100 required",
+            ));
+        }
+        self.bind_thread()?;
+        self.ensure_embedded_kernel(
+            "gemm_mq6g256v2_residual_pm_gfx1100",
+            kernels::GEMM_MQ6G256V2_RESIDUAL_PM_GFX1100,
+            func_name,
+        )?;
+        let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
+        let mut a_ptr = a_raw.buf.as_ptr();
+        let mut x_ptr = x_f16_ptr;
+        let mut y_ptr = y.buf.as_ptr();
+        let mut m_val = m as i32;
+        let mut k_val = k as i32;
+        let mut n_val = batch_size as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_ptr as *mut _ as *mut c_void,
+            &mut x_ptr as *mut _ as *mut c_void,
+            &mut y_ptr as *mut _ as *mut c_void,
+            &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut n_val as *mut _ as *mut c_void,
+        ];
+        let bytes = m * (k / 256) * crate::dispatch::MQ6G256V2_GROUP_BYTES
+            + batch_size * k * 2
+            + batch_size * m * 4 * 2;
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", func_name, bytes);
+        let result = self.launch_maybe_blob(
+            func_name,
+            [
+                m.div_ceil(16 * waves) as u32,
+                batch_size.div_ceil(256) as u32,
+                1,
+            ],
             [(32 * waves) as u32, 1, 1],
             0,
             &mut params,
@@ -56564,6 +56699,46 @@ mod qwen4_moe_stream8_selection {
                 other[i] = value;
                 assert!(!selected("gfx1151", true, false, other));
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod mq6_resid_pm_gfx1100_selection {
+    use super::mq6_resid_pm_gfx1100_waves as pick;
+
+    #[test]
+    fn m_boundaries_on_gfx1100() {
+        for (m, want) in [
+            (48, None),
+            (640, None),
+            (2559, None),
+            (2560, Some(4)),
+            (6143, Some(4)),
+            (6144, Some(8)),
+            (10240, Some(8)),
+            (12288, Some(8)),
+        ] {
+            assert_eq!(pick("gfx1100", 6, 768, m, true), want, "m={m}");
+        }
+    }
+
+    #[test]
+    fn only_where_hipcc_selects_mw8() {
+        assert_eq!(pick("gfx1100", 6, 463, 10240, true), None);
+        assert_eq!(pick("gfx1100", 6, 416, 10240, true), None);
+        assert_eq!(pick("gfx1100", 6, 464, 10240, true), Some(8));
+        assert_eq!(pick("gfx1100", 6, 464, 2560, true), Some(4));
+    }
+
+    #[test]
+    fn kill_switch_other_bits_and_other_arches_unchanged() {
+        assert_eq!(pick("gfx1100", 6, 768, 10240, false), None);
+        for bits in [3u8, 4, 5] {
+            assert_eq!(pick("gfx1100", bits, 768, 10240, true), None, "bits={bits}");
+        }
+        for arch in ["gfx1151", "gfx1150", "gfx1152", "gfx1201", "gfx942", "gfx1101"] {
+            assert_eq!(pick(arch, 6, 768, 10240, true), None, "{arch}");
         }
     }
 }

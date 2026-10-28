@@ -16,7 +16,6 @@ use peacemaker_ir::inst::Frontend;
 use peacemaker_isa::kernels::qwen4_mq6_x4_gfx11::{self as mq6, Cfg, Fmt, Kind};
 use peacemaker_isa::Arch;
 
-const SYMBOL: &str = "gemm_mq6g256v2_residual_wmma_gfx11_mw8_lds";
 
 fn cfg(arch: Arch, wr: u8) -> Cfg {
     Cfg {
@@ -37,7 +36,7 @@ fn residual_entries_emit_on_gfx1100_deterministically() {
         assert_eq!(a.s_text, b.s_text, "w{wr}");
         assert_eq!(a.proof.s_text_sha256, b.proof.s_text_sha256, "w{wr}");
         assert_eq!(a.shape.wmma, 256, "w{wr}");
-        assert!(a.s_text.contains(&format!(".globl {SYMBOL}\n")), "w{wr}");
+        assert!(a.s_text.contains(&format!(".globl gemm_mq6g256v2_residual_pm_gfx1100_w{wr}\n")), "w{wr}");
         // hipcc's incumbent metadata: A X Y pointers, M K N by value, 36-byte block, 40 KiB static LDS.
         assert!(a.s_text.contains(".kernarg_segment_size: 36\n"), "w{wr}");
         let field = |key: &str| -> Vec<u32> {
@@ -285,7 +284,7 @@ fn run(p: &Problem, wr: u8) -> Result<Vec<f32>, String> {
         },
     )
     .map_err(|e| format!("lift: {e:?}"))?;
-    let emu = Emulator::new(&lifted.program, SYMBOL)?;
+    let emu = Emulator::new(&lifted.program, &format!("gemm_mq6g256v2_residual_pm_gfx1151_w{wr}"))?;
     let (kva, ava, xva, yva) = (0x1000_0000u64, 0x2000_0000u64, 0x3000_0000u64, 0x4000_0000u64);
     let mut kern = Vec::new();
     for ptr in [ava, xva, yva] {
@@ -374,5 +373,31 @@ fn residual_matches_cpu_bitwise_on_random_values() {
     for (m, n, k, wr, seed) in [(48, 33, 512, 8, 11u64), (48, 33, 512, 4, 12), (29, 19, 256, 8, 13)] {
         let p = Problem::new(m, n, k, seed, false);
         check(&p, wr);
+    }
+}
+
+/// The committed product object `kernels/gemm_mq6g256v2_residual_pm_gfx1100.hxaco` is what the
+/// builder emits today: fresh module emission, native assembly and bundling are byte-equal to it
+/// (the host triple is read from the committed bundle), and its `.sha256` is the bundle's digest.
+#[test]
+fn committed_module_bundle_equals_fresh_emission() {
+    use sha2::{Digest, Sha256};
+    let root = concat!(env!("CARGO_MANIFEST_DIR"), "/../../kernels");
+    let stem = Cfg::resid_module(Arch::Gfx1100);
+    let committed = std::fs::read(format!("{root}/{stem}.hxaco")).unwrap();
+    let (_, text, _) = mq6::emit_resid_module(Arch::Gfx1100).unwrap();
+    let elf = peacemaker_isa::native::assemble(&text, Arch::Gfx1100).unwrap();
+    let fresh = peacemaker_isa::native::bundle(
+        &elf,
+        Arch::Gfx1100,
+        peacemaker_isa::native::DEFAULT_HOST_TARGET,
+    );
+    assert!(fresh == committed, "{stem}: fresh bundle differs from the committed bundle");
+    let sha = std::fs::read_to_string(format!("{root}/{stem}.hxaco.sha256")).unwrap();
+    assert_eq!(sha, format!("{:x}", Sha256::digest(&committed)));
+    let s = std::fs::read_to_string(format!("{root}/{stem}.s")).unwrap();
+    assert_eq!(s, text);
+    for wr in [4, 8] {
+        assert!(text.contains(&format!(".globl gemm_mq6g256v2_residual_pm_gfx1100_w{wr}\n")));
     }
 }
