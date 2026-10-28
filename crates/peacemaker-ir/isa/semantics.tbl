@@ -516,3 +516,16 @@ scratch_store_b32	memory
 scratch_store_b64	memory
 scratch_store_b96	memory
 scratch_store_b128	memory
+# wave64 / gfx1201 lane-kernel additions (EmuWave64): 64-bit lane-mask scalar ops, the gfx12 spelling of the 64-bit MAD, global_inv (cache invalidate:
+# no state the interpreter models, a no-op like buffer_gl0_inv); s_code_end is padding after s_endpgm and errors if ever executed.
+s_and_b64	alu
+s_or_b64	alu
+s_and_not1_b64	alu
+s_and_saveexec_b64	alu
+s_or_saveexec_b64	alu
+s_and_not1_saveexec_b64	alu
+v_mad_co_i64_i32	alu
+v_mad_co_u64_u32	alu
+global_inv	wait
+s_code_end	control
+v_mbcnt_hi_u32_b32	alu

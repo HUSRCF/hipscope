@@ -260,9 +260,12 @@ pub(super) const PRIVATE_APERTURE_HI: u32 = 3;
 struct State {
     s: [u32; 106],
     t: [u32; 16],
-    v: Box<[[u32; 32]; 256]>,
-    exec: u32,
-    vcc: u32,
+    /// 64 lane slots; only `lanes` (32 or 64, the kernel's wavefront size) are architecturally present.
+    v: Box<[[u32; 64]; 256]>,
+    /// Wavefront size: 32 or 64. Wave32 keeps the upper halves of `exec`/`vcc` zero.
+    lanes: usize,
+    exec: u64,
+    vcc: u64,
     scc: bool,
     m0: u32,
     pc: usize,
@@ -275,12 +278,17 @@ struct State {
 }
 impl State {
     fn new(arch: Arch, kernel: &Kernel, launch: &Launch, wave: usize) -> Result<Self> {
-        if kernel.wave != Wave::Wave32 {
-            return Err("emulator requires wave32".into());
-        }
+        let lanes = match kernel.wave {
+            Wave::Wave32 => 32usize,
+            Wave::Wave64 => 64usize,
+        };
         let Abi::Hsa { descriptor: d, metadata } = &kernel.abi else {
             return Err("descriptor-driven HSA ABI required".into());
         };
+        // The lifter derives `kernel.wave` from KERNEL_CODE_PROPERTIES.ENABLE_WAVEFRONT_SIZE32; refuse a disagreement.
+        if d.kernel_code_properties.wave32() != (lanes == 32) {
+            return Err("kernel wave disagrees with the descriptor ENABLE_WAVEFRONT_SIZE32 bit".into());
+        }
         if metadata.parsed.uses_dynamic_stack {
             return Err("dynamic stack (private segment beyond the fixed size) unsupported".into());
         }
@@ -294,7 +302,8 @@ impl State {
         let mut st = Self {
             s: [0; 106],
             t: [0; 16],
-            v: Box::new([[0; 32]; 256]),
+            v: Box::new([[0; 64]; 256]),
+            lanes,
             exec: 0,
             vcc: 0,
             scc: false,
@@ -303,7 +312,7 @@ impl State {
             ended: false,
             barrier: None,
             signals: 0,
-            scratch: vec![vec![0; d.private_segment_fixed_size as usize]; 32],
+            scratch: vec![vec![0; d.private_segment_fixed_size as usize]; lanes],
         };
         let props = d.kernel_code_properties.0;
         let mut sg = 0;
@@ -366,8 +375,8 @@ impl State {
             .checked_mul(launch.block[1])
             .and_then(|n| n.checked_mul(launch.block[2]))
             .ok_or("block size overflow")? as usize;
-        for lane in 0..32 {
-            let id = wave * 32 + lane;
+        for lane in 0..lanes {
+            let id = wave * lanes + lane;
             if id >= threads {
                 continue;
             }
@@ -399,9 +408,11 @@ impl State {
                 (bits >> if *h == Half::Hi { 16 } else { 0 }) & 0xffff
             }
             Operand::Special(s) => match s {
-                Special::Exec | Special::ExecLo => self.exec,
-                Special::Vcc | Special::VccLo => self.vcc,
-                Special::ExecHi | Special::VccHi | Special::Null => 0,
+                Special::Exec | Special::ExecLo => self.exec as u32,
+                Special::Vcc | Special::VccLo => self.vcc as u32,
+                Special::ExecHi => (self.exec >> 32) as u32,
+                Special::VccHi => (self.vcc >> 32) as u32,
+                Special::Null => 0,
                 Special::Scc => u32::from(self.scc),
                 Special::M0 => self.m0,
                 Special::Ttmp(n) => self.t[usize::from(*n)],
@@ -436,9 +447,9 @@ impl State {
             }
             Operand::Special(Special::SrcSharedBase) => u64::from(SHARED_APERTURE_HI) << 32,
             Operand::Special(Special::SrcPrivateBase) => u64::from(PRIVATE_APERTURE_HI) << 32,
-            Operand::Special(Special::Vcc | Special::Exec | Special::Null) => {
-                u64::from(self.read(op, lane, 0)?)
-            }
+            Operand::Special(Special::Vcc) => self.vcc & self.lane_mask(),
+            Operand::Special(Special::Exec) => self.exec & self.lane_mask(),
+            Operand::Special(Special::Null) => 0,
             Operand::Inline(InlineConst::Integer(n)) => i64::from(*n) as u64,
             Operand::Inline(InlineConst::FloatBits(b)) if kind == Wide::Float => {
                 f64::from(f32::from_bits(*b)).to_bits()
@@ -458,10 +469,78 @@ impl State {
                 self.put(op, lane, 0, value as u32)?;
                 self.put(op, lane, 1, (value >> 32) as u32)
             }
+            Operand::Special(Special::Exec) => {
+                self.exec = value & self.lane_mask();
+                Ok(())
+            }
+            Operand::Special(Special::Vcc) => {
+                self.vcc = value & self.lane_mask();
+                Ok(())
+            }
+            Operand::Special(Special::Null) => Ok(()),
             _ => Err(format!(
                 "64-bit destination needs a register pair, got {op}"
             )),
         }
+    }
+    /// Bits of `exec`/`vcc` that exist in this wavefront.
+    fn lane_mask(&self) -> u64 {
+        if self.lanes == 64 {
+            u64::MAX
+        } else {
+            0xffff_ffff
+        }
+    }
+    /// A lane-mask operand (`v_cmp` destination, `v_cndmask`/carry-in source, carry-out): one SGPR/`vcc_lo`/`exec_lo`
+    /// in wave32, an SGPR pair or the full `vcc`/`exec` in wave64. The encoding names `vcc_lo`/`exec_lo` and `s_n`
+    /// for both wave sizes, so the kernel's wave size (not the operand spelling) decides the width.
+    fn read_mask(&self, op: &Operand) -> Result<u64> {
+        let wide = self.lanes == 64;
+        Ok(match op {
+            Operand::Special(Special::Vcc | Special::VccLo | Special::VccHi) => self.vcc & self.lane_mask(),
+            Operand::Special(Special::Exec | Special::ExecLo | Special::ExecHi) => self.exec & self.lane_mask(),
+            Operand::Special(Special::Null) => 0,
+            Operand::Reg(r) if r.kind != Kind::V => {
+                if wide && r.len < 2 {
+                    return Err(format!("wave64 lane mask needs a register pair, got {op}"));
+                }
+                let lo = u64::from(self.read(op, 0, 0)?);
+                if wide {
+                    lo | u64::from(self.read(op, 0, 1)?) << 32
+                } else {
+                    lo
+                }
+            }
+            Operand::Inline(InlineConst::Integer(n)) => {
+                if wide {
+                    i64::from(*n) as u64
+                } else {
+                    u64::from(*n as i32 as u32)
+                }
+            }
+            Operand::Literal(n) => u64::from(*n),
+            _ => return Err(format!("not a lane-mask operand {op}")),
+        })
+    }
+    fn put_mask(&mut self, op: &Operand, value: u64) -> Result<()> {
+        let wide = self.lanes == 64;
+        let value = value & self.lane_mask();
+        match op {
+            Operand::Special(Special::Vcc | Special::VccLo) => self.vcc = value,
+            Operand::Special(Special::Exec | Special::ExecLo) => self.exec = value,
+            Operand::Special(Special::Null) => (),
+            Operand::Reg(r) if r.kind != Kind::V => {
+                if wide && r.len < 2 {
+                    return Err(format!("wave64 lane mask needs a register pair, got {op}"));
+                }
+                self.put(op, 0, 0, value as u32)?;
+                if wide {
+                    self.put(op, 0, 1, (value >> 32) as u32)?;
+                }
+            }
+            _ => return Err(format!("not a lane-mask destination {op}")),
+        }
+        Ok(())
     }
     fn put(&mut self, op: &Operand, lane: usize, word: usize, value: u32) -> Result<()> {
         match op {
@@ -484,8 +563,11 @@ impl State {
                 )?;
             }
             Operand::Special(s) => match s {
-                Special::Exec | Special::ExecLo => self.exec = value,
-                Special::Vcc | Special::VccLo => self.vcc = value,
+                Special::Exec | Special::ExecLo => self.exec = (self.exec & !0xffff_ffff) | u64::from(value),
+                Special::Vcc | Special::VccLo => self.vcc = (self.vcc & !0xffff_ffff) | u64::from(value),
+                Special::ExecHi if self.lanes == 64 => self.exec = (self.exec & 0xffff_ffff) | u64::from(value) << 32,
+                Special::VccHi if self.lanes == 64 => self.vcc = (self.vcc & 0xffff_ffff) | u64::from(value) << 32,
+                Special::ExecHi | Special::VccHi => (),
                 Special::Scc => self.scc = value != 0,
                 Special::M0 => self.m0 = value,
                 Special::Null => (),
@@ -618,7 +700,7 @@ impl<'a> Emulator<'a> {
         if n == 0 || n > 1024 {
             return Err("workgroup must contain 1..1024 threads".into());
         }
-        let mut states = (0..n.div_ceil(32))
+        let mut states = (0..n.div_ceil(kernel.wave.lanes()))
             .map(|w| State::new(self.arch, kernel, launch, w))
             .collect::<Result<Vec<_>>>()?;
         let mut lds = vec![
@@ -702,7 +784,7 @@ fn failure_bits(arch: Arch, wave: usize, st: &State, inst: &Inst) -> String {
                 for word in 0..usize::from(r.len) {
                     if r.kind == Kind::V {
                         let _ = write!(out, " w{word}=[");
-                        for lane in 0..32 {
+                        for lane in 0..st.lanes {
                             if lane != 0 {
                                 out.push(' ');
                             }
@@ -730,7 +812,7 @@ fn failure_bits(arch: Arch, wave: usize, st: &State, inst: &Inst) -> String {
             }
             Operand::Half(r, _) if r.kind == Kind::V => {
                 out.push_str(" h=[");
-                for lane in 0..32 {
+                for lane in 0..st.lanes {
                     if lane != 0 {
                         out.push(' ');
                     }
@@ -824,8 +906,9 @@ mod tests {
         State {
             s: [0; 106],
             t: [0; 16],
-            v: Box::new([[0; 32]; 256]),
-            exec: u32::MAX,
+            v: Box::new([[0; 64]; 256]),
+            lanes: 32,
+            exec: 0xffff_ffff,
             vcc: 0,
             scc: false,
             m0: 0,

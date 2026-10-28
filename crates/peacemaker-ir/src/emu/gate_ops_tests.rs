@@ -20,7 +20,8 @@ fn state() -> State {
     State {
         s: [0; 106],
         t: [0; 16],
-        v: Box::new([[0; 32]; 256]),
+        v: Box::new([[0; 64]; 256]),
+        lanes: 32,
         exec: 1,
         vcc: 0,
         scc: false,

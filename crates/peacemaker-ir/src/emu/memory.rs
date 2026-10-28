@@ -88,8 +88,8 @@ fn ds_atomic_execute(
         })
         .sum();
     let mut seen = std::collections::HashSet::new();
-    for lane in 0..32 {
-        if s.exec & (1 << lane) == 0 {
+    for lane in 0..s.lanes {
+        if s.exec & (1u64 << lane) == 0 {
             continue;
         }
         // LDS addresses are 32-bit (VGPR + 16-bit offset, carry out discarded).
@@ -228,8 +228,8 @@ fn global_atomic_add_u32(i: &Inst, s: &mut State, mem: &mut Memory) -> Result<()
     // SADDR form: a 32-bit VGPR byte offset added to the SGPR-pair base; `off`: a 64-bit VGPR address.
     let saddr_pair = matches!(saddr, Operand::Reg(r) if r.kind == crate::reg::Kind::S && r.len == 2);
     let mut lanes: Vec<(usize, u64)> = Vec::new();
-    for lane in 0..32 {
-        if s.exec & (1 << lane) == 0 {
+    for lane in 0..s.lanes {
+        if s.exec & (1u64 << lane) == 0 {
             continue;
         }
         let addr = if saddr_pair {
@@ -272,8 +272,8 @@ fn scratch_access(name: &str, i: &Inst, s: &mut State) -> Result<()> {
             offset += i64::from(*k);
         }
     }
-    for lane in 0..32 {
-        if s.exec & (1 << lane) == 0 {
+    for lane in 0..s.lanes {
+        if s.exec & (1u64 << lane) == 0 {
             continue;
         }
         let mut addr = offset;
@@ -367,22 +367,25 @@ pub(super) fn execute_tracked(
                 }
             })
             .unwrap_or(0);
-        let mut values = [0; 32];
+        let mut values = [0; 64];
         for (lane, val) in values.iter_mut().enumerate() {
+            // BitMode: and/or/xor masks act on the lane's index inside its 32-lane group (the upper half of a wave64 is
+            // its own group); QDMode permutes within each quad.
             let src = if pat & 0x8000 != 0 {
                 (lane & !3) | usize::from((pat >> (2 * (lane & 3))) & 3)
             } else {
-                ((lane & usize::from(pat & 31)) | usize::from((pat >> 5) & 31))
-                    ^ usize::from((pat >> 10) & 31)
+                (lane & !31)
+                    | (((lane & usize::from(pat & 31)) | usize::from((pat >> 5) & 31))
+                        ^ usize::from((pat >> 10) & 31))
             };
-            *val = if src < 32 && s.exec & (1 << src) != 0 {
+            *val = if src < s.lanes && s.exec & (1u64 << src) != 0 {
                 s.read(&ops[1], src, 0)?
             } else {
                 0
             };
         }
         for (lane, val) in values.into_iter().enumerate() {
-            if s.exec & (1 << lane) != 0 {
+            if s.exec & (1u64 << lane) != 0 {
                 s.put(&ops[0], lane, 0, val)?;
             }
         }
@@ -401,20 +404,20 @@ pub(super) fn execute_tracked(
                 }
             })
             .unwrap_or(0);
-        let mut values = [0; 32];
+        let mut values = [0; 64];
         for (lane, val) in values.iter_mut().enumerate() {
-            if s.exec & (1 << lane) == 0 {
+            if s.exec & (1u64 << lane) == 0 {
                 continue;
             }
-            let src = (s.read(&ops[1], lane, 0)?.wrapping_add(offset) / 4 % 32) as usize;
-            *val = if s.exec & (1 << src) != 0 {
+            let src = (s.read(&ops[1], lane, 0)?.wrapping_add(offset) / 4) as usize % s.lanes;
+            *val = if s.exec & (1u64 << src) != 0 {
                 s.read(&ops[2], src, 0)?
             } else {
                 0
             };
         }
         for (lane, val) in values.into_iter().enumerate() {
-            if s.exec & (1 << lane) != 0 {
+            if s.exec & (1u64 << lane) != 0 {
                 s.put(&ops[0], lane, 0, val)?;
             }
         }
@@ -433,8 +436,8 @@ pub(super) fn execute_tracked(
     let ds = name.starts_with("ds_");
     let buffer = name.starts_with("buffer_");
     let two = name.contains("2addr");
-    for lane in 0..32 {
-        if s.exec & (1 << lane) == 0 {
+    for lane in 0..s.lanes {
+        if s.exec & (1u64 << lane) == 0 {
             continue;
         }
         let mut offset = 0i64;
@@ -634,7 +637,8 @@ mod tests {
         State {
             s: [0; 106],
             t: [0; 16],
-            v: Box::new([[0; 32]; 256]),
+            v: Box::new([[0; 64]; 256]),
+            lanes: 32,
             exec: 1,
             vcc: 0,
             scc: false,
@@ -791,7 +795,7 @@ mod tests {
         }
         assert_eq!(lds, [0x5a; 16]);
         // shfl-down 16 idiom with a DS offset: (lane*4 + 64)/4 mod 32 = lane+16 mod 32.
-        st.exec = u32::MAX;
+        st.exec = 0xffff_ffff;
         for lane in 0..32 {
             st.v[158][lane] = (lane * 4) as u32;
         }
@@ -1057,7 +1061,7 @@ mod tests {
         lds[4..8].copy_from_slice(&0xf0u32.to_le_bytes());
         let mut st = state();
         st.exec = 0b111;
-        st.v[1] = [0; 32];
+        st.v[1] = [0; 64];
         st.v[2][0] = 1;
         st.v[2][1] = 2;
         st.v[2][2] = 4;
@@ -1075,8 +1079,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(u32::from_le_bytes(lds[0..4].try_into().unwrap()), 17);
-        st.v[1] = [4; 32];
-        st.v[2] = [0x0f; 32];
+        st.v[1] = [4; 64];
+        st.v[2] = [0x0f; 64];
         execute(
             "ds_or_b32",
             &insn_on(
@@ -1097,7 +1101,7 @@ mod tests {
         st.v[1][1] = 4;
         st.v[2][0] = 100;
         st.v[2][1] = 200;
-        st.v[0] = [0x77; 32];
+        st.v[0] = [0x77; 64];
         execute(
             "ds_add_rtn_u32",
             &insn_on(
@@ -1188,8 +1192,8 @@ mod tests {
             st.exec = 0b01; // lane 1 inactive
             st.v[2][0] = 4;
             st.v[2][1] = 16;
-            st.v[0] = [0xdead_beef; 32];
-            st.v[1] = [0xdead_beef; 32];
+            st.v[0] = [0xdead_beef; 64];
+            st.v[1] = [0xdead_beef; 64];
             execute(
                 "ds_load_b64",
                 &insn_on(

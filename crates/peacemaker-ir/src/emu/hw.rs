@@ -104,7 +104,7 @@ pub(super) struct StepHw {
     clears_store_locks: bool,
 }
 
-pub(super) fn build_step_hw(arch: Arch, step: &Step, lock_gfx11_stores: bool) -> StepHw {
+pub(super) fn build_step_hw(arch: Arch, wave: Wave, step: &Step, lock_gfx11_stores: bool) -> StepHw {
     let inst = step.inst;
     let eff = &inst.effects;
     // A MUBUF access with neither OFFEN nor IDXEN (`off`) ignores VADDR, but the decoder still yields the encoded
@@ -123,10 +123,10 @@ pub(super) fn build_step_hw(arch: Arch, step: &Step, lock_gfx11_stores: bool) ->
         if Some(idx) == skip {
             None
         } else {
-            operand_register(arch, Wave::Wave32, inst, idx)
+            operand_register(arch, wave, inst, idx)
         }
     };
-    let skipped: Option<RegRef> = skip.and_then(|i| operand_register(arch, Wave::Wave32, inst, i));
+    let skipped: Option<RegRef> = skip.and_then(|i| operand_register(arch, wave, inst, i));
     let mut masks: Vec<(Kind, u16, u32)> = Vec::new();
     let mut explicit: Vec<(Kind, u16)> = Vec::new();
     for idx in 0..inst.operands.len() {
@@ -151,7 +151,7 @@ pub(super) fn build_step_hw(arch: Arch, step: &Step, lock_gfx11_stores: bool) ->
     };
     let mut touch: Vec<Touch> = Vec::new();
     // The tables reserve 64-bit lane-mask slots even in wave32 (`operand_register`): an effect register that starts at
-    // an explicit operand takes that operand's real width, or `v_add_co_u32 v, s1, ...` would "write" s2 as well.
+    // an explicit operand takes that operand's real width (`wave` decides it: one SGPR in wave32, a pair in wave64), or `v_add_co_u32 v, s1, ...` would "write" s2 as well.
     let exact: Vec<RegRef> = (0..inst.operands.len()).filter_map(operand_reg).collect();
     let fit = |r: &RegRef| -> RegRef {
         match exact.iter().find(|e| e.kind == r.kind && e.base == r.base && e.len < r.len) {
@@ -255,8 +255,8 @@ struct RegWrite {
     kind: Kind,
     reg: u16,
     mask: u32,
-    lanes: u32,
-    vals: [u32; 32],
+    lanes: u64,
+    vals: [u32; 64],
 }
 struct Pending {
     pc: usize,
@@ -325,24 +325,24 @@ fn pending_counter(p: &Pending) -> &'static str {
         .map_or("a wait", |c| counter_name(*c))
 }
 
-fn read_dword(st: &State, kind: Kind, n: u16) -> [u32; 32] {
+fn read_dword(st: &State, kind: Kind, n: u16) -> [u32; 64] {
     match kind {
         Kind::V => {
-            let mut out = [0; 32];
-            for (lane, o) in out.iter_mut().enumerate() {
+            let mut out = [0; 64];
+            for (lane, o) in out.iter_mut().enumerate().take(st.lanes) {
                 *o = st.v[usize::from(n)][lane];
             }
             out
         }
-        Kind::S => [st.s[usize::from(n)]; 32],
-        Kind::Ttmp => [st.t[usize::from(n)]; 32],
+        Kind::S => [st.s[usize::from(n)]; 64],
+        Kind::Ttmp => [st.t[usize::from(n)]; 64],
     }
 }
-fn write_dword(st: &mut State, kind: Kind, n: u16, mask: u32, lanes: u32, vals: &[u32; 32]) {
+fn write_dword(st: &mut State, kind: Kind, n: u16, mask: u32, lanes: u64, vals: &[u32; 64]) {
     let n = usize::from(n);
     match kind {
         Kind::V => {
-            for lane in 0..32 {
+            for lane in 0..st.lanes {
                 if lanes >> lane & 1 != 0 {
                     let v = &mut st.v[n][lane];
                     *v = (*v & !mask) | (vals[lane] & mask);
@@ -538,7 +538,7 @@ impl<'a> Emulator<'a> {
         self.hw = Some(
             self.steps
                 .iter()
-                .map(|s| build_step_hw(arch, s, lock_gfx11_stores))
+                .map(|s| build_step_hw(arch, self.kernel.wave, s, lock_gfx11_stores))
                 .collect(),
         );
         self.strict_lds = true;
@@ -553,7 +553,7 @@ impl<'a> Emulator<'a> {
             .checked_mul(launch.block[1])
             .and_then(|n| n.checked_mul(launch.block[2]))
             .ok_or("block size overflow")? as usize)
-            .div_ceil(32);
+            .div_ceil(self.kernel.wave.lanes());
         let h = fnv(&[
             u64::from(launch.workgroup[0]),
             u64::from(launch.workgroup[1]),
@@ -629,7 +629,7 @@ impl<'a> Emulator<'a> {
         if n == 0 || n > 1024 {
             return Err("workgroup must contain 1..1024 threads".into());
         }
-        let nw = n.div_ceil(32);
+        let nw = n.div_ceil(kernel.wave.lanes());
         let states = (0..nw)
             .map(|w| State::new(self.arch, kernel, launch, w))
             .collect::<Result<Vec<_>>>()?;
@@ -829,7 +829,7 @@ impl<'a> Emulator<'a> {
         } = ctx;
         let inst = step.inst;
         log.clear();
-        let mut snap: Vec<(Kind, u16, [u32; 32])> = Vec::new();
+        let mut snap: Vec<(Kind, u16, [u32; 64])> = Vec::new();
         let exec = states[wave].exec;
         if let Some(m) = shw.mem.as_ref().filter(|m| m.load) {
             for r in &m.def_regs {
@@ -854,7 +854,7 @@ impl<'a> Emulator<'a> {
             let new = read_dword(&states[wave], kind, reg);
             let lanes = if kind == Kind::V { exec } else { 1 };
             // Restore only what the load changed (exec lanes of a VGPR; the one scalar).
-            write_dword(&mut states[wave], kind, reg, u32::MAX, u32::MAX, &old);
+            write_dword(&mut states[wave], kind, reg, u32::MAX, u64::MAX, &old);
             writes.push(RegWrite {
                 kind,
                 reg,

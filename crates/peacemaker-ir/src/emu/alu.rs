@@ -241,9 +241,20 @@ fn sgn(v: u32, abs: bool, neg: bool) -> u32 {
     }
 }
 
+/// Lanes `base..base + 32` strictly below `lane`, as a dword mask (`v_mbcnt_lo/hi_u32_b32`).
+fn mbcnt_below(lane: usize, base: usize) -> u32 {
+    if lane <= base {
+        0
+    } else if lane >= base + 32 {
+        u32::MAX
+    } else {
+        (1u32 << (lane - base)) - 1
+    }
+}
+
 fn active(s: &State) -> impl Iterator<Item = usize> {
     let exec = s.exec;
-    (0..32).filter(move |lane| exec & (1 << lane) != 0)
+    (0..s.lanes).filter(move |lane| exec & (1u64 << lane) != 0)
 }
 
 pub(super) fn execute(arch: Arch, name: &str, i: &Inst, s: &mut State) -> Result<()> {
@@ -359,7 +370,7 @@ fn vopd(arch: Arch, x: &str, y: &str, split: usize, i: &Inst, s: &mut State) -> 
         }
         return Ok(());
     }
-    let mut out = [[0u32; 2]; 32];
+    let mut out = [[0u32; 2]; 64];
     for lane in active(s) {
         out[lane] = [
             dword(vector(arch, x, ox, i, s, lane, Src0::Plain)?)?,
@@ -394,16 +405,16 @@ fn add_carry(name: &str, i: &Inst, s: &mut State) -> Result<()> {
     } else if implicit_vcc {
         s.vcc
     } else {
-        s.read(&o[4], 0, 0)?
+        s.read_mask(&o[4])?
     };
-    let mut out = [0u32; 32];
-    let mut carry = 0u32;
+    let mut out = [0u32; 64];
+    let mut carry = 0u64;
     for lane in active(s) {
         let sum = u64::from(s.read(&o[a_idx], lane, 0)?)
             + u64::from(s.read(&o[b_idx], lane, 0)?)
-            + u64::from(cin >> lane & 1);
+            + (cin >> lane & 1);
         out[lane] = sum as u32;
-        carry |= ((sum >> 32) as u32) << lane;
+        carry |= (sum >> 32) << lane;
     }
     for lane in active(s) {
         s.put(&o[0], lane, 0, out[lane])?;
@@ -412,7 +423,7 @@ fn add_carry(name: &str, i: &Inst, s: &mut State) -> Result<()> {
         s.vcc = carry;
         Ok(())
     } else {
-        s.put(&o[1], 0, 0, carry)
+        s.put_mask(&o[1], carry)
     }
 }
 
@@ -430,14 +441,14 @@ fn readfirstlane(i: &Inst, s: &mut State) -> Result<()> {
 /// `v_readlane_b32 sdst, vsrc, lane`: reads the lane selected by the low five bits of the third
 /// operand whatever EXEC says.
 fn readlane(i: &Inst, s: &mut State) -> Result<()> {
-    let lane = (s.read(i.operands.get(2).ok_or("missing lane select")?, 0, 0)? & 31) as usize;
+    let lane = (s.read(i.operands.get(2).ok_or("missing lane select")?, 0, 0)? as usize) & (s.lanes - 1);
     let v = s.read(&i.operands[1], lane, 0)?;
     s.put(&i.operands[0], 0, 0, v)
 }
 
 /// `v_writelane_b32 vdst, ssrc, lane`: writes one lane of `vdst`, whatever EXEC says.
 fn writelane(i: &Inst, s: &mut State) -> Result<()> {
-    let lane = (s.read(i.operands.get(2).ok_or("missing lane select")?, 0, 0)? & 31) as usize;
+    let lane = (s.read(i.operands.get(2).ok_or("missing lane select")?, 0, 0)? as usize) & (s.lanes - 1);
     let v = s.read(&i.operands[1], 0, 0)?;
     s.put(&i.operands[0], lane, 0, v)
 }
@@ -526,7 +537,7 @@ fn lanes(arch: Arch, name: &str, i: &Inst, s: &mut State) -> Result<()> {
         return Ok(());
     }
     let fi = dpp_fi(i);
-    let mut vals: [Option<Val>; 32] = [None; 32];
+    let mut vals: [Option<Val>; 64] = [None; 64];
     for lane in active(s) {
         let d = match dpp {
             Some(d) => match dpp_plan(&d, fi, s, lane)? {
@@ -836,7 +847,7 @@ fn vector(
         "v_mov_b32" | "v_dual_mov_b32" => (Class::Int, raw(0)?),
         "v_cndmask_b32" | "v_dual_cndmask_b32" => {
             let mask = if o.len() > 3 {
-                s.read(&o[3], lane, 0)?
+                s.read_mask(&o[3])?
             } else {
                 s.vcc
             };
@@ -847,7 +858,12 @@ fn vector(
         // Lanes below this one set in the wave32 mask `src0`, plus `src1`.
         "v_mbcnt_lo_u32_b32" => (
             Class::Int,
-            raw(1)?.wrapping_add((raw(0)? & ((1u32 << lane) - 1)).count_ones()),
+            raw(1)?.wrapping_add((raw(0)? & mbcnt_below(lane, 0)).count_ones()),
+        ),
+        // Lanes 32.. below this one set in the upper dword of the wave64 mask (zero for every wave32 lane).
+        "v_mbcnt_hi_u32_b32" => (
+            Class::Int,
+            raw(1)?.wrapping_add((raw(0)? & mbcnt_below(lane, 32)).count_ones()),
         ),
         "v_sub_nc_u32" => (Class::Int, raw(0)?.wrapping_sub(raw(1)?)),
         "v_subrev_nc_u32" => (Class::Int, raw(1)?.wrapping_sub(raw(0)?)),
@@ -1574,7 +1590,7 @@ fn vector(
 
 fn cvt_pk_f32_fp8(arch: Arch, i: &Inst, s: &mut State) -> Result<()> {
     let o = &i.operands;
-    let mut out = [None; 32];
+    let mut out = [None; 64];
     for lane in active(s) {
         let h = half_src(s, &o[1], i, lane, 0)?;
         let mut pair = [0u32; 2];
@@ -1607,9 +1623,12 @@ fn permlane(name: &str, i: &Inst, s: &mut State) -> Result<()> {
     if m.abs | m.neg != 0 || m.omod != Omod::None || m.clamp || m.op_sel & 0b1100 != 0 {
         return Err(format!("{name}: abs/neg/omod/clamp and OPSEL[2]/OPSEL[3] are not modeled (only OPSEL[0]=FI, OPSEL[1]=BC)"));
     }
+    if s.lanes != 32 {
+        return Err(format!("{name}: permlane16 rows are modeled for wave32 only"));
+    }
     let sel = u64::from(s.read(&o[2], 0, 0)?) | (u64::from(s.read(&o[3], 0, 0)?) << 32);
     let cross = name == "v_permlanex16_b32";
-    let mut vals = [None; 32];
+    let mut vals = [None; 64];
     for lane in active(s) {
         let row = if cross { (lane ^ 16) & 16 } else { lane & 16 };
         let src = row | ((sel >> (4 * (lane & 15))) & 15) as usize;
@@ -1791,8 +1810,8 @@ fn div_scale_isa(s0: u32, s1: u32, s2: u32) -> Result<(u32, bool)> {
 fn div_scale(arch: Arch, i: &Inst, s: &mut State) -> Result<()> {
     let o = &i.operands;
     let m = &i.mods;
-    let mut out = [None; 32];
-    let mut vcc = 0u32;
+    let mut out = [None; 64];
+    let mut vcc = 0u64;
     for lane in active(s) {
         let src = |n: usize| -> Result<u32> {
             let v = sgn(
@@ -1821,7 +1840,7 @@ fn div_scale(arch: Arch, i: &Inst, s: &mut State) -> Result<()> {
             s.put(&o[0], lane, 0, v)?;
         }
     }
-    s.put(&o[1], 0, 0, vcc)
+    s.put_mask(&o[1], vcc)
 }
 
 /// `v_div_fixup_f32 D, S0 (quotient), S1 (denominator), S2 (numerator)`. The special-case chain is the ISA's
@@ -2023,7 +2042,7 @@ fn compare(name: &str, i: &Inst, s: &mut State) -> Result<()> {
         ));
     }
     let fi = dpp_fi(i);
-    let mut mask = 0u32;
+    let mut mask = 0u64;
     for lane in active(s) {
         let d = match dpp {
             Some(d) => match dpp_plan(&d, fi, s, lane)? {
@@ -2098,7 +2117,7 @@ fn compare(name: &str, i: &Inst, s: &mut State) -> Result<()> {
         s.exec = mask;
         Ok(())
     } else if o.len() >= 3 {
-        s.put(&o[0], 0, 0, mask)
+        s.put_mask(&o[0], mask)
     } else {
         s.vcc = mask;
         Ok(())
@@ -2230,7 +2249,7 @@ fn udiv_scalar_rcp(arch: Arch, i: &Inst, s: &mut State) -> Result<()> {
     if m.neg != 0 || m.abs != 0 || m.omod != Omod::None || m.clamp {
         return Err("v_s_rcp_f32: neg/abs/omod/clamp are not measured".into());
     }
-    if s.exec != u32::MAX {
+    if s.exec != s.lane_mask() {
         return Err("v_s_rcp_f32 with a partial EXEC is not measured".into());
     }
     let o = &i.operands;
@@ -2301,31 +2320,67 @@ fn scalar(name: &str, i: &Inst, s: &mut State) -> Result<()> {
         s.scc = value != 0;
         return Ok(());
     }
+    // SOP2 64-bit lane-mask logic: D = S0 op S1 over the whole mask (wave64: all 64 lanes), SCC = D != 0.
+    if matches!(name, "s_and_b64" | "s_or_b64" | "s_and_not1_b64") {
+        let a = s.read_wide(o.get(1).ok_or("missing scalar operand")?, 0, Wide::Unsigned)?;
+        let b = s.read_wide(o.get(2).ok_or("missing scalar operand")?, 0, Wide::Unsigned)?;
+        let value = match name {
+            "s_and_b64" => a & b,
+            "s_or_b64" => a | b,
+            _ => a & !b,
+        };
+        s.put_wide(o.first().ok_or("missing scalar operand")?, 0, value)?;
+        s.scc = value != 0;
+        return Ok(());
+    }
+    // SOP1 64-bit saveexec family: D = EXEC; EXEC = S0 op EXEC (`and_not1`: S0 & ~EXEC); SCC = EXEC != 0.
+    // S0 is captured first because native divergence masks alias the saved destination.
+    if matches!(name, "s_and_saveexec_b64" | "s_or_saveexec_b64" | "s_and_not1_saveexec_b64") {
+        let mask = s.read_wide(o.get(1).ok_or("missing scalar operand")?, 0, Wide::Unsigned)?;
+        let old = s.exec;
+        s.put_wide(o.first().ok_or("missing scalar operand")?, 0, old)?;
+        s.exec = match name {
+            "s_and_saveexec_b64" => old & mask,
+            "s_or_saveexec_b64" => mask | old,
+            _ => mask & !old,
+        } & s.lane_mask();
+        s.scc = s.exec != 0;
+        return Ok(());
+    }
     // gfx11 `s_and_not1_saveexec_b32` (= `s_andn2_saveexec_b32`): D = EXEC; EXEC = S0 & ~EXEC; SCC = EXEC != 0.
     if name == "s_and_not1_saveexec_b32" {
-        let mask = rd(s, 1)?;
+        if s.lanes != 32 {
+            return Err(format!("{name} is a wave32 instruction"));
+        }
+        let mask = u64::from(rd(s, 1)?);
         let old = s.exec;
-        s.put(o.first().ok_or("missing scalar operand")?, 0, 0, old)?;
-        s.exec = mask & !old;
+        s.put(o.first().ok_or("missing scalar operand")?, 0, 0, old as u32)?;
+        s.exec = mask & !old & 0xffff_ffff;
         s.scc = s.exec != 0;
         return Ok(());
     }
     // Save the old wave32 EXEC, then intersect EXEC with S0 and report nonempty EXEC.
     // Capture S0 first because native divergence masks can alias the saved destination.
     if name == "s_and_saveexec_b32" {
-        let mask = rd(s, 1)?;
+        if s.lanes != 32 {
+            return Err(format!("{name} is a wave32 instruction"));
+        }
+        let mask = u64::from(rd(s, 1)?);
         let old = s.exec;
-        s.put(o.first().ok_or("missing scalar operand")?, 0, 0, old)?;
+        s.put(o.first().ok_or("missing scalar operand")?, 0, 0, old as u32)?;
         s.exec = old & mask;
         s.scc = s.exec != 0;
         return Ok(());
     }
     // Save the old wave32 EXEC, then EXEC = S0 | EXEC and SCC = EXEC != 0 (RDNA3 ISA S_OR_SAVEEXEC_B32).
     if name == "s_or_saveexec_b32" {
-        let mask = rd(s, 1)?;
+        if s.lanes != 32 {
+            return Err(format!("{name} is a wave32 instruction"));
+        }
+        let mask = u64::from(rd(s, 1)?);
         let old = s.exec;
-        s.put(o.first().ok_or("missing scalar operand")?, 0, 0, old)?;
-        s.exec = mask | old;
+        s.put(o.first().ok_or("missing scalar operand")?, 0, 0, old as u32)?;
+        s.exec = (mask | old) & 0xffff_ffff;
         s.scc = s.exec != 0;
         return Ok(());
     }
@@ -2523,8 +2578,9 @@ mod tests {
         State {
             s: [0; 106],
             t: [0; 16],
-            v: Box::new([[0; 32]; 256]),
-            exec: u32::MAX,
+            v: Box::new([[0; 64]; 256]),
+            lanes: 32,
+            exec: 0xffff_ffff,
             vcc: 0,
             scc: false,
             m0: 0,
@@ -2812,7 +2868,7 @@ mod tests {
                         }
                         let i = insn_on(arch, name, ops);
                         let mut st = state();
-                        st.exec = exec;
+                        st.exec = u64::from(exec);
                         st.vcc = 0x8000_0001;
                         st.scc = true;
                         st.s[2] = 0xdead_beef;
@@ -2839,7 +2895,7 @@ mod tests {
                                 assert_eq!(st.vcc, 0x8000_0001);
                             }
                             Operand::Special(Special::VccLo) => {
-                                assert_eq!(st.vcc, carry);
+                                assert_eq!(st.vcc, u64::from(carry));
                                 assert_eq!(st.s[2], 0xdead_beef);
                             }
                             _ => {
@@ -2847,7 +2903,7 @@ mod tests {
                                 assert_eq!(st.s[2], 0xdead_beef);
                             }
                         }
-                        assert_eq!((st.exec, st.scc), (exec, true));
+                        assert_eq!((st.exec, st.scc), (u64::from(exec), true));
                     }
                 }
             }
@@ -2938,14 +2994,14 @@ mod tests {
                 for scc in [false, true] {
                     let i = insn_on(arch, "s_and_saveexec_b32", vec![sreg(2), sreg(2)]);
                     let mut st = state();
-                    st.exec = old;
+                    st.exec = u64::from(old);
                     st.vcc = 0x1234_5678;
                     st.scc = scc;
                     st.s[2] = mask;
                     st.s[3] = 0xdead_beef;
                     execute(arch, "s_and_saveexec_b32", &i, &mut st).unwrap();
                     assert_eq!(st.s[2], old, "{arch:?}");
-                    assert_eq!((st.exec, st.scc), (want, want != 0));
+                    assert_eq!((st.exec, st.scc), (u64::from(want), want != 0));
                     assert_eq!((st.vcc, st.s[3]), (0x1234_5678, 0xdead_beef));
                 }
             }
@@ -3258,7 +3314,7 @@ mod tests {
                     let mut i = base.clone();
                     apply(&mut i);
                     let mut st = fresh();
-                    st.exec = exec;
+                    st.exec = u64::from(exec);
                     let before = st.v[0];
                     assert!(
                         run(&i, &mut st).is_err(),
@@ -4324,7 +4380,7 @@ mod tests {
             load(&mut st);
             st.exec &= !(1 << 16); // lane 16 inactive: its D0 and VCC bit stay
             st.v[0][16] = 0xcafe_f00d;
-            st.vcc = u32::MAX;
+            st.vcc = 0xffff_ffff;
             st.scc = true;
             execute(arch, "v_div_scale_f32", &i, &mut st).unwrap();
             for (l, (_, want, _)) in rows.iter().enumerate() {
@@ -4338,7 +4394,7 @@ mod tests {
             assert_eq!(st.v[0][25], 0xdead_beef);
             assert_eq!(
                 st.vcc,
-                mask & !(1 << 16),
+                u64::from(mask & !(1u32 << 16)),
                 "{arch:?} VCC is overwritten by the predicate, inactive lanes read 0"
             );
             assert!(st.scc, "SCC is untouched");
@@ -4436,7 +4492,7 @@ mod tests {
                 execute(arch, "v_div_scale_f32", &i, &mut st).unwrap();
                 assert_eq!(
                     (st.v[0][0], st.vcc),
-                    (want, u32::from(flag)),
+                    (want, u64::from(flag)),
                     "{arch:?} {s0:#x} {s1:#x} {s2:#x}"
                 );
             }
@@ -4598,7 +4654,7 @@ mod tests {
         let fmas = |vcc: bool, [a, b, c]: [u32; 3]| {
             let mut st = state();
             st.exec = 1;
-            st.vcc = u32::from(vcc);
+            st.vcc = u64::from(vcc);
             (st.v[1][0], st.v[2][0], st.v[3][0]) = (a, b, c);
             execute(Arch::Gfx1201, "v_div_fmas_f32", &i, &mut st).unwrap();
             st.v[0][0]
@@ -5445,14 +5501,14 @@ mod tests {
     ) -> Result<(u32, u32, u32)> {
         let i = insn_on(arch, name, ops);
         let mut st = state();
-        st.exec = (1u64 << lanes.len()).wrapping_sub(1) as u32;
+        st.exec = (1u64 << lanes.len()).wrapping_sub(1) ;
         st.s[10] = u32::MAX;
-        st.vcc = u32::MAX;
+        st.vcc = 0xffff_ffff;
         for (lane, (a, b)) in lanes.iter().enumerate() {
             set64(&mut st, 4, lane, *a);
             set64(&mut st, 6, lane, *b);
         }
-        execute(arch, name, &i, &mut st).map(|_| (st.s[10], st.vcc, st.exec))
+        execute(arch, name, &i, &mut st).map(|_| (st.s[10], st.vcc as u32, st.exec as u32))
     }
 
     #[test]
@@ -5662,7 +5718,7 @@ mod tests {
             let mut st = state();
             st.exec = 1;
             st.s[10] = u32::MAX;
-            st.vcc = u32::MAX;
+            st.vcc = 0xffff_ffff;
             st.v[1][0] = a;
             st.v[2][0] = b;
             execute(arch, name, &i, &mut st).map(|_| (st.s[10], st.vcc, st.exec))
@@ -5737,7 +5793,7 @@ mod tests {
             let mut st = state();
             st.exec = 1;
             st.s[10] = u32::MAX;
-            st.vcc = u32::MAX;
+            st.vcc = 0xffff_ffff;
             (st.v[1][0], st.v[2][0]) = (a.to_bits(), b.to_bits());
             execute(arch, name, &i, &mut st).map(|_| (st.s[10], st.vcc, st.exec))
         };
@@ -5855,7 +5911,7 @@ mod tests {
         };
         let i = insn_on(arch, name, ops);
         let mut st = state();
-        st.exec = u32::MAX;
+        st.exec = 0xffff_ffff;
         st.s[1] = src;
         execute(arch, name, &i, &mut st).map(|_| st.s[0])
     }
@@ -6122,7 +6178,7 @@ mod tests {
         {
             st.v[1][lane] = x;
         }
-        st.vcc = u32::MAX;
+        st.vcc = 0xffff_ffff;
         execute(arch, "v_cmp_gt_f32_e32", &i, &mut st).unwrap();
         assert_eq!(
             st.vcc, 0b1000_0111,
