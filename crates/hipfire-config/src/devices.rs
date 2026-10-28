@@ -112,6 +112,16 @@ impl UncertifiedPlatform {
 pub const UNSAFE_WSL_REDLINE: &str = "HIPFIRE_UNSAFE_WSL_REDLINE";
 /// Process knob that admits VMM KV under WSL/ROCDXG; unsafe until certified.
 pub const UNSAFE_WSL_VMM_KV: &str = "HIPFIRE_UNSAFE_WSL_VMM_KV";
+/// Developer opt-in (default off) that admits Qwen4 (Flash-Next) VMM QSA
+/// context arenas and the VMM gather/split-KV workspace on exact gfx1100,
+/// where only gfx1151/gfx1201 are certified. Read by the Qwen4 VMM
+/// capability check and `Gpu::qsa_gather_vmm_capable`.
+pub const QWEN4_VMM_GFX1100: &str = "HIPFIRE_QWEN4_VMM_GFX1100";
+
+/// Whether [`QWEN4_VMM_GFX1100`] is `1` in this process.
+pub fn qwen4_vmm_gfx1100_optin() -> bool {
+    crate::developer_bool(QWEN4_VMM_GFX1100, false)
+}
 
 /// Why Redline PM4 (retained default or explicit backend) is refused on
 /// `platform`, or `None` when it may run. Native Windows has no ROCr, so no

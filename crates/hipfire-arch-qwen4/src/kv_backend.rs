@@ -63,10 +63,13 @@ const VMM_ARCHS: [&str; 2] = ["gfx1151", "gfx1201"];
 pub fn qwen4_vmm_refusal(gpu_arch: &str, vmm_runtime_available: bool) -> Option<String> {
     if cfg!(windows) {
         Some("Windows maps whole VMM reservations; Qwen4 QSA keeps legacy storage".to_string())
-    } else if !VMM_ARCHS.contains(&gpu_arch) {
+    } else if !VMM_ARCHS.contains(&gpu_arch)
+        && !(gpu_arch == "gfx1100" && hipfire_config::devices::qwen4_vmm_gfx1100_optin())
+    {
         Some(format!(
-            "Qwen4 VMM QSA state is certified only on {}, not {gpu_arch}",
-            VMM_ARCHS.join(", ")
+            "Qwen4 VMM QSA state is certified only on {}, not {gpu_arch} (gfx1100 opt-in: {}=1)",
+            VMM_ARCHS.join(", "),
+            hipfire_config::devices::QWEN4_VMM_GFX1100
         ))
     } else if let Some(reason) = hipfire_config::devices::vmm_kv_platform_refusal() {
         Some(reason)

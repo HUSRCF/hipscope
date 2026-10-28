@@ -4968,7 +4968,10 @@ impl Gpu {
     /// WSL without its unsafe override), and a runtime answering the VMM
     /// granularity query. Everything else keeps the legacy contiguous slot.
     pub(crate) fn qsa_gather_vmm_capable(&self) -> bool {
-        (self.arch_caps.is_gfx1151() || self.arch_caps.is_gfx1201())
+        (self.arch_caps.is_gfx1151()
+            || self.arch_caps.is_gfx1201()
+            || (self.arch_caps.is_gfx1100()
+                && hipfire_config::devices::qwen4_vmm_gfx1100_optin()))
             && hipfire_config::devices::vmm_kv_platform_refusal().is_none()
             && self.vmm_recommended_granularity().is_ok()
     }
