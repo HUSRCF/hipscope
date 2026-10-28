@@ -343,6 +343,34 @@ pub(super) fn execute_tracked(
         return Err("GDS not modeled".into());
     }
     let ops = &i.operands;
+    // `s_prefetch_data sbase, ioffset, soffset, len`: scalar L2 prefetch of (len + 1) * 128 bytes (len = the 5-bit imm
+    // in SDATA[4:0], word0 bits 10:6, kept as the honored `smem_len` field; LLVM: "prefetch (len+1)*128 bytes") at
+    // SGPR-pair base + SGPR soffset (u32, when not `null`) + the sign-extended 24-bit ioffset. No architectural effect
+    // and no counter (the table row has none): a no-op that is FAIL-CLOSED on the address. A prefetched range that
+    // does not lie inside ONE mapped (guarded) region is reported as an unmapped access: an unmapped prefetch is
+    // unsafe until proven otherwise. `s_prefetch_data_pc_rel` and `s_buffer_prefetch_data` have no table row (their
+    // base is the PC / a buffer SRD): the decoder refuses them.
+    if name == "s_prefetch_data" {
+        let mut addr = s.read64(ops.first().ok_or("s_prefetch_data: missing base")?, 0)?;
+        for op in &ops[1..] {
+            addr = match op {
+                Operand::Imm(ImmField::SmemOffset(k) | ImmField::SmemDisplacement(k)) => addr.wrapping_add_signed(i64::from(*k)),
+                Operand::Reg(_) => addr.wrapping_add(u64::from(s.read(op, 0, 0)?)),
+                _ => return Err(format!("s_prefetch_data: unexpected operand {op}")),
+            };
+        }
+        let lines = match &i.fields {
+            crate::inst::FormFields::Bits { honored, .. } => {
+                honored.iter().find(|f| f.name == "smem_len").map_or(0, |f| (f.value >> 6) as usize)
+            }
+            _ => 0,
+        } + 1;
+        let len = lines * 128;
+        return mem
+            .locate(addr, len)
+            .map(|_| ())
+            .map_err(|_| format!("s_prefetch_data: prefetched range {addr:#x}+{len} is not inside a mapped buffer (unmapped memory access)"));
+    }
     let n = width(name)?;
     if name.starts_with("s_load_") {
         let mut off = 0u64;
@@ -696,6 +724,59 @@ mod tests {
     }
     fn offen() -> Operand {
         Operand::Vmem(VmemToken::Offen)
+    }
+    /// `s_prefetch_data s[22:23], 0x0, null, 0` (F404C00B F8000000, as hipcc emits it): one 128-byte line at s[22:23] + offset.
+    /// In range it changes nothing (not even strict-read bookkeeping); a line that is not wholly inside one mapped region
+    /// is an unmapped-access error.
+    #[test]
+    fn prefetch_data_is_a_noop_in_range_and_refused_out_of_range() {
+        let (inst, n) = crate::codec::gfx12::decode(&[0xF404_C00B, 0xF800_0000]).unwrap();
+        assert_eq!(n, 2);
+        let name = crate::isa::lookup(Arch::Gfx1201, inst.op, inst.form).unwrap().name;
+        assert_eq!(name, "s_prefetch_data");
+        assert_eq!(crate::emu::semantic_class(name), Some("memory"));
+        let run = |base: u64, size: usize| {
+            let mut st = state();
+            st.s[22] = base as u32;
+            st.s[23] = (base >> 32) as u32;
+            let mut mem = Memory::default();
+            mem.map("buf".into(), 0x4000, vec![7u8; size]).unwrap();
+            mem.set_strict_read("buf").unwrap();
+            let before = st.s;
+            let r = execute(name, &inst, &mut st, &mut mem, &mut []);
+            assert_eq!(st.s, before, "no architectural effect");
+            assert_eq!(mem.regions[0].written.count(), 0);
+            r
+        };
+        assert!(run(0x4000, 128).is_ok(), "exact fit");
+        assert!(run(0x4000 + 64, 256).is_ok());
+        let e = run(0x4000 + 1, 128).unwrap_err();
+        assert!(e.contains("unmapped memory access") && e.contains("s_prefetch_data"), "{e}");
+        assert!(run(0x4000 - 8, 256).is_err(), "before the region");
+        assert!(run(0x9000, 256).is_err(), "nowhere");
+    }
+    /// `s_prefetch_data s[2:3], 0x0, s5, 3` (F404C0C1 0A000000: 4 lines = 512 B at s[2:3] + s5) and
+    /// `s_prefetch_data s[2:3], 0x10, null, 31` (F404C7C1 F8000010: 32 lines = 4096 B at s[2:3] + 0x10).
+    #[test]
+    fn prefetch_data_length_field_and_sgpr_soffset() {
+        let dec = |w: [u32; 2]| crate::codec::gfx12::decode(&w).unwrap().0;
+        let a = dec([0xF404_C0C1, 0x0A00_0000]);
+        let b = dec([0xF404_C7C1, 0xF800_0010]);
+        // the typed fields survive an encode round trip
+        for i in [&a, &b] {
+            assert_eq!(crate::codec::gfx12::encode_for(Arch::Gfx1201, i).unwrap().as_slice().len(), 2);
+        }
+        let run = |inst: &Inst, base: u64, s5: u32, size: usize| {
+            let mut st = state();
+            (st.s[2], st.s[3], st.s[5]) = (base as u32, (base >> 32) as u32, s5);
+            let mut mem = Memory::default();
+            mem.map("buf".into(), 0x4000, vec![0u8; size]).unwrap();
+            execute("s_prefetch_data", inst, &mut st, &mut mem, &mut [])
+        };
+        assert!(run(&a, 0x4000, 64, 64 + 512).is_ok());
+        assert!(run(&a, 0x4000, 64, 64 + 511).unwrap_err().contains("+512"), "one byte short");
+        assert!(run(&b, 0x4000, 0, 0x10 + 4096).is_ok());
+        assert!(run(&b, 0x4000, 0, 0x10 + 4095).unwrap_err().contains("+4096"));
     }
     // Captured raw SRDs (0x31004000) and offset-only/offen forms keep exact byte-bounds semantics.
     #[test]

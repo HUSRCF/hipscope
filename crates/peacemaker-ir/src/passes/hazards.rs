@@ -114,6 +114,11 @@ fn pipe_by_name(inst: &Inst, arch: Arch) -> Pipeline {
 /// (`global_*`, `scratch_*`, `flat_*`) are ignored, `s_sendmsg_rtn_*` is SOP1.
 fn llvm_pipe(inst: &Inst, arch: Arch) -> Pipeline {
     let name = inst.op.name(arch).unwrap_or("");
+    // Every SMEM-encoded instruction is `isSMRD` in LLVM, including the effect-less hints (`s_prefetch_data`): it
+    // clears the pending state instead of consuming an SGPR (it is not a SALU/VALU in the pass's classification).
+    if inst.form == crate::inst::Form::Smem && !name.starts_with("s_sendmsg_rtn") {
+        return Pipeline::Smem;
+    }
     match &inst.effects.mem {
         Some(mem) => match mem.class {
             MemClass::SmemLoad if name.starts_with("s_sendmsg_rtn") => Pipeline::Salu,
@@ -1090,6 +1095,7 @@ mod tests {
     const GLOBAL_LOAD: &[u32] = &[0xee05_007c, 0, 2]; // global_load_b32 v0, v[2:3], off
     const BUFFER_LOAD: &[u32] = &[0xc405_000c, 0x4080_1000, 1]; // buffer_load_b32 v0, v1, s[8:11], s12 offen
     const S_LOAD: &[u32] = &[0xf400_0000, 0xf800_0000]; // s_load_b32 s0, s[0:1], 0x0
+    const S_PREFETCH: &[u32] = &[0xf404_c00b, 0xf800_0000]; // s_prefetch_data s[22:23], 0x0, null, 0
     const SETPC_S45: &[u32] = &[0xbe80_4804]; // s_setpc_b64 s[4:5]
     const ENDPGM: &[u32] = &[0xbfb0_0000]; // s_endpgm
 
@@ -1232,6 +1238,8 @@ mod tests {
         );
         assert_eq!(tail(BUFFER_LOAD), vec![]);
         assert_eq!(tail(S_LOAD), vec![]);
+        // SMEM hints are `isSMRD` too: a prefetch consumes no pending SGPR write and clears the state.
+        assert_eq!(tail(S_PREFETCH), vec![]);
         // wave32 keeps the historic model where every VMEM/FLAT access clears.
         assert_eq!(
             gfx1201_missing(
