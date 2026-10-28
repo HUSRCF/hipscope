@@ -196,6 +196,57 @@ pub(crate) fn prefill_chunk_requested_from(
         .min(max_seq)
 }
 
+/// Flash-Next pipeline-parallel prefill chunk on gfx1201. Under PP the band
+/// pipeline needs several chunks in flight; the 16384-row compact default
+/// leaves a 32K prompt only 2-3 chunks, so smaller tiles fill it. Measured
+/// on 4x R9700 (PP4, packed mq4-xts, fresh processes, greedy), prefill tok/s
+/// at 16384 / 8192 / 4096 rows: 8K 4,838 / 6,039 / 6,709; 32K 6,953 / 14,026 /
+/// 16,657; 64K 13,445 / 16,735 / 18,260; 131K 15,194 / 17,444 / 17,885.
+/// Decode is unchanged (~54 tok/s). Numerics equal a single card at the same
+/// explicit chunk (`HIPFIRE_PREFILL_CHUNK_ROWS=4096`), which is also the
+/// gfx1201 Full-plan / EP default.
+pub const QWEN4_PP_PREFILL_CHUNK_ROWS_GFX1201: usize = 4096;
+
+/// [`qwen4_prefill_chunk_requested`] for a pipeline-parallel band or mesh:
+/// an explicit `HIPFIRE_PREFILL_CHUNK_ROWS` wins, else
+/// [`QWEN4_PP_PREFILL_CHUNK_ROWS_GFX1201`] on gfx1201, else the single-card
+/// default; never above `max_seq`. Every PP call site must use this so bands
+/// and the mesh agree on one chunk.
+pub fn qwen4_pp_prefill_chunk_requested(
+    gpu: &Gpu,
+    max_seq: usize,
+    mode: Qwen4ForwardScratchMode,
+) -> usize {
+    pp_prefill_chunk_requested_from(
+        &gpu.arch,
+        hipfire_config::developer_var(QWEN4_PREFILL_CHUNK_ROWS_ENV)
+            .ok()
+            .as_deref(),
+        max_seq,
+        mode,
+        || crate::host_link::host_link(gpu),
+    )
+}
+
+/// [`qwen4_pp_prefill_chunk_requested`] with the env value and host link supplied.
+pub(crate) fn pp_prefill_chunk_requested_from(
+    arch: &str,
+    env: Option<&str>,
+    max_seq: usize,
+    mode: Qwen4ForwardScratchMode,
+    link: impl FnOnce() -> crate::host_link::HostLink,
+) -> usize {
+    explicit_prefill_chunk_rows(env)
+        .unwrap_or_else(|| {
+            if arch == "gfx1201" {
+                QWEN4_PP_PREFILL_CHUNK_ROWS_GFX1201
+            } else {
+                qwen4_prefill_chunk_default(arch, mode, link)
+            }
+        })
+        .min(max_seq)
+}
+
 /// Chunk rungs admission tries, largest first: `requested`, then each
 /// smaller default rung (8192, 4096, 2048) down to 1536 (or `requested`
 /// itself when smaller).
@@ -15430,6 +15481,35 @@ mod tests {
             qwen4_prefill_chunk_rungs(16384).collect::<Vec<_>>(),
             [16384, 8192, 4096, 2048, 1536]
         );
+    }
+
+    #[test]
+    fn pp_prefill_chunk_is_4096_on_gfx1201_and_otherwise_the_single_card_default() {
+        use super::Qwen4ForwardScratchMode::{FnSymGfx1201, Full};
+        use super::{pp_prefill_chunk_requested_from as pp, prefill_chunk_requested_from};
+        use crate::host_link::HostLink::Unmeasured;
+        let probe = || unreachable!("probed");
+        // Both scratch plans pipeline 4096-row chunks under PP.
+        assert_eq!(pp("gfx1201", None, usize::MAX, FnSymGfx1201, probe), 4096);
+        assert_eq!(pp("gfx1201", None, usize::MAX, Full, probe), 4096);
+        // Explicit env wins, rounded to whole 256-row tiles.
+        assert_eq!(
+            pp("gfx1201", Some("16384"), usize::MAX, FnSymGfx1201, probe),
+            16384
+        );
+        assert_eq!(pp("gfx1201", Some("5000"), usize::MAX, Full, probe), 4864);
+        // Capped at max_seq.
+        assert_eq!(pp("gfx1201", None, 2048, Full, probe), 2048);
+        assert_eq!(pp("gfx1201", Some("16384"), 8192, Full, probe), 8192);
+        // Other arches keep the single-card default.
+        for arch in ["gfx1100", "gfx1151"] {
+            for mode in [FnSymGfx1201, Full] {
+                assert_eq!(
+                    pp(arch, None, usize::MAX, mode, || Unmeasured),
+                    prefill_chunk_requested_from(arch, None, usize::MAX, mode, || Unmeasured),
+                );
+            }
+        }
     }
 
     #[test]

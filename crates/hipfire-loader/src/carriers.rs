@@ -4562,13 +4562,24 @@ fn load_qwen4_rank_scoped(
     // device is classified without a copy) and is 8192 only on a narrow
     // discrete link, so the placement cedes resident layers for the wider
     // chunk there. On gfx1201 the default follows the load's scratch plan
-    // (16384 rows under the compact plan, 4096 under `Full`). Every other
+    // (16384 rows under the compact plan, 4096 under `Full`). Under pipeline
+    // parallelism (`band.is_some()`) gfx1201 defaults to 4096 rows so the
+    // band pipeline fills; the PP mesh planner uses the same function and
+    // bands refuse a chunk that differs from the mesh chunk. Every other
     // arch and any explicit value never probes.
-    let placement_chunk = hipfire_arch_qwen4::gpu_forward::qwen4_prefill_chunk_requested(
-        &*ctx.gpu,
-        ctx.max_seq,
-        scratch_mode,
-    );
+    let placement_chunk = if band.is_some() {
+        hipfire_arch_qwen4::gpu_forward::qwen4_pp_prefill_chunk_requested(
+            &*ctx.gpu,
+            ctx.max_seq,
+            scratch_mode,
+        )
+    } else {
+        hipfire_arch_qwen4::gpu_forward::qwen4_prefill_chunk_requested(
+            &*ctx.gpu,
+            ctx.max_seq,
+            scratch_mode,
+        )
+    };
     // Freeze the original capacity inputs before placement, materialization or
     // capture growth. Pool readings are separate instants, not a free-memory
     // delta and not evidence of an old model's original preload basis.
@@ -7500,7 +7511,7 @@ fn load_qwen4_pp_bundle(
             q4::artifact::source_forward_scratch_mode(daemon, hfq, &config, &receipt.manifest)
                 .map_err(|error| error.to_string())?;
         let chunk_rows =
-            q4::gpu_forward::qwen4_prefill_chunk_requested(daemon, shared.max_seq, scratch_mode);
+            q4::gpu_forward::qwen4_pp_prefill_chunk_requested(daemon, shared.max_seq, scratch_mode);
         let context = q4::Qwen4ContextCommit::new(
             shared.backend,
             shared.max_seq,

@@ -898,6 +898,21 @@ whose free VRAM cannot hold it refuses instead of shrinking it.
 
 - **AR decode** and **pipelined prefill**: a prompt is cut into canonical chunks
   that flow through the bands in order; only the last chunk computes the head.
+  **gfx1201 prefill chunk:** under PP the canonical chunk defaults to **4096
+  rows** (a single card stays at 16384 rows under the compact plan), so a 32K
+  prompt is eight chunks in flight instead of two or three and the band pipeline
+  fills. An explicit `HIPFIRE_PREFILL_CHUNK_ROWS` wins (`=16384` restores the
+  previous chunk); the bands and the mesh planner share one chunk. Output equals a
+  single-card run at the same chunk. Decode is unchanged (~54 tok/s). Measured
+  2026-10-28, 4x R9700 (PP4), packed mq4-xts, beta c7c44097cc + explicit chunk
+  env, greedy, one fresh process per arm:
+
+  | Prefill tok/s | 16384 rows (old default) | 8192 rows | 4096 rows (new default) |
+  |---|---:|---:|---:|
+  | 8K | 4,838 | 6,039 | 6,709 |
+  | 32K | 6,953 | 14,026 | 16,657 |
+  | 64K | 13,445 | 16,735 | 18,260 |
+  | 131K | 15,194 | 17,444 | 17,885 |
 - **Per-band sessions**: every band attaches its own in-memory session cache
   (`memory.session_cache_bytes`, an independent opportunistic budget per band, see
   [`env-vars.md`](env-vars.md)); only client-committed all-band snapshots are
