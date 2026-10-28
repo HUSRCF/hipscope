@@ -375,7 +375,8 @@ struct MoeStepStats {
     /// DN activation-prep/metadata vs Rayon decode-and-dot execution split.
     dn_prep_ns: u64,
     dn_exec_ns: u64,
-    /// CPU middle split: gather vs SiLU vs FWHT across the per-token loop.
+    /// CPU middle split: gather vs SiLU vs FWHT, summed worker time across the
+    /// slot-parallel middle region (may exceed `middle_ns`).
     middle_gather_ns: u64,
     middle_silu_ns: u64,
     middle_fwht_ns: u64,
@@ -835,7 +836,6 @@ struct MoeScratch {
     gu: Vec<f32>,
     hidden: Vec<f32>,
     dn: Vec<f32>,
-    gather: Vec<f32>,
     /// Slots in first-seen group order: group `g` owns
     /// `order[group_start[g]..group_start[g+1]]`.
     order: Vec<u32>,
@@ -859,7 +859,6 @@ thread_local! {
             gu: Vec::new(),
             hidden: Vec::new(),
             dn: Vec::new(),
-            gather: Vec::new(),
             order: Vec::new(),
             group_start: Vec::new(),
             group_id: Vec::new(),
@@ -1445,7 +1444,6 @@ fn moe_slots_compute(
     // bytes are read once for all of that expert's tokens.
     scratch.gu.resize(2 * mi * slots, 0.0);
     scratch.hidden.resize(mi * slots, 0.0);
-    scratch.gather.resize(2 * mi, 0.0);
     scratch.dn.resize(dim * slots, 0.0);
     scratch.group_off.resize(groups + 1, 0);
     fill_group_off(&scratch.group_start, &mut scratch.group_off, 2 * mi);
@@ -1480,30 +1478,52 @@ fn moe_slots_compute(
     if let Some(t) = trace.as_mut().map(|t| &mut **t) {
         t.middle_start_ns = t.offset_ns(t_middle);
     }
-    let mut gather_ns: u64 = 0;
-    let mut silu_ns: u64 = 0;
-    let mut fwht_ns: u64 = 0;
+    // Slot-parallel: every slot's gather -> SiLU -> BF16 -> FWHT touches only its
+    // own `hidden` row and reads `gu` (written before this region), so the slots
+    // are independent and the result is byte-identical to the serial loop. The
+    // sub-phase counters are summed worker time (they can exceed `middle_ns`).
+    let gather_ns = AtomicU64::new(0);
+    let silu_ns = AtomicU64::new(0);
+    let fwht_ns = AtomicU64::new(0);
     {
         let gu = &scratch.gu[..2 * mi * slots];
-        let hidden = &mut scratch.hidden[..mi * slots];
-        let gather = &mut scratch.gather[..2 * mi];
-        for gi in 0..groups {
-            let n = group_n(&scratch.group_start, gi);
-            let base = scratch.group_off[gi];
-            let first = scratch.order[scratch.group_start[gi] as usize] as usize;
-            let down_rotation = experts[first].down_quant.input_rotation();
-            let rotate = down_rotation != InputRotation::None;
-            for si in 0..n {
-                let s = scratch.order[scratch.group_start[gi] as usize + si] as usize;
-                let t_gather = Instant::now();
-                for (r, g) in gather.iter_mut().enumerate() {
-                    let v = gu[base + r * n + si];
-                    *g = if bf16_round_trip { bf16_rt(v) } else { v };
+        let (order, group_start, group_off) =
+            (&scratch.order, &scratch.group_start, &scratch.group_off);
+        let (slot_group, slot_si) = (&scratch.slot_group, &scratch.slot_si);
+        hipfire_cpu::splice_pool::par_for_each_chunk_mut(
+            &mut scratch.hidden[..mi * slots],
+            mi,
+            |s, hid| {
+                let gi = slot_group[s] as usize;
+                let si = slot_si[s] as usize;
+                let n = group_n(group_start, gi);
+                let base = group_off[gi];
+                let first = order[group_start[gi] as usize] as usize;
+                let down_rotation = experts[first].down_quant.input_rotation();
+                // Gate/up are gathered into a stack buffer one `MIDDLE_CHUNK`-wide
+                // column block at a time (a whole slot for every real shape);
+                // SiLU is elementwise, so chunking changes no bit.
+                let mut buf = [0.0f32; 2 * MIDDLE_CHUNK];
+                let (mut gather_t, mut silu_t) = (0u64, 0u64);
+                let mut j0 = 0;
+                while j0 < mi {
+                    let c = (mi - j0).min(MIDDLE_CHUNK);
+                    let t_gather = Instant::now();
+                    for j in 0..c {
+                        let (g, u) = (
+                            gu[base + (j0 + j) * n + si],
+                            gu[base + (mi + j0 + j) * n + si],
+                        );
+                        buf[j] = if bf16_round_trip { bf16_rt(g) } else { g };
+                        buf[c + j] = if bf16_round_trip { bf16_rt(u) } else { u };
+                    }
+                    gather_t += elapsed_ns(t_gather);
+                    let t_silu = Instant::now();
+                    silu_mul(&buf[..2 * c], &mut hid[j0..j0 + c]);
+                    silu_t += elapsed_ns(t_silu);
+                    j0 += c;
                 }
-                gather_ns += t_gather.elapsed().as_nanos() as u64;
-                let hid = &mut hidden[s * mi..(s + 1) * mi];
                 let t_silu = Instant::now();
-                silu_mul(gather, hid);
                 if bf16_round_trip {
                     // The activated hidden is stored BF16 before the FWHT; the
                     // rotated output below stays f32.
@@ -1511,18 +1531,24 @@ fn moe_slots_compute(
                         *h = bf16_rt(*h);
                     }
                 }
-                silu_ns += t_silu.elapsed().as_nanos() as u64;
-                if rotate {
+                gather_ns.fetch_add(gather_t, Ordering::Relaxed);
+                silu_ns.fetch_add(silu_t + elapsed_ns(t_silu), Ordering::Relaxed);
+                if down_rotation != InputRotation::None {
                     let t_fwht = Instant::now();
                     match down_rotation {
                         InputRotation::FwhtG128V2 => rotate_x_128_v2(hid),
                         _ => rotate_x(hid),
                     }
-                    fwht_ns += t_fwht.elapsed().as_nanos() as u64;
+                    fwht_ns.fetch_add(elapsed_ns(t_fwht), Ordering::Relaxed);
                 }
-            }
-        }
+            },
+        );
     }
+    let (gather_ns, silu_ns, fwht_ns) = (
+        gather_ns.into_inner(),
+        silu_ns.into_inner(),
+        fwht_ns.into_inner(),
+    );
     if let Some(t) = trace.as_mut().map(|t| &mut **t) {
         t.middle_end_ns = t.offset_ns(Instant::now());
     }
@@ -1749,7 +1775,6 @@ pub fn reserve_moe_cpu_host_slot_scratch(
         reserve_to(&mut s.gu, gu);
         reserve_to(&mut s.hidden, hid);
         reserve_to(&mut s.dn, dn);
-        reserve_to(&mut s.gather, 2 * mi);
         reserve_to(&mut s.order, max_slots);
         reserve_to(&mut s.group_start, max_slots + 1);
         reserve_to(&mut s.group_id, max_slots);
@@ -1770,7 +1795,7 @@ pub fn reserve_moe_cpu_host_slot_scratch(
 /// slot: `2*mi` gu + `mi` hidden + `dim` dn elements, one
 /// `order`/`group_id`/`slot_group`/`slot_si` entry each, one
 /// `group_start`/`group_off` entry each (the `+1` trailing offset is covered
-/// by the same reservation), and a `2*mi`-element `gather` shared across slots.
+/// by the same reservation).
 /// Pure reader: no allocation, no growth, no mutation; `0` when `dim/mi/top_k`
 /// is zero, when any stride divides nothing, when `top_k` exceeds the slot
 /// minimum, or when the thread holds no reservation yet; `usize::MAX` is never
@@ -1791,10 +1816,6 @@ pub fn moe_cpu_host_slot_scratch_capacity_rows(dim: usize, mi: usize, top_k: usi
         slots = slots.min(s.gu.capacity() / stride_2mi);
         slots = slots.min(s.hidden.capacity() / mi);
         slots = slots.min(s.dn.capacity() / dim);
-        // Shared gather: must hold one full 2*mi row to run at all.
-        if s.gather.capacity() < stride_2mi {
-            return 0;
-        }
         // Per-slot index metadata: one entry per computed slot.
         slots = slots.min(s.order.capacity());
         slots = slots.min(s.group_id.capacity());
@@ -2121,6 +2142,9 @@ enum MoeProj {
 }
 
 /// Group `gi`'s member count from the prefix-summed `group_start`.
+/// Column block (gate/up pairs) the middle region gathers per step on its stack.
+const MIDDLE_CHUNK: usize = 2048;
+
 fn group_n(group_start: &[u32], gi: usize) -> usize {
     (group_start[gi + 1] - group_start[gi]) as usize
 }
@@ -3934,7 +3958,7 @@ mod moe_splice_tests {
         );
         assert_eq!(trace.gu_ns, trace.gu_prep_ns + trace.gu_exec_ns);
         assert_eq!(trace.dn_ns, trace.dn_prep_ns + trace.dn_exec_ns);
-        assert!(trace.gather_ns + trace.silu_ns + trace.fwht_ns <= trace.middle_ns);
+        assert!(trace.gather_ns + trace.silu_ns + trace.fwht_ns > 0);
         assert!(
             trace.group_ns + trace.gu_ns + trace.middle_ns + trace.dn_ns + trace.scatter_ns
                 <= trace.pool_body_ns
@@ -5364,7 +5388,6 @@ mod moe_splice_tests {
                     s.gu.capacity(),
                     s.hidden.capacity(),
                     s.dn.capacity(),
-                    s.gather.capacity(),
                     s.order.capacity(),
                     s.group_start.capacity(),
                     s.group_id.capacity(),
