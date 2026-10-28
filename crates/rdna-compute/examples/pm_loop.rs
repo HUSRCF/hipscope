@@ -9,6 +9,7 @@
 //! ```text
 //! pm_loop --kernel iu4_gemm|mq6_i8_gemm|fp8_gemm|fa_prefill|qwen4_moe_sym|qwen4_moe_verify --shape <S> [kernel knobs]
 //!         [--arch gfx1201|gfx1151|gfx1100] [--base-<knob> V ...] [--rip FILE.rip] [--time N] [--rounds R]
+//!         [--cand-object FILE: qwen4_moe_sym --arch gfx1100 only, a prebuilt candidate object]
 //!         [--max-rounds R] [--time-budget-s S] [--min-effect F] [--emu] [--offline] [--out DIR]
 //!         [--null-control aa] [--noise-floor FILE]
 //!         (--offline: stop after step 2 below, no device opened, record `offline: true`; the
@@ -125,6 +126,14 @@
 //! candidate_sha256, note}` and the candidate's M7 is the baseline's (`reused_from:
 //! "baseline"`). `--rip` is refused for chains.
 //!
+//! Route judge (`--kernel qwen4_moe_route --arch gfx1100`, `pm_loop/moe_route.rs`; `--offline` plans
+//! the launches and certifies the candidate's shipped PM bundles without a device): baseline = the
+//! shipped F16 grouped WMMA routed-MoE route of an S1 window, candidate = the symmetric-IU4 PM chain
+//! (`HIPFIRE_QWEN4_MOE_SYM_IU4=1`), the production panel schedule over one synthetic route. No
+//! identity gate (A4 vs F16); the record carries per-stage times, the ABBA chain ratio and the
+//! numeric distance of the two routes. `--rip`, `--emu` are refused; `--null-control aa` runs the
+//! baseline chain as the candidate and requires bit identity.
+//!
 //! Exit status: 0 ok; 1 correctness failure (record still printed); 3 the
 //! candidate could not be emitted/certified/launched (record printed with the
 //! error); 2 usage error.
@@ -168,6 +177,8 @@ mod gdn;
 mod iu4;
 #[path = "pm_loop/moe.rs"]
 mod moe;
+#[path = "pm_loop/moe_route.rs"]
+mod moe_route;
 #[path = "pm_loop/moe_verify.rs"]
 mod moe_verify;
 #[path = "pm_loop/moe_verify_iu4.rs"]
@@ -193,8 +204,9 @@ const SCHEMA: u32 = 1;
 const CHAIN_KERNEL: &str = "qwen4_moe_verify";
 /// `--arch` values.
 const ARCHES: [&str; 3] = ["gfx1201", "gfx1151", "gfx1100"];
-/// Kernels that accept an `--arch` other than gfx1201.
-const TRI_ARCH_KERNELS: [&str; 2] = ["qwen4_moe_sym", "qwen4_moe_verify"];
+/// Kernels that accept an `--arch` other than gfx1201 (`qwen4_moe_route` only gfx1100, enforced by
+/// `moe_route::check_cli`).
+const TRI_ARCH_KERNELS: [&str; 3] = ["qwen4_moe_sym", "qwen4_moe_verify", "qwen4_moe_route"];
 const DEFAULT_TIME: usize = 50;
 const DEFAULT_ROUNDS: usize = 6;
 const DEFAULT_MAX_ROUNDS: usize = 256;
@@ -237,6 +249,10 @@ struct Opts {
     out: Option<PathBuf>,
     /// `--rip FILE`: candidate compiled from a `.rip` source (iu4_gemm only).
     rip: Option<PathBuf>,
+    /// `--cand-object FILE`: a prebuilt code object used as the candidate instead of the emit
+    /// (`--kernel qwen4_moe_sym --arch gfx1100` only; built from a candidate copy of the gfx11 NT1
+    /// module by the standalone emitter project, `pm-krsi-1100/emit`).
+    cand_object: Option<PathBuf>,
     /// `--null-control aa`: time the baseline object against a clone of itself.
     null_control: bool,
     /// `--noise-floor FILE`: a `pm-census noise` document.
@@ -249,7 +265,7 @@ struct Opts {
 }
 
 const DRIVER_FLAGS: &str =
-    "--kernel K --shape S [--arch gfx1201|gfx1151|gfx1100] [--time N] [--rounds R] [--max-rounds R] [--time-budget-s S] [--min-effect F] [--emu] [--offline] [--out DIR] [--rip FILE.rip] [--null-control aa] [--noise-floor FILE] [--<knob> V]... [--base-<knob> V]...";
+    "--kernel K --shape S [--arch gfx1201|gfx1151|gfx1100] [--time N] [--rounds R] [--max-rounds R] [--time-budget-s S] [--min-effect F] [--emu] [--offline] [--out DIR] [--rip FILE.rip] [--cand-object FILE] [--null-control aa] [--noise-floor FILE] [--<knob> V]... [--base-<knob> V]...";
 
 fn parse_args(mut a: impl Iterator<Item = String>) -> Result<Opts> {
     let mut o = Opts {
@@ -264,6 +280,7 @@ fn parse_args(mut a: impl Iterator<Item = String>) -> Result<Opts> {
         emu: false,
         out: None,
         rip: None,
+        cand_object: None,
         null_control: false,
         noise_floor: None,
         noise_floor_doc: None,
@@ -322,6 +339,7 @@ fn parse_args(mut a: impl Iterator<Item = String>) -> Result<Opts> {
             }
             "out" => o.out = Some(PathBuf::from(value)),
             "rip" => o.rip = Some(PathBuf::from(value)),
+            "cand-object" => o.cand_object = Some(PathBuf::from(value)),
             "null-control" => {
                 if value != "aa" {
                     return Err(format!(
@@ -340,6 +358,9 @@ fn parse_args(mut a: impl Iterator<Item = String>) -> Result<Opts> {
     }
     if o.kernel.is_empty() {
         return Err(format!("missing --kernel (usage: {DRIVER_FLAGS})"));
+    }
+    if o.kernel == moe_route::KERNEL {
+        moe_route::check_cli(o.arch, o.emu)?;
     }
     if o.arch != ARCHES[0] && !TRI_ARCH_KERNELS.contains(&o.kernel.as_str()) {
         return Err(format!(
@@ -374,6 +395,23 @@ fn parse_args(mut a: impl Iterator<Item = String>) -> Result<Opts> {
             "--rip is only supported with --kernel iu4_gemm, mq6_i8_gemm, fp8_gemm, fa_prefill, qwen4_moe_sym, iu4_c8_producer_pm, moe_rotate_i4_pm or gdn_chunk_prep_pm: only those generators are exposed to .rip so far (got --kernel {})",
             o.kernel
         ));
+    }
+    if o.cand_object.is_some() {
+        if o.kernel != "qwen4_moe_sym" || o.arch != "gfx1100" {
+            return Err(format!(
+                "--cand-object is only supported with --kernel qwen4_moe_sym --arch gfx1100 (got --kernel {} --arch {})",
+                o.kernel, o.arch
+            ));
+        }
+        if o.rip.is_some() {
+            return Err("--cand-object cannot be combined with --rip (two candidate sources)".into());
+        }
+        if o.null_control {
+            return Err(
+                "--null-control aa cannot be combined with --cand-object (no candidate is emitted)"
+                    .into(),
+            );
+        }
     }
     if o.null_control {
         if o.rip.is_some() {
@@ -421,9 +459,13 @@ fn build_workload(o: &mut Opts) -> Result<Box<dyn Workload>> {
         "mq6_i8_gemm" => mq6::new(&shape, &mut knobs, o.rip.as_deref())?,
         "fp8_gemm" => fp8::new(&shape, &mut knobs, o.rip.as_deref())?,
         "fa_prefill" => fa::new(&shape, &mut knobs, o.rip.as_deref())?,
-        "qwen4_moe_sym" => {
-            moe::new_with_rip(&shape, &mut knobs, o.rip.as_deref(), arch_enum(o.arch)?)?
-        }
+        "qwen4_moe_sym" => moe::new_with_cand_object(
+            &shape,
+            &mut knobs,
+            o.rip.as_deref(),
+            arch_enum(o.arch)?,
+            o.cand_object.as_deref(),
+        )?,
         "iu4_c8_producer_pm" => c8::new_with_rip(&shape, &mut knobs, o.rip.as_deref())?,
         "moe_rotate_i4_pm" => rotate::new_with_rip(&shape, &mut knobs, o.rip.as_deref())?,
         "gdn_chunk_prep_pm" => gdn::new_with_rip(&shape, &mut knobs, o.rip.as_deref())?,
@@ -980,6 +1022,9 @@ fn crossover_json(t: &Value) -> Result<Value> {
 
 fn run(o: &mut Opts) -> (Value, Outcome) {
     let mut rec = json!({"schema": SCHEMA, "kernel": o.kernel, "arch": o.arch});
+    if o.kernel == moe_route::KERNEL {
+        return moe_route::run(o);
+    }
     if o.kernel == CHAIN_KERNEL {
         return match build_chain(o) {
             Ok(w) => run_chain(o, w),
@@ -1011,7 +1056,16 @@ fn run(o: &mut Opts) -> (Value, Outcome) {
     } else {
         match w.candidate() {
             Ok(c) => Some(c),
-            Err(e) => return fail(rec, if o.rip.is_some() { "rip" } else { "emit" }, e),
+            Err(e) => {
+                let stage = if o.rip.is_some() {
+                    "rip"
+                } else if o.cand_object.is_some() {
+                    "cand_object"
+                } else {
+                    "emit"
+                };
+                return fail(rec, stage, e);
+            }
         }
     };
     let base = match w.baseline() {
@@ -1568,6 +1622,24 @@ mod tests {
         let c = crossover_json(&json!({"noise": {"round_ratios": [1.0]}})).unwrap();
         assert!(c.get("crossover_ratio").is_none());
         assert!(crossover_json(&json!({})).is_err());
+    }
+
+    #[test]
+    fn cand_object_is_gfx1100_qwen4_moe_sym_only() {
+        let ok = "--kernel qwen4_moe_sym --arch gfx1100 --offline --cand-object /tmp/c.co";
+        let o = parse_args(args(ok)).unwrap();
+        assert_eq!(o.cand_object.as_deref(), Some(std::path::Path::new("/tmp/c.co")));
+        assert!(parse_args(args("--kernel qwen4_moe_sym")).unwrap().cand_object.is_none());
+        for bad in [
+            "--kernel qwen4_moe_sym --arch gfx1151 --cand-object /tmp/c.co",
+            "--kernel qwen4_moe_sym --cand-object /tmp/c.co",
+            "--kernel iu4_gemm --arch gfx1100 --cand-object /tmp/c.co",
+            "--kernel qwen4_moe_sym --arch gfx1100 --cand-object /tmp/c.co --rip /tmp/a.rip",
+            "--kernel qwen4_moe_sym --arch gfx1100 --cand-object /tmp/c.co --null-control aa",
+            "--kernel qwen4_moe_sym --arch gfx1100 --cand-object",
+        ] {
+            assert!(parse_args(args(bad)).is_err(), "{bad}");
+        }
     }
 
     #[test]

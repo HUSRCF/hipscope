@@ -46,6 +46,15 @@
 //! timed against the shipped baseline and reported as `identical_to_baseline: false`. The
 //! chains/prefetch/grouped axes of `R4Spec` stay private Rust experiments (`pm_r4_screen`).
 //!
+//! `--cand-object FILE` (`--arch gfx1100` only; `pm_loop.rs`): FILE is the candidate code object
+//! instead of the emit, e.g. `pm-krsi-1100/emit` builds a modified copy of
+//! `crates/peacemaker-isa/src/kernels/qwen4_moe_sym_gfx1100/` into `gate_up.co` / `down.co`
+//! (`tools/moe_check.sh`). It must expose the entry's symbol with the in-tree emit's ABI
+//! (kernarg layout, workgroup size, LDS, wave mode; refused otherwise, stage `cand_object`); M7,
+//! resources and `code_sha256` then run as for an emitted candidate (`candidate.cand_object`
+//! = `{path, sha256, variant, identical_to_generator}`) and the GPU path (identity vs shipped,
+//! CPU reference, timing) is unchanged.
+//!
 //! Correctness requires the candidate to be bitwise equal to the shipped baseline (every NT and
 //! `gp` entry is byte-identical to the others on the same activations) AND to pass the CPU
 //! reference below.
@@ -1369,6 +1378,8 @@ struct Moe {
     reference: OnceLock<Vec<(usize, Vec<u16>)>>,
     /// `--rip`: source path and text of the candidate script.
     rip: Option<(String, String)>,
+    /// `--cand-object`: path and bytes of the prebuilt candidate code object (gfx1100 only).
+    cand_object: Option<(String, Vec<u8>)>,
 }
 
 fn arm_index(arm: Arm) -> usize {
@@ -1632,21 +1643,89 @@ fn rip_object(entry: Entry, path: &str, source: &str) -> Result<Object> {
     })
 }
 
+/// A prebuilt candidate code object for `entry` (`--cand-object`; gfx1100 NT1, built by the
+/// standalone emitter of a candidate module copy): refused unless it exposes `entry`'s symbol with
+/// the ABI (kernarg layout, workgroup size, LDS, wave mode) of the in-tree Rust emit of that
+/// entry, so the launch contract, kernarg encoding and grid of the baseline arm stay valid. M7,
+/// resources and `code_sha256` then run on it exactly as on an emitted candidate.
+fn cand_object_object(entry: Entry, path: &str, bytes: &[u8]) -> Result<Object> {
+    let symbol = entry.symbol();
+    let generator = entry.emit()?;
+    let gen_elf = peacemaker_isa::native::assemble(&generator.s_text, entry.spec.arch)?;
+    let got = crate::iu4::abi_signature(bytes, &symbol)
+        .map_err(|e| format!("--cand-object {path}: not a code object exposing {symbol}: {e}"))?;
+    let want = crate::iu4::abi_signature(&gen_elf, &symbol)?;
+    if got != want {
+        return Err(format!(
+            "--cand-object {path}: ABI mismatch with the in-tree emit of {}:\n  object:    {got}\n  generator: {want}",
+            entry.variant()
+        ));
+    }
+    Ok(Object {
+        source: json!({
+            "source": format!("--cand-object {path} (prebuilt candidate code object)"),
+            "variant": entry.variant(),
+            "sha256": sha256_hex(bytes),
+        }),
+        desc: json!({
+            "knobs": spec_json(entry),
+            "cand_object": {
+                "path": path,
+                "sha256": sha256_hex(bytes),
+                "variant": entry.variant(),
+                "identical_to_generator": bytes == gen_elf.as_slice(),
+            },
+        }),
+        exports: vec![symbol.clone()],
+        launch_symbol: symbol,
+        bytes: bytes.to_vec(),
+    })
+}
+
 /// Constructor for `--kernel qwen4_moe_sym` without `--rip` (gfx1201).
 #[cfg(test)]
 pub fn new(shape: &str, knobs: &mut Knobs) -> Result<Box<dyn Workload>> {
     new_with_rip(shape, knobs, None, Arch::Gfx1201)
 }
 
-/// Constructor for `--kernel qwen4_moe_sym`; `rip` = `--rip FILE.rip` (every MQ4 entry); `arch` =
-/// gfx1201 (default), gfx1151 or gfx1100: the shipped baseline, candidate emit, R1 contract and
-/// geometry are all that arch's (see the module doc's `# Shipped baseline`).
+/// Test constructor: `--rip` only, no `--cand-object`.
+#[cfg(test)]
 pub fn new_with_rip(
     shape: &str,
     knobs: &mut Knobs,
     rip: Option<&std::path::Path>,
     arch: Arch,
 ) -> Result<Box<dyn Workload>> {
+    new_with_cand_object(shape, knobs, rip, arch, None)
+}
+
+/// Constructor for `--kernel qwen4_moe_sym`; `rip` = `--rip FILE.rip` (every MQ4 entry);
+/// `cand_object` = `--cand-object FILE` (a prebuilt candidate code object, gfx1100 only: read and
+/// ABI-checked against the in-tree emit of the entry by `candidate()`); `arch` =
+/// gfx1201 (default), gfx1151 or gfx1100: the shipped baseline, candidate emit, R1 contract and
+/// geometry are all that arch's (see the module doc's `# Shipped baseline`).
+pub fn new_with_cand_object(
+    shape: &str,
+    knobs: &mut Knobs,
+    rip: Option<&std::path::Path>,
+    arch: Arch,
+    cand_object: Option<&std::path::Path>,
+) -> Result<Box<dyn Workload>> {
+    let cand_object = match cand_object {
+        Some(p) => {
+            if arch != Arch::Gfx1100 {
+                return Err(format!(
+                    "--cand-object is supported on gfx1100 only (got {})",
+                    arch.name()
+                ));
+            }
+            Some((
+                p.display().to_string(),
+                std::fs::read(p).map_err(|e| format!("--cand-object {}: {e}", p.display()))?,
+            ))
+        }
+        None => None,
+    };
     abi_arch(arch)?;
     let rip = match rip {
         Some(p) => Some((
@@ -1693,6 +1772,7 @@ pub fn new_with_rip(
         dev: None,
         reference: OnceLock::new(),
         rip,
+        cand_object,
     }))
 }
 
@@ -2093,6 +2173,9 @@ impl Workload for Moe {
     }
 
     fn candidate(&self) -> Result<Object> {
+        if let Some((path, bytes)) = &self.cand_object {
+            return cand_object_object(self.cand, path, bytes);
+        }
         if let Some((path, text)) = &self.rip {
             return rip_object(self.cand, path, text);
         }
@@ -3250,6 +3333,47 @@ mod tests {
                 assert_eq!(l.block[0], e.spec.threads());
             }
         }
+    }
+
+    /// `--cand-object` (gfx1100): the emitted object round-trips (identical to the generator, the
+    /// same launch symbol/exports as an emitted candidate); garbage, a wrong-kind object and a
+    /// non-gfx1100 arch are refused before any launch.
+    #[test]
+    fn cand_object_is_checked_against_the_in_tree_emit() {
+        let dir = std::env::temp_dir().join(format!("pm_loop_cand_object_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let write = |name: &str, bytes: &[u8]| {
+            let p = dir.join(name);
+            std::fs::write(&p, bytes).unwrap();
+            p
+        };
+        let build = |epi: &str, path: &std::path::Path, arch: Arch| {
+            new_with_cand_object("fn,T=64", &mut knobs(&[("epi", epi)]), None, arch, Some(path))
+        };
+        for epi in ["gate_up", "down"] {
+            let e = Entry::parse(epi, Arch::Gfx1100).unwrap();
+            let emitted = emit_object(e, json!({})).unwrap();
+            let p = write(&format!("{epi}.co"), &emitted.bytes);
+            let c = build(epi, &p, Arch::Gfx1100).unwrap().candidate().unwrap();
+            assert_eq!(c.bytes, emitted.bytes, "{epi}");
+            assert_eq!(c.launch_symbol, emitted.launch_symbol, "{epi}");
+            assert_eq!(c.exports, emitted.exports, "{epi}");
+            assert_eq!(c.desc["cand_object"]["identical_to_generator"], true, "{epi}");
+            // The other kind's object does not expose this entry's symbol.
+            let other = if epi == "down" { "gate_up" } else { "down" };
+            let o = emit_object(Entry::parse(other, Arch::Gfx1100).unwrap(), json!({})).unwrap();
+            let po = write(&format!("{epi}_wrong.co"), &o.bytes);
+            let e = build(epi, &po, Arch::Gfx1100).unwrap().candidate().unwrap_err();
+            assert!(e.contains("--cand-object") && e.contains(&emitted.launch_symbol), "{e}");
+        }
+        let junk = write("junk.co", b"not an elf");
+        let e = build("gate_up", &junk, Arch::Gfx1100).unwrap().candidate().unwrap_err();
+        assert!(e.contains("--cand-object"), "{e}");
+        let e = build("gate_up", &dir.join("missing.co"), Arch::Gfx1100).err().unwrap();
+        assert!(e.contains("--cand-object") && e.contains("missing.co"), "{e}");
+        let e = build("gate_up", &junk, Arch::Gfx1151).err().unwrap();
+        assert!(e.contains("gfx1100 only"), "{e}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// An entry an arch has no shipped object for is refused naming the entry and the arch; so
