@@ -135,6 +135,17 @@ pub trait Node {
     fn emu_case(&self, _seed: u64) -> Result<EmuCase> {
         Err(format!("{}: no host-side emulator case", self.name()))
     }
+    /// Production-extent shapes (`--shape` strings of this node) the emulator gate also runs, sampled:
+    /// the judge shapes, plus the capacity extremes the node's addressing depends on.
+    fn extent_shapes(&self) -> Vec<String> {
+        Vec::new()
+    }
+    /// Which workgroup of a launch with header `hdr` (no header = production geometry) writes output
+    /// ELEMENT `e` (the output buffer is an array of 4-byte elements). GPU-free; the extent gate samples
+    /// workgroups of both arms and compares exactly the output elements they own.
+    fn out_owner<'a>(&'a self, _hdr: &Header) -> Result<Box<dyn Fn(usize) -> [u32; 3] + 'a>> {
+        Err(format!("{}: no output-owner map", self.name()))
+    }
 
     /// Allocate seeded valid inputs and the output; keep a pristine copy of
     /// every mutable output. Must be deterministic in `seed`.
@@ -442,4 +453,20 @@ pub fn tiled_geometry(
         block: [block as u32, 1, 1],
         lds: lds as u32,
     })
+}
+
+/// Tile sizes `(tile_m, tile_n)` of a tiled-GEMM launch from a header, read without consuming it
+/// (same keys and defaults as [`tiled_geometry`]).
+pub fn header_tiles(hdr: &Header, def_tile_m: usize, def_tile_n: usize) -> Result<(usize, usize)> {
+    let get = |k: &str, d: usize| -> Result<usize> {
+        match hdr.kv.get(k) {
+            Some(v) => v.parse::<usize>().map_err(|e| format!("hip_loop header {k}={v}: {e}")),
+            None => Ok(d),
+        }
+    };
+    let (m, n) = (get("tile_m", def_tile_m)?, get("tile_n", def_tile_n)?);
+    if m == 0 || n == 0 {
+        return Err("hip_loop header: tile_m/tile_n must be positive".into());
+    }
+    Ok((m, n))
 }

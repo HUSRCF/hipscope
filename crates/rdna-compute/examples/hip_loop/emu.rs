@@ -25,10 +25,11 @@
 #![allow(dead_code)]
 
 use crate::elf::sha256_hex;
-use crate::node::{EmuArg, EmuCase, Geometry, Result};
-use peacemaker_ir::emu::{Emulator, Launch, Memory};
+use crate::node::{EmuArg, EmuCase, Geometry, Result, Xs64};
+use peacemaker_ir::emu::{Emulator, Launch, Memory, WriteSet};
 use peacemaker_ir::inst::{Abi, Frontend};
 use serde_json::{json, Value};
+use std::collections::BTreeSet;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::time::Instant;
 
@@ -43,6 +44,8 @@ pub struct ArmRun {
     pub json: Value,
     /// Bytes of the output buffer the arm wrote.
     pub out_written: usize,
+    /// Which output bytes the arm wrote.
+    pub written: Option<WriteSet>,
 }
 
 /// An arm that failed, with the work done before it did.
@@ -130,13 +133,54 @@ fn lift(image: &[u8]) -> Result<(peacemaker_ir::Program, &'static str)> {
     Err(format!("lift refused the object ({})", errs.join("; ")))
 }
 
-/// Emulate every workgroup of `geo` for `symbol` in `image` on a fresh copy of `case`.
+/// Which workgroups of the launch grid an arm runs.
+pub enum WgSel<'a> {
+    All,
+    List(&'a [[u32; 3]]),
+}
+
+/// Emulate the selected workgroups of `geo` for `symbol` in `image` on `case`. The case's buffers are moved
+/// into the emulator's regions (no copy: large zero-filled caches stay untouched pages) and moved back
+/// afterwards, the output buffer reset to its pristine value, so the same case serves the next arm.
 pub fn run_arm(
     tag: &str,
     image: &[u8],
     symbol: &str,
     geo: &Geometry,
-    case: &EmuCase,
+    case: &mut EmuCase,
+    sel: &WgSel,
+) -> std::result::Result<ArmRun, ArmFail> {
+    let pristine = case.bufs[case.out].bytes.clone();
+    let mut mem = Memory::default();
+    let r = exec_arm(tag, image, symbol, geo, case, sel, &mut mem);
+    let mut taken = None;
+    for reg in std::mem::take(&mut mem.regions) {
+        if let Some(i) = case.bufs.iter().position(|b| b.name == reg.name) {
+            if i == case.out {
+                taken = Some((reg.bytes, reg.written));
+            } else {
+                case.bufs[i].bytes = reg.bytes;
+            }
+        }
+    }
+    case.bufs[case.out].bytes = pristine;
+    r.map(|mut run| {
+        if let Some((bytes, written)) = taken {
+            run.out = bytes;
+            run.written = Some(written);
+        }
+        run
+    })
+}
+
+fn exec_arm(
+    tag: &str,
+    image: &[u8],
+    symbol: &str,
+    geo: &Geometry,
+    case: &mut EmuCase,
+    sel: &WgSel,
+    mem: &mut Memory,
 ) -> std::result::Result<ArmRun, ArmFail> {
     let started = Instant::now();
     let mut info = json!({"tag": tag, "symbol": symbol, "object_sha256": sha256_hex(image)});
@@ -172,11 +216,11 @@ pub fn run_arm(
         .strict_lds()
         .gfx1100_as_gfx1151();
 
-    let mut mem = Memory::default();
     let mut addrs = Vec::with_capacity(case.bufs.len());
-    for b in &case.bufs {
+    for b in &mut case.bufs {
+        let bytes = std::mem::take(&mut b.bytes);
         addrs.push(
-            mem.map_guarded(b.name.to_owned(), b.bytes.clone(), GUARD_BYTES)
+            mem.map_guarded(b.name.to_owned(), bytes, GUARD_BYTES)
                 .map_err(|e| fail(format!("map {}: {e}", b.name), info.clone()))?,
         );
     }
@@ -192,44 +236,59 @@ pub fn run_arm(
         .map_guarded("kernarg".to_owned(), kern, GUARD_BYTES)
         .map_err(|e| fail(format!("map kernarg: {e}"), info.clone()))?;
 
-    let (mut instructions, mut workgroups) = (0u64, 0u64);
-    for z in 0..geo.grid[2] {
-        for y in 0..geo.grid[1] {
-            for x in 0..geo.grid[0] {
-                let launch = Launch {
-                    kernarg_ptr: kva,
-                    workgroup: [x, y, z],
-                    block: geo.block,
-                    dynamic_lds: geo.lds,
-                };
-                let r = catch_unwind(AssertUnwindSafe(|| emu.run_workgroup_counted(&launch, &mut mem)));
-                match r {
-                    Ok(Ok(n)) => {
-                        instructions += n;
-                        workgroups += 1;
-                    }
-                    Ok(Err(e)) => {
-                        return Err(ArmFail {
-                            reason: format!("workgroup ({x},{y},{z}): {e}"),
-                            instructions,
-                            workgroups,
-                            json: info,
-                        });
-                    }
-                    Err(p) => {
-                        let msg = p
-                            .downcast_ref::<String>()
-                            .cloned()
-                            .or_else(|| p.downcast_ref::<&str>().map(|s| (*s).to_owned()))
-                            .unwrap_or_default();
-                        return Err(ArmFail {
-                            reason: format!("workgroup ({x},{y},{z}): emulator panic: {msg}"),
-                            instructions,
-                            workgroups,
-                            json: info,
-                        });
+    let all: Vec<[u32; 3]>;
+    let list: &[[u32; 3]] = match sel {
+        WgSel::List(l) => l,
+        WgSel::All => {
+            let mut v = Vec::new();
+            for z in 0..geo.grid[2] {
+                for y in 0..geo.grid[1] {
+                    for x in 0..geo.grid[0] {
+                        v.push([x, y, z]);
                     }
                 }
+            }
+            all = v;
+            &all
+        }
+    };
+    let (mut instructions, mut workgroups) = (0u64, 0u64);
+    for &[x, y, z] in list {
+        if x >= geo.grid[0] || y >= geo.grid[1] || z >= geo.grid[2] {
+            return Err(ArmFail {
+                reason: format!("workgroup ({x},{y},{z}) is outside the grid {:?}", geo.grid),
+                instructions,
+                workgroups,
+                json: info,
+            });
+        }
+        let launch = Launch { kernarg_ptr: kva, workgroup: [x, y, z], block: geo.block, dynamic_lds: geo.lds };
+        let r = catch_unwind(AssertUnwindSafe(|| emu.run_workgroup_counted(&launch, mem)));
+        match r {
+            Ok(Ok(n)) => {
+                instructions += n;
+                workgroups += 1;
+            }
+            Ok(Err(e)) => {
+                return Err(ArmFail {
+                    reason: format!("workgroup ({x},{y},{z}): {e}"),
+                    instructions,
+                    workgroups,
+                    json: info,
+                });
+            }
+            Err(p) => {
+                let msg = p
+                    .downcast_ref::<String>()
+                    .cloned()
+                    .or_else(|| p.downcast_ref::<&str>().map(|s| (*s).to_owned()))
+                    .unwrap_or_default();
+                return Err(ArmFail {
+                    reason: format!("workgroup ({x},{y},{z}): emulator panic: {msg}"),
+                    instructions,
+                    workgroups,
+                    json: info,
+                });
             }
         }
     }
@@ -252,19 +311,19 @@ pub fn run_arm(
     if !violations.is_empty() {
         return Err(ArmFail { reason: violations.join("; "), instructions, workgroups, json: info });
     }
-    let out_region = mem
+    let out_written = mem
         .regions
         .iter()
         .find(|r| r.name == case.bufs[case.out].name)
-        .expect("the output region is mapped");
-    let out = out_region.bytes.clone();
-    let out_written = out_region.written.count();
+        .expect("the output region is mapped")
+        .written
+        .count();
     info["workgroups"] = json!(workgroups);
     info["instructions"] = json!(instructions);
     info["geometry"] = json!({"grid_workgroups": geo.grid, "block": geo.block, "lds_dynamic_bytes": geo.lds});
     info["output_written_bytes"] = json!(out_written);
     info["elapsed_ms"] = json!(started.elapsed().as_millis() as u64);
-    Ok(ArmRun { out, instructions, workgroups, json: info, out_written })
+    Ok(ArmRun { out: Vec::new(), instructions, workgroups, json: info, out_written, written: None })
 }
 
 /// First differing byte and the number of differing bytes.
@@ -276,50 +335,53 @@ fn diff(a: &[u8], b: &[u8]) -> Option<(usize, usize)> {
     Some((first, a.iter().zip(b).filter(|(x, y)| x != y).count()))
 }
 
-/// Run both arms (concurrently) and build the `emu_gate` receipt. `pass` is the verdict.
+type ArmResult = std::result::Result<ArmRun, ArmFail>;
+
+fn counts(r: &ArmResult) -> (u64, u64) {
+    match r {
+        Ok(a) => (a.instructions, a.workgroups),
+        Err(f) => (f.instructions, f.workgroups),
+    }
+}
+
+fn arm_json(r: &ArmResult) -> Value {
+    match r {
+        Ok(a) => a.json.clone(),
+        Err(f) => f.json.clone(),
+    }
+}
+
+fn failure_reasons(b: &ArmResult, c: &ArmResult) -> Option<String> {
+    let mut why = Vec::new();
+    if let Err(f) = b {
+        why.push(format!("baseline: {}", f.reason));
+    }
+    if let Err(f) = c {
+        why.push(format!("candidate: {}", f.reason));
+    }
+    (!why.is_empty()).then(|| why.join(" | "))
+}
+
+/// Run both arms over the FULL small grid and build the `emu_gate` receipt. `pass` is the verdict.
 pub fn gate(
     symbol: &str,
-    case: &EmuCase,
+    case: &mut EmuCase,
     base: (&[u8], &Geometry),
     cand: (&[u8], &Geometry),
     shape: Value,
     seed: u64,
 ) -> (bool, Value) {
-    let (b, c) = std::thread::scope(|s| {
-        let hb = std::thread::Builder::new()
-            .name("emu-baseline".into())
-            .stack_size(256 << 20)
-            .spawn_scoped(s, || run_arm("baseline", base.0, symbol, base.1, case))
-            .expect("spawn baseline emulation");
-        let hc = std::thread::Builder::new()
-            .name("emu-candidate".into())
-            .stack_size(256 << 20)
-            .spawn_scoped(s, || run_arm("candidate", cand.0, symbol, cand.1, case))
-            .expect("spawn candidate emulation");
-        (hb.join(), hc.join())
-    });
-    let unpack = |r: std::thread::Result<std::result::Result<ArmRun, ArmFail>>, tag: &str| match r {
-        Ok(r) => r,
-        Err(_) => Err(fail(format!("{tag} emulation thread panicked"), json!({"tag": tag}))),
-    };
-    let (b, c) = (unpack(b, "baseline"), unpack(c, "candidate"));
-    let count = |r: &std::result::Result<ArmRun, ArmFail>| match r {
-        Ok(a) => (a.instructions, a.workgroups),
-        Err(f) => (f.instructions, f.workgroups),
-    };
-    let arm_json = |r: &std::result::Result<ArmRun, ArmFail>| match r {
-        Ok(a) => a.json.clone(),
-        Err(f) => f.json.clone(),
-    };
-    let (bn, cn) = (count(&b), count(&c));
+    let b = run_arm("baseline", base.0, symbol, base.1, case, &WgSel::All);
+    let c = run_arm("candidate", cand.0, symbol, cand.1, case, &WgSel::All);
+    let (bn, cn) = (counts(&b), counts(&c));
     let mut rec = json!({
         "pass": false,
         "reason": Value::Null,
         "shape": shape,
         "seed": seed,
         "strict_lds": true,
-        "numerics_model": "gfx1100 program decoded with gfx1100 tables; WMMA/transcendental/NaN rules of the gfx1151 model (both arms identical; no claim about gfx1100 hardware ulps)",
         "guard_bytes": GUARD_BYTES,
+        "numerics_model": "gfx1100 program decoded with gfx1100 tables; WMMA/transcendental/NaN rules of the gfx1151 model (both arms identical; no claim about gfx1100 hardware ulps)",
         "instructions": {"baseline": bn.0, "candidate": cn.0},
         "workgroups": {"baseline": bn.1, "candidate": cn.1},
         "arms": {"baseline": arm_json(&b), "candidate": arm_json(&c)},
@@ -333,20 +395,11 @@ pub fn gate(
     if let Ok(a) = &c {
         rec["output_sha256"]["candidate"] = json!(sha256_hex(&a.out));
     }
-    let (b, c) = match (b, c) {
-        (Ok(b), Ok(c)) => (b, c),
-        (b, c) => {
-            let mut why = Vec::new();
-            if let Err(f) = &b {
-                why.push(format!("baseline: {}", f.reason));
-            }
-            if let Err(f) = &c {
-                why.push(format!("candidate: {}", f.reason));
-            }
-            rec["reason"] = json!(why.join(" | "));
-            return (false, rec);
-        }
-    };
+    if let Some(why) = failure_reasons(&b, &c) {
+        rec["reason"] = json!(why);
+        return (false, rec);
+    }
+    let (b, c) = (b.ok().unwrap(), c.ok().unwrap());
     if b.out_written == 0 {
         rec["reason"] = json!("the baseline wrote none of the output buffer: the launch is not exercised");
         return (false, rec);
@@ -371,4 +424,197 @@ pub fn gate(
             (false, rec)
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Production-extent cases: sampled workgroups
+
+/// Output-owner map: which workgroup writes output element `e` (4-byte elements).
+pub type Owner<'a> = &'a dyn Fn(usize) -> [u32; 3];
+
+/// Upper bound on the workgroups either arm runs in one extent case (the sampled set plus the closure
+/// that makes both arms cover the same output elements).
+pub const MAX_EXTENT_WGS: usize = 2000;
+
+fn fnv(s: &str) -> u64 {
+    s.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3))
+}
+
+/// The sampled workgroups of a grid: every corner (first/last along each dim), the last tile of each dim
+/// next to the first/middle tiles of the others (the partial-dim edges), and eight seeded random ones.
+pub fn sample_wgs(grid: [u32; 3], seed: u64, label: &str) -> Vec<[u32; 3]> {
+    let mut set = BTreeSet::new();
+    let last = [grid[0] - 1, grid[1] - 1, grid[2] - 1];
+    let mid = [grid[0] / 2, grid[1] / 2, grid[2] / 2];
+    for m in 0..8u32 {
+        set.insert([
+            if m & 1 != 0 { last[0] } else { 0 },
+            if m & 2 != 0 { last[1] } else { 0 },
+            if m & 4 != 0 { last[2] } else { 0 },
+        ]);
+    }
+    for d in 0..3 {
+        let (a, b) = ((d + 1) % 3, (d + 2) % 3);
+        for m in 0..4u32 {
+            let mut w = [0u32; 3];
+            w[d] = last[d];
+            w[a] = if m & 1 != 0 { mid[a] } else { 0 };
+            w[b] = if m & 2 != 0 { mid[b] } else { 0 };
+            set.insert(w);
+        }
+    }
+    let mut r = Xs64::new(seed ^ fnv(label));
+    for _ in 0..8 {
+        set.insert([
+            (r.next_u64() % u64::from(grid[0])) as u32,
+            (r.next_u64() % u64::from(grid[1])) as u32,
+            (r.next_u64() % u64::from(grid[2])) as u32,
+        ]);
+    }
+    set.into_iter().collect()
+}
+
+fn lin(g: [u32; 3], w: [u32; 3]) -> Option<usize> {
+    (w[0] < g[0] && w[1] < g[1] && w[2] < g[2])
+        .then(|| w[0] as usize + g[0] as usize * (w[1] as usize + g[1] as usize * w[2] as usize))
+}
+
+fn grid_len(g: [u32; 3]) -> usize {
+    g[0] as usize * g[1] as usize * g[2] as usize
+}
+
+fn wg_list(g: [u32; 3], picked: &[bool]) -> Vec<[u32; 3]> {
+    picked
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| **p)
+        .map(|(i, _)| {
+            let (gx, gy) = (g[0] as usize, g[1] as usize);
+            [(i % gx) as u32, (i / gx % gy) as u32, (i / (gx * gy)) as u32]
+        })
+        .collect()
+}
+
+/// One production-extent case. Both arms run only SAMPLED workgroups of their own grids, chosen so that
+/// they cover the same set `E` of output elements: the baseline's sampled workgroups (`sample_wgs`) give
+/// elements, the candidate workgroups owning them give a larger element set, the baseline workgroups
+/// owning THAT give the final set `E`. `E` is compared bitwise between the arms. Each arm must have
+/// written every element of `E` and nothing outside its own workgroups' elements.
+pub fn extent_gate(
+    label: &str,
+    symbol: &str,
+    case: &mut EmuCase,
+    base: (&[u8], &Geometry, Owner),
+    cand: (&[u8], &Geometry, Owner),
+    shape: Value,
+    seed: u64,
+) -> (bool, Value) {
+    let (gb, gc) = (base.1.grid, cand.1.grid);
+    let nelem = case.bufs[case.out].bytes.len() / 4;
+    let mut rec = json!({
+        "label": label, "pass": false, "reason": Value::Null, "shape": shape, "seed": seed,
+        "grid": {"baseline": gb, "candidate": gc},
+        "output_elements": nelem,
+    });
+    let stop = |rec: &mut Value, why: String| {
+        rec["reason"] = json!(why);
+        (false, rec.clone())
+    };
+    if case.bufs[case.out].bytes.len() % 4 != 0 {
+        return stop(&mut rec, "output buffer is not a whole number of 4-byte elements".into());
+    }
+    // 1. the baseline's sampled workgroups -> their output elements -> the candidate workgroups owning them.
+    let sampled = sample_wgs(gb, seed, label);
+    let mut sel_b = vec![false; grid_len(gb)];
+    for w in &sampled {
+        sel_b[lin(gb, *w).expect("sample is inside the grid")] = true;
+    }
+    let mut sel_c = vec![false; grid_len(gc)];
+    for e in 0..nelem {
+        let Some(lb) = lin(gb, (base.2)(e)) else {
+            return stop(&mut rec, format!("baseline geometry does not cover output element {e}"));
+        };
+        if sel_b[lb] {
+            let Some(lc) = lin(gc, (cand.2)(e)) else {
+                return stop(&mut rec, format!("candidate geometry does not cover output element {e} (owner {:?}, grid {gc:?})", (cand.2)(e)));
+            };
+            sel_c[lc] = true;
+        }
+    }
+    // 2. the elements those candidate workgroups own (E) -> the baseline workgroups owning E.
+    let mut in_e = vec![false; nelem];
+    let mut sel_b2 = vec![false; grid_len(gb)];
+    let mut n_e = 0usize;
+    for e in 0..nelem {
+        let Some(lc) = lin(gc, (cand.2)(e)) else {
+            return stop(&mut rec, format!("candidate geometry does not cover output element {e} (owner {:?}, grid {gc:?})", (cand.2)(e)));
+        };
+        if sel_c[lc] {
+            in_e[e] = true;
+            n_e += 1;
+            sel_b2[lin(gb, (base.2)(e)).expect("checked")] = true;
+        }
+    }
+    let (wb, wc) = (wg_list(gb, &sel_b2), wg_list(gc, &sel_c));
+    rec["sampled_wgs"] = json!({"baseline_seed": sampled.len(), "baseline": wb.len(), "candidate": wc.len()});
+    rec["elements_compared"] = json!(n_e);
+    if wb.len() > MAX_EXTENT_WGS || wc.len() > MAX_EXTENT_WGS {
+        return stop(&mut rec, format!("the closure of the sampled workgroups is too large ({} baseline, {} candidate; limit {MAX_EXTENT_WGS})", wb.len(), wc.len()));
+    }
+    rec["first_wgs"] = json!({"baseline": wb.iter().take(6).collect::<Vec<_>>(), "candidate": wc.iter().take(6).collect::<Vec<_>>()});
+    // 3. run both arms on their lists.
+    let b = run_arm("baseline", base.0, symbol, base.1, case, &WgSel::List(&wb));
+    let c = run_arm("candidate", cand.0, symbol, cand.1, case, &WgSel::List(&wc));
+    let (bn, cn) = (counts(&b), counts(&c));
+    rec["instructions"] = json!({"baseline": bn.0, "candidate": cn.0});
+    rec["workgroups"] = json!({"baseline": bn.1, "candidate": cn.1});
+    rec["arms"] = json!({"baseline": arm_json(&b), "candidate": arm_json(&c)});
+    if let Some(why) = failure_reasons(&b, &c) {
+        return stop(&mut rec, why);
+    }
+    let (b, c) = (b.ok().unwrap(), c.ok().unwrap());
+    let (Some(wrb), Some(wrc)) = (&b.written, &c.written) else {
+        return stop(&mut rec, "internal: no written set".into());
+    };
+    // 4. write discipline, coverage of E, bitwise identity on E.
+    let pristine = &case.bufs[case.out].bytes;
+    let mut sha_b = sha2::Sha256::default();
+    let mut sha_c = sha2::Sha256::default();
+    let mut changed = false;
+    for e in 0..nelem {
+        for (arm, wr, grid, owner, list) in [
+            ("baseline", wrb, gb, base.2, &sel_b2),
+            ("candidate", wrc, gc, cand.2, &sel_c),
+        ] {
+            if wr.contains(e * 4) && !list[lin(grid, owner(e)).expect("covered")] {
+                return stop(&mut rec, format!("{arm} wrote output element {e} outside the elements of its sampled workgroups"));
+            }
+        }
+        if !in_e[e] {
+            continue;
+        }
+        for (arm, wr) in [("baseline", wrb), ("candidate", wrc)] {
+            if !(0..4).all(|k| wr.contains(e * 4 + k)) {
+                return stop(&mut rec, format!("{arm} did not write output element {e} (owner workgroup {:?})", if arm == "baseline" { (base.2)(e) } else { (cand.2)(e) }));
+            }
+        }
+        let r = e * 4..e * 4 + 4;
+        use sha2::Digest;
+        sha_b.update(&b.out[r.clone()]);
+        sha_c.update(&c.out[r.clone()]);
+        changed |= b.out[r.clone()] != pristine[r.clone()];
+        if b.out[r.clone()] != c.out[r.clone()] {
+            let (x, y) = (u32::from_le_bytes(b.out[r.clone()].try_into().unwrap()), u32::from_le_bytes(c.out[r.clone()].try_into().unwrap()));
+            rec["identical_to_baseline"] = json!(false);
+            return stop(&mut rec, format!("output element {e} differs from the emulated incumbent: baseline {x:#010x}, candidate {y:#010x} (baseline owner {:?}, candidate owner {:?})", (base.2)(e), (cand.2)(e)));
+        }
+    }
+    use sha2::Digest;
+    rec["output_sha256"] = json!({"baseline": format!("{:x}", sha_b.finalize()), "candidate": format!("{:x}", sha_c.finalize())});
+    if !changed {
+        return stop(&mut rec, "the baseline left every compared element at its pristine value: the launch is not exercised".into());
+    }
+    rec["identical_to_baseline"] = json!(true);
+    rec["pass"] = json!(true);
+    (true, rec)
 }

@@ -112,6 +112,7 @@ impl QsaHg4 {
         }
         let emu = pos.as_deref() == Some("emu");
         let rows = s.take_usize("rows", Some(if emu { EMU_ROWS } else { TILE_ROWS }))?;
+        let cap = s.take_usize("cap", Some(0))?;
         s.no_leftover()?;
         // Tile 11 of 22 (mid-window) is the representative default, tile 21 the
         // late one; an integer is an explicit position_start; `emu` is the pre-card
@@ -134,7 +135,16 @@ impl QsaHg4 {
             ));
         }
         // The emulator gate maps the K/V cache exactly: no tokens past the last visible one.
-        let full_capacity = if emu { position_start + rows } else { (position_start + rows).max(FN_TOKENS) };
+        let full_capacity = if cap != 0 {
+            if cap < position_start + rows {
+                return Err(format!("--shape cap={cap} is below position_start + rows = {}", position_start + rows));
+            }
+            cap
+        } else if emu {
+            position_start + rows
+        } else {
+            (position_start + rows).max(FN_TOKENS)
+        };
         Ok(Self { label, rows, position_start, full_capacity, dev: None })
     }
 
@@ -249,6 +259,31 @@ impl Node for QsaHg4 {
         })
     }
 
+    fn extent_shapes(&self) -> Vec<String> {
+        // Judge shapes at the FN capacity (16896 tokens), then the K/V capacity at max_seq scale: the
+        // late window of a 262144-token cache, and a 16-row window at its far end (cache populated to 261016).
+        ["pos=mid", "pos=late", "pos=late,cap=262144", "pos=261000,rows=16,cap=262144"]
+            .iter()
+            .map(|s| (*s).to_owned())
+            .collect()
+    }
+    fn out_owner<'a>(&'a self, hdr: &Header) -> Result<Box<dyn Fn(usize) -> [u32; 3] + 'a>> {
+        // out is f32 [rows][n_heads][head_dim]; the workgroup is (head group, 0, row group).
+        let get = |k: &str, d: usize| -> Result<usize> {
+            match hdr.kv.get(k) {
+                Some(v) => v.parse::<usize>().map_err(|e| format!("hip_loop header {k}={v}: {e}")),
+                None => Ok(d),
+            }
+        };
+        let (hpw, rpw) = (get("heads_per_wg", HG4_HEADS)?, get("rows_per_wg", 1)?);
+        if hpw == 0 || rpw == 0 {
+            return Err("hip_loop header: heads_per_wg/rows_per_wg must be positive".into());
+        }
+        Ok(Box::new(move |e| {
+            let (row, head) = (e / OUT_ROW_FLOATS, e % OUT_ROW_FLOATS / HEAD_DIM);
+            [(head / hpw) as u32, 0, (row / rpw) as u32]
+        }))
+    }
     fn emu_case(&self, seed: u64) -> Result<EmuCase> {
         let inputs = generate(self.rows, self.position_start, self.full_capacity, seed);
         validate_selection(&inputs.sel, self.rows, self.position_start, self.full_capacity)?;

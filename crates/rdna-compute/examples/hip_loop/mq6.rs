@@ -184,6 +184,15 @@ impl Node for Mq6Res {
         }
     }
 
+    fn extent_shapes(&self) -> Vec<String> {
+        PRESETS.iter().map(|p| p.0.to_owned()).collect()
+    }
+    fn out_owner<'a>(&'a self, hdr: &Header) -> Result<Box<dyn Fn(usize) -> [u32; 3] + 'a>> {
+        // Y is f32 [N][M]; the workgroup is (row tile, token tile).
+        let (tm, tn) = header_tiles(hdr, 16, 16 * self.waves)?;
+        let m = self.m;
+        Ok(Box::new(move |e| [(e % m / tm) as u32, (e / m / tn) as u32, 0]))
+    }
     fn emu_case(&self, seed: u64) -> Result<EmuCase> {
         let (w, x, y) = self.host_inputs(seed);
         Ok(EmuCase {

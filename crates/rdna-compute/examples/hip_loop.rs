@@ -70,6 +70,16 @@
 //!   identical_to_baseline, guard_bytes, strict_lds, numerics_model, arms{..}`. The numerics are the gfx1151
 //!   model (`Emulator::gfx1100_as_gfx1151`) for both arms: it proves memory safety and arm-vs-arm identity at
 //!   the small shape, not gfx1100 hardware ulps. `--base-object` is trusted via its sidecar (no recompile).
+//!   EXTENT CASES (`emu_gate.extent_cases`, on by default, `--no-extent` = dev only and not a pass): after the
+//!   small shape passes, the same objects run at every production extent shape of the node
+//!   (`mq6_res` qkv/z/out/qg/ba, `hc_mix` mix/sel, `qsa_hg4` pos=mid, pos=late, pos=late with a 262144-token
+//!   K/V capacity and a far-end 16-row window of that cache) on exact-size guarded buffers, emulating only
+//!   SAMPLED workgroups: every grid corner, the last tile of each dim beside the first/middle tiles of the
+//!   others, eight seeded random ones, then the closure that makes the baseline and the candidate (different
+//!   tilings) cover the same set of output elements. Those elements are compared bitwise; each arm must have
+//!   written all of them and nothing outside its own workgroups' elements. A 32-bit address overflow that only
+//!   appears at production extents is an unmapped access (or a diff) here. Receipt per case: label, shape, grids,
+//!   sampled workgroup counts, elements compared, instructions, output sha256 of the compared elements.
 //!
 //! Exit status: 0 ok; 1 identity failure (record still printed); 2 usage; 3 the
 //! candidate (or the device) could not compile/launch (record printed with `error`).
@@ -107,7 +117,7 @@ const DEFAULT_ROUNDS: usize = 12;
 const NODES: [&str; 3] = ["mq6_res", "hc_mix", "qsa_hg4"];
 const USAGE: &str = "--node mq6_res|hc_mix|qsa_hg4 [--shape k=v,...] \
 (--cand FILE.hip | --cand-object FILE.co [--cand-geometry \"tile_m=.. tile_n=.. block=.. lds_dynamic=..\"] | --null-control aa) \
-[--base-object FILE.co] [--offline] [--emu] [--time N] [--rounds R] [--seed S] [--out DIR]";
+[--base-object FILE.co] [--offline] [--emu [--no-extent]] [--time N] [--rounds R] [--seed S] [--out DIR]";
 
 // ---------------------------------------------------------------------------
 // CLI
@@ -119,6 +129,7 @@ struct Opts {
     cand: Option<PathBuf>,
     offline: bool,
     emu: bool,
+    no_extent: bool,
     null_control: bool,
     cand_object: Option<PathBuf>,
     base_object: Option<PathBuf>,
@@ -136,6 +147,7 @@ fn parse_args(args: &[String]) -> Result<Opts> {
         cand: None,
         offline: false,
         emu: false,
+        no_extent: false,
         null_control: false,
         cand_object: None,
         cand_geometry: None,
@@ -164,6 +176,7 @@ fn parse_args(args: &[String]) -> Result<Opts> {
                 o.emu = true;
                 o.offline = true;
             }
+            "--no-extent" => o.no_extent = true,
             "--null-control" => {
                 let v = value("null-control")?;
                 if v != "aa" {
@@ -263,6 +276,8 @@ struct Prep {
     cand: jit::Built,
     base_geo: Geometry,
     cand_geo: Geometry,
+    /// The candidate's `// hip_loop:` header (before the node consumed it), for the extent gate.
+    cand_header: Header,
 }
 
 /// Resolve the candidate, its geometry, compile both arms, and fill the offline
@@ -403,7 +418,7 @@ fn prepare(o: &Opts, node: &dyn Node, workdir: &Path, rec: &mut Value) -> std::r
             },
         });
     }
-    Ok(Prep { inc, base, cand, base_geo, cand_geo })
+    Ok(Prep { inc, base, cand, base_geo, cand_geo, cand_header: Header { kv: header_kv } })
 }
 
 /// `--base-object FILE.co` as the incumbent: its sidecar `FILE.co.json` (written by an
@@ -514,22 +529,55 @@ fn run(o: &Opts) -> (Value, Outcome) {
 // ---------------------------------------------------------------------------
 // Emulator gate (`--emu`)
 
-/// The pre-card gate: both arms' objects lifted and emulated over the full small grid on the
-/// PeaceMaker CPU emulator, output bytes bit-compared (`emu.rs`). Exit 1 and the reason on stderr
-/// when it fails; `rec["emu_gate"]` is the receipt either way.
+/// The pre-card gate. (1) Both arms' objects lifted and emulated over the FULL small grid on the PeaceMaker
+/// CPU emulator, output bytes bit-compared. (2) Unless `--no-extent`, the same objects at every PRODUCTION
+/// extent shape of the node (`Node::extent_shapes`: judge shapes, capacity extremes), emulating only sampled
+/// workgroups (grid corners, partial-dim edges, seeded random ones, plus the closure that makes both arms
+/// cover the same output elements) on exact-size guarded buffers; bits compared on those elements. Both
+/// parts must pass: a 32-bit address overflow that only shows at production extents cannot slip through
+/// the small shape. `rec["emu_gate"]` is the receipt (`extent_cases` lists part 2); exit 1 on failure.
 fn emu_stage(o: &Opts, node: &dyn Node, prep: &Prep, mut rec: Value) -> (Value, Outcome) {
-    let case = match node.emu_case(o.seed) {
+    let mut case = match node.emu_case(o.seed) {
         Ok(c) => c,
         Err(e) => return fail(rec, "emu_case", e),
     };
-    let (pass, receipt) = emu::gate(
+    let (small_pass, mut receipt) = emu::gate(
         &prep.inc.symbol,
-        &case,
+        &mut case,
         (&prep.base.image, &prep.base_geo),
         (&prep.cand.image, &prep.cand_geo),
         node.shape_json(),
         o.seed,
     );
+    drop(case);
+    receipt["small_pass"] = json!(small_pass);
+    let mut pass = small_pass;
+    let mut why: Vec<String> = Vec::new();
+    if !small_pass {
+        why.push(format!("small shape: {}", receipt["reason"].as_str().unwrap_or("?")));
+    }
+    if o.no_extent {
+        receipt["extent_cases"] = json!([]);
+        receipt["extent_skipped"] = json!("--no-extent");
+        pass = false;
+        why.push("extent cases skipped (--no-extent): not a gate pass".into());
+    } else if !small_pass {
+        receipt["extent_cases"] = json!([]);
+        receipt["extent_skipped"] = json!("the small shape already failed");
+    } else {
+        let mut cases = Vec::new();
+        for shape in node.extent_shapes() {
+            let (ok, r) = extent_case(o, node, prep, &shape);
+            if !ok {
+                why.push(format!("extent {shape}: {}", r["reason"].as_str().unwrap_or("?")));
+            }
+            pass &= ok;
+            cases.push(r);
+        }
+        receipt["extent_cases"] = json!(cases);
+    }
+    receipt["pass"] = json!(pass);
+    receipt["reason"] = if pass { Value::Null } else { json!(why.join(" | ")) };
     rec["emu_gate"] = receipt;
     if pass {
         (rec, Outcome::Ok)
@@ -537,6 +585,42 @@ fn emu_stage(o: &Opts, node: &dyn Node, prep: &Prep, mut rec: Value) -> (Value, 
         eprintln!("hip_loop: emu_gate FAIL: {}", rec["emu_gate"]["reason"].as_str().unwrap_or("?"));
         (rec, Outcome::IdentityFailed)
     }
+}
+
+/// One production-extent case of `emu_stage` at `shape`.
+fn extent_case(o: &Opts, like: &dyn Node, prep: &Prep, shape: &str) -> (bool, Value) {
+    let t = std::time::Instant::now();
+    let bad = |why: String| (false, json!({"label": shape, "shape": shape, "pass": false, "reason": why}));
+    let n = match build_node(like.name(), Some(shape)) {
+        Ok(n) => n,
+        Err(e) => return bad(format!("extent shape: {e}")),
+    };
+    let base_geo = n.geometry();
+    let cand_geo = match n.geometry_with(&mut prep.cand_header.clone()) {
+        Ok(g) => g,
+        Err(e) => return bad(format!("candidate geometry at this shape: {e}")),
+    };
+    let (ob, oc) = match (n.out_owner(&Header::default()), n.out_owner(&prep.cand_header)) {
+        (Ok(b), Ok(c)) => (b, c),
+        (Err(e), _) | (_, Err(e)) => return bad(format!("output owner map: {e}")),
+    };
+    let mut case = match n.emu_case(o.seed) {
+        Ok(c) => c,
+        Err(e) => return bad(format!("inputs: {e}")),
+    };
+    let built = t.elapsed().as_millis() as u64;
+    let (ok, mut r) = emu::extent_gate(
+        shape,
+        &prep.inc.symbol,
+        &mut case,
+        (&prep.base.image, &base_geo, &*ob),
+        (&prep.cand.image, &cand_geo, &*oc),
+        n.shape_json(),
+        o.seed,
+    );
+    r["inputs_ms"] = json!(built);
+    r["total_ms"] = json!(t.elapsed().as_millis() as u64);
+    (ok, r)
 }
 
 // ---------------------------------------------------------------------------
@@ -921,6 +1005,7 @@ mod tests {
             cand: Some(cand),
             offline: true,
             emu: false,
+            no_extent: false,
             null_control: false,
             cand_object: None,
             cand_geometry: None,
@@ -1023,6 +1108,7 @@ mod tests {
             cand: Some(cand.clone()),
             offline: true,
             emu: false,
+            no_extent: false,
             null_control: false,
             cand_object: None,
             cand_geometry: None,
@@ -1056,6 +1142,7 @@ mod tests {
             cand: None,
             offline: true,
             emu: false,
+            no_extent: false,
             null_control: true,
             cand_object: None,
             cand_geometry: None,
@@ -1099,6 +1186,7 @@ mod object_tests {
             cand: None,
             offline: true,
             emu: false,
+            no_extent: false,
             null_control: false,
             cand_object: Some(object),
             cand_geometry: geometry.map(str::to_owned),
@@ -1213,6 +1301,7 @@ mod base_object_tests {
             cand,
             offline: true,
             emu: false,
+            no_extent: false,
             null_control: aa,
             cand_object: None,
             cand_geometry: None,
@@ -1399,6 +1488,97 @@ mod emu_tests {
         assert!(c.bufs[4].bytes.iter().all(|&b| b == 0xff));
     }
 
+    #[test]
+    fn extent_sampling_covers_corners_edges_and_is_seeded() {
+        let g = emu::sample_wgs([640, 6, 1], 1, "qkv");
+        for corner in [[0, 0, 0], [639, 0, 0], [0, 5, 0], [639, 5, 0]] {
+            assert!(g.contains(&corner), "{corner:?}");
+        }
+        assert!(g.len() >= 8 && g.len() <= 25, "{}", g.len());
+        assert!(g.iter().all(|w| w[0] < 640 && w[1] < 6 && w[2] == 0));
+        assert_eq!(g, emu::sample_wgs([640, 6, 1], 1, "qkv"));
+        assert_ne!(g, emu::sample_wgs([640, 6, 1], 2, "qkv"));
+        // The three-dimensional qsa grid: every corner, last tile along each dim.
+        let q = emu::sample_wgs([6, 1, 768], 1, "q");
+        for corner in [[0, 0, 0], [5, 0, 0], [0, 0, 767], [5, 0, 767]] {
+            assert!(q.contains(&corner), "{corner:?}");
+        }
+        // A one-workgroup grid is just that workgroup.
+        assert_eq!(emu::sample_wgs([1, 1, 1], 9, "x"), vec![[0, 0, 0]]);
+    }
+
+    #[test]
+    fn output_owner_maps_follow_the_kernel_layouts() {
+        let n = build_node("mq6_res", Some("qkv")).unwrap();
+        // Y[token][row]: element (token 5, row 33) with 16 x 128 tiles -> workgroup (2, 0); production header.
+        let own = n.out_owner(&Header::default()).unwrap();
+        assert_eq!(own(5 * 10240 + 33), [2, 0, 0]);
+        assert_eq!(own(767 * 10240 + 10239), [639, 5, 0]);
+        let h = Header::parse_list("tile_m=128 tile_n=256 block=256").unwrap();
+        let own = n.out_owner(&h).unwrap();
+        assert_eq!(own(5 * 10240 + 33), [0, 0, 0]);
+        assert_eq!(own(767 * 10240 + 10239), [79, 2, 0]);
+        let n = build_node("qsa_hg4", Some("pos=mid")).unwrap();
+        let own = n.out_owner(&Header::default()).unwrap();
+        // out[row][head][d]: row 3, head 13, d 7 -> workgroup (head / 4, 0, row).
+        assert_eq!(own((3 * 24 + 13) * 256 + 7), [3, 0, 3]);
+        let h = Header::parse_list("heads_per_wg=12 block=1024").unwrap();
+        assert_eq!(n.out_owner(&h).unwrap()((3 * 24 + 13) * 256 + 7), [1, 0, 3]);
+        let n = build_node("hc_mix", Some("mix")).unwrap();
+        let h = Header::parse_list("tile_m=80 tile_n=64 block=128").unwrap();
+        assert_eq!(n.out_owner(&h).unwrap()(70 * 320 + 319), [3, 1, 0]);
+        // Every node declares production extents; the qsa ones include a max_seq-scale capacity.
+        assert!(n.extent_shapes().contains(&"mix".to_owned()));
+        let q = build_node("qsa_hg4", Some("emu")).unwrap().extent_shapes();
+        assert!(q.iter().any(|s| s.contains("cap=262144")) && q.contains(&"pos=late".to_owned()));
+        for s in &q {
+            build_node("qsa_hg4", Some(s)).unwrap();
+        }
+        assert_eq!(build_node("qsa_hg4", Some("pos=late,cap=262144")).unwrap().shape_json()["full_capacity"], 262144);
+        assert!(build_node("qsa_hg4", Some("pos=late,cap=100")).is_err());
+    }
+
+    /// The extent gate: the incumbent passes against itself at a production extent; a short input buffer
+    /// is an unmapped access; a candidate whose geometry does not match its object leaves elements unwritten.
+    #[test]
+    fn extent_gate_passes_the_incumbent_and_fails_closed() {
+        if !jit::hipcc_available() {
+            eprintln!("SKIP: no hipcc");
+            return;
+        }
+        let dir = tmp("extent");
+        jit::isolate_caches(&dir).unwrap();
+        let node = build_node("mq6_res", Some("ba")).unwrap();
+        let inc = node.incumbent().unwrap();
+        let built = jit::compile(&dir, "baseline", &inc, &inc.source).unwrap();
+        let geo = node.geometry();
+        let own = node.out_owner(&Header::default()).unwrap();
+        let mut case = node.emu_case(1).unwrap();
+        let (pass, rec) = emu::extent_gate("ba", &inc.symbol, &mut case, (&built.image, &geo, &*own), (&built.image, &geo, &*own), node.shape_json(), 1);
+        assert!(pass, "{rec}");
+        assert_eq!(rec["identical_to_baseline"], true);
+        assert_eq!(rec["output_sha256"]["baseline"], rec["output_sha256"]["candidate"]);
+        assert!(rec["elements_compared"].as_u64().unwrap() > 1000);
+        // The same case object serves the next gate: buffers were moved back, output pristine.
+        let (pass, _) = emu::extent_gate("ba", &inc.symbol, &mut case, (&built.image, &geo, &*own), (&built.image, &geo, &*own), node.shape_json(), 1);
+        assert!(pass);
+        // A short input: the kernel's reads past the end land in the unmapped guard.
+        let mut short = case.clone();
+        let x = short.bufs.iter_mut().find(|b| b.name == "x").unwrap();
+        x.bytes.truncate(x.bytes.len() - 4);
+        let (pass, rec) = emu::extent_gate("ba", &inc.symbol, &mut short, (&built.image, &geo, &*own), (&built.image, &geo, &*own), node.shape_json(), 1);
+        assert!(!pass);
+        assert!(rec["reason"].as_str().unwrap().contains("unmapped memory access"), "{rec}");
+        // Candidate geometry (32-row tiles) launched on the 16-row object: half the rows are never written.
+        let h = Header::parse_list("tile_m=32 tile_n=128 block=256").unwrap();
+        let mut hh = h.clone();
+        let cgeo = node.geometry_with(&mut hh).unwrap();
+        let cown = node.out_owner(&h).unwrap();
+        let (pass, rec) = emu::extent_gate("ba", &inc.symbol, &mut case, (&built.image, &geo, &*own), (&built.image, &cgeo, &*cown), node.shape_json(), 1);
+        assert!(!pass, "{rec}");
+        assert!(rec["reason"].as_str().unwrap().contains("did not write"), "{rec}");
+    }
+
     /// The gate passes an incumbent against itself and fails closed on an out-of-buffer access and on
     /// a launch that leaves output unwritten (different bytes from the incumbent's).
     #[test]
@@ -1416,7 +1596,7 @@ mod emu_tests {
             let geo = node.geometry();
             let case = node.emu_case(1).unwrap();
             let run = |case: &node::EmuCase, cand_geo: &Geometry| {
-                emu::gate(&inc.symbol, case, (&built.image, &geo), (&built.image, cand_geo), node.shape_json(), 1)
+                emu::gate(&inc.symbol, &mut case.clone(), (&built.image, &geo), (&built.image, cand_geo), node.shape_json(), 1)
             };
             let (pass, rec) = run(&case, &geo);
             assert!(pass, "{node_name}: {rec}");
