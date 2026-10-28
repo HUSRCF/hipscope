@@ -431,11 +431,50 @@ impl std::fmt::Display for PlanBypass {
 
 /// The plan of one request, or why it is the incumbent's. `Err` is a
 /// malformed input (a bug), never a verdict.
+///
+/// The window COUNT is the greedy packing's at the admitted window
+/// ([`SlowlinkProfile::window_rows`]), so it never exceeds `windows_for`; the
+/// rows are then levelled across those windows. Every window pays one full
+/// expert sweep, so a short tail window (17,000 rows = 22 tiles + 1) is a
+/// 7.95-s wire-bound sweep for 768 rows; the same count of windows at the
+/// smallest tile-multiple cap that still yields that many windows has no such
+/// tail. A request whose greedy windows were closed by session cuts or the
+/// boundary snapshot cap (more windows than its rows need) keeps the greedy
+/// plan, whose window ends are the transaction's chronology; so does a cap
+/// that needs more windows or bypasses. The admitted window is always the
+/// last candidate.
 pub(crate) fn plan_prompt_verdict(
     inputs: &PromptPlanInputs<'_>,
 ) -> R<Result<Qwen4PromptPlan, PlanBypass>> {
     let profile = inputs.profile;
-    let (tile_rows, window_rows) = (profile.tile_rows, profile.window_rows);
+    let greedy = plan_prompt_at_window(inputs, profile.window_rows)?;
+    let Ok(plan) = &greedy else {
+        return Ok(greedy);
+    };
+    let (windows, tile) = (plan.windows.len(), profile.tile_rows);
+    // Cut-closed windows are the transaction's, not a row packing to level.
+    if windows < 2 || windows > profile.windows_for(plan.rows) {
+        return Ok(greedy);
+    }
+    let mut cap = plan.rows.div_ceil(windows).div_ceil(tile) * tile;
+    while cap < profile.window_rows {
+        match plan_prompt_at_window(inputs, cap)? {
+            Ok(levelled) if levelled.windows.len() <= windows => return Ok(Ok(levelled)),
+            Ok(_) => cap += tile,
+            Err(_) => break,
+        }
+    }
+    Ok(greedy)
+}
+
+/// [`plan_prompt_verdict`] at one explicit window cap (a whole number of
+/// tiles no larger than the admitted window).
+fn plan_prompt_at_window(
+    inputs: &PromptPlanInputs<'_>,
+    window_rows: usize,
+) -> R<Result<Qwen4PromptPlan, PlanBypass>> {
+    let profile = inputs.profile;
+    let tile_rows = profile.tile_rows;
     let admitted = profile.route_dims();
     if inputs.rows == 0 {
         return Err(invalid("slow-link plan has no rows"));
@@ -2347,6 +2386,15 @@ fn select(
     let plan = verdict.map_err(|bypass| bypass.to_string())?;
     prompt_bytes(&plan).map_err(|error| error.to_string())?;
     validate_window_layouts(&profile, &plan).map_err(|error| error.to_string())?;
+    // One line per request: every window is one full expert sweep, so this is
+    // the sweep count the receipts could not previously show.
+    eprintln!(
+        "  qwen4 S1 plan: {rows} rows from position {entry}, {} windows (= expert sweeps), window rows {:?} of the admitted {}, {}-row tiles",
+        plan.windows.len(),
+        plan.windows.iter().map(|w| w.rows).collect::<Vec<_>>(),
+        profile.window_rows,
+        profile.tile_rows,
+    );
     for window in &plan.windows {
         if bundle.prompt_txn_cuts(window.position, window.end_position()) != window.cuts {
             return Err(format!(
@@ -4571,8 +4619,12 @@ mod slowlink_prompt {
         let plan = plan(0, 40000, &[]);
         assert_chronology(&plan);
         let windows: Vec<usize> = plan.windows.iter().map(|w| w.rows).collect();
-        // A window ends at a tile end, so eleven 1536-row tiles (16896 rows) fill it.
-        assert_eq!(windows, vec![16896, 16896, 6208]);
+        // Three windows (a window ends at a tile end, eleven 1536-row tiles
+        // = 16896 rows fill one, so 40000 rows need three), levelled to the
+        // smallest tile-multiple cap that still yields three: nine tiles.
+        assert_eq!(windows, vec![13824, 13824, 12352]);
+        assert_eq!(windows.iter().sum::<usize>(), 40000);
+        assert!(windows.iter().all(|&rows| rows <= S1_WINDOW_ROWS));
         // One sweep per window: a long request can never claim one per prompt.
         let reports = vec![WindowReport::default(); plan.windows.len()];
         let receipt = layer_major_receipt(&ReceiptInputs {
