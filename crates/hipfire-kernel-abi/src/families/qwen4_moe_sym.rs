@@ -621,7 +621,7 @@ const OBJ_PM_GFX1201: ObjectRefV1 = ObjectRefV1::Embedded {
 const OBJ_PM_GFX1100: ObjectRefV1 = ObjectRefV1::Embedded {
     module: "qwen4_moe_iu4_sym_pm_gfx1100",
     artifact: "kernels/qwen4_moe_iu4_sym_pm_gfx1100.hxaco",
-    sha256: "5af2af82d147f4b3cd00924fd5499932d014e5ad81a0d68b05eb711d8eb847da",
+    sha256: "1b7e211514f21d9275e8207e04ff9bf9858a716f0dfebcc613781c40739aa439",
 };
 const OBJ_STREAM8_GFX1151: ObjectRefV1 = ObjectRefV1::Embedded {
     module: "qwen4_moe_gate_up_stream8_pm_gfx1151",
@@ -643,7 +643,7 @@ const OBJ_HIPCC_GFX1151: ObjectRefV1 = ObjectRefV1::HipccSource {
 const OBJ_E8P_GFX1100: ObjectRefV1 = ObjectRefV1::Embedded {
     module: "qwen4_moe_iu4_sym_e8p_pm_gfx1100",
     artifact: "kernels/qwen4_moe_iu4_sym_e8p_pm_gfx1100.hxaco",
-    sha256: "309c45abc5a65e326bfed920db58e110dc5fcde83f33a675dd86721e4abff105",
+    sha256: "1dfc581125a655fc0d15969fe63e18e5a145a427e59b7935109ce0dc1501a010",
 };
 const OBJ_E8P_GFX1151: ObjectRefV1 = ObjectRefV1::Embedded {
     module: "qwen4_moe_iu4_sym_e8p_pm_gfx1151",

@@ -52,8 +52,11 @@
 //! MAGIC; `v32..47` CACC (8/tensor); `v48..63` SUM (Whole; `v48+j` = row
 //! `rbase+2j+hi`, GateUp up sums at `v56+j`); `v64..79` SCF; `v80..87` fold
 //! products; `v88,v89` f32 scales; `v92..` operand set (A per tensor, X, scale
-//! dwords, `d`, four unpack scratch). SGPR: `s0:1` kernarg; `s2,s3` native
-//! workgroup ids; `s16:17` Y (Whole); `s18` M; `s47` TILE16; `s49` RBASE;
+//! dwords, `d`, four unpack scratch). SGPR: `s0:1` kernarg; the native workgroup ids at `s2,s3` (gfx1151) or
+//! `s14,s15` (gfx1100: LLVM's `FeatureUserSGPRInit16Bug` makes the descriptor declare 14 user SGPRs so that
+//! user + system >= 16, and the ids follow the declared count; see [`Gen::wg_in`]); the eight-dword kernarg
+//! `s_load_b256` at `s8:15` (gfx1151) or `s88:95` (gfx1100, clear of the ids; see [`Gen::args0`]);
+//! `s16:17` Y (Whole); `s18` M; `s47` TILE16; `s49` RBASE;
 //! `s52:53` LIVE (Whole); `s60:63` rounding masks (Whole). The epilogue's
 //! aliases (RT_TMP v32.., OWN v64.., SEND/RECV/SEL v68.., OUT v76.., PACK
 //! v80.., SiLU v92.. and s24..47, HIMASK s54:55, PSEL s56, SRD_Y s64:67) are
@@ -508,7 +511,15 @@ const KARG: u8 = 0;
 const T0: u8 = 4;
 const T1: u8 = 5;
 const T64: u8 = 6;
-const ARGS0: u8 = 8; // ptrs 8:9, tiles 10:11, sorted 12:13, xq 14:15
+/// Kernarg words 0x00..0x20 on gfx1151 (ptrs 8:9, tiles 10:11, sorted 12:13, xq 14:15); gfx1100: see [`ARGS0_PADDED`].
+const ARGS0: u8 = 8;
+/// gfx1100 kernarg block: s8:15 would overlap the workgroup ids at s14/s15 (padded user SGPRs); s88:95 is above
+/// every other allocation, and keeps the descriptor's SGPR count within the contracts' 104 ceiling (the E8P table
+/// literals, formerly s88:95, move to the freed s8..s13, see `e8p::LITS_PADDED`).
+const ARGS0_PADDED: u8 = 88;
+/// Real user SGPRs (the kernarg pointer) and enabled system SGPRs (workgroup ids X, Y).
+const USER_SGPRS: u8 = 2;
+const SYSTEM_SGPRS: u8 = 2;
 const ARGS1: u8 = 16; // Y 16:17
 const M: u8 = 18;
 const K: u8 = 19;
@@ -545,6 +556,25 @@ struct Gen {
 }
 
 impl Gen {
+    /// `.amdhsa_user_sgpr_count` of this arch (`Arch::declared_user_sgprs`: gfx1100 pads user + system to 16).
+    fn declared_user_sgprs(&self) -> u8 {
+        self.spec
+            .arch
+            .declared_user_sgprs(USER_SGPRS, SYSTEM_SGPRS)
+    }
+    /// SGPR of the native workgroup id X (`+ 1`: Y): after the DECLARED user SGPRs.
+    fn wg_in(&self) -> u8 {
+        self.declared_user_sgprs()
+    }
+    /// First SGPR of the eight kernarg dwords: s8 (the padding-free arches), [`ARGS0_PADDED`] where the
+    /// padded user SGPRs put the workgroup ids on s8..s15.
+    fn args0(&self) -> u8 {
+        if self.declared_user_sgprs() > USER_SGPRS {
+            ARGS0_PADDED
+        } else {
+            ARGS0
+        }
+    }
     fn label(&self, name: &str) -> String {
         format!(".Lc24_{}_{name}", self.spec.symbol())
     }
@@ -671,12 +701,12 @@ impl Gen {
         }
         // SGPRs.
         p.s::<2>("kernarg_ptr", KARG, Live::Whole)?;
-        p.s::<1>("wg_x_in", 2, Live::Whole)?;
-        p.s::<1>("wg_y_in", 3, Live::Whole)?;
+        p.s::<1>("wg_x_in", self.wg_in(), Live::Whole)?;
+        p.s::<1>("wg_y_in", self.wg_in() + 1, Live::Whole)?;
         p.s::<1>("s_tmp0", T0, kernel())?;
         p.s::<1>("s_tmp1", T1, kernel())?;
         p.s::<2>("s_tmp64", T64, kernel())?;
-        p.s::<8>("kernargs_0x00", ARGS0, kernel())?;
+        p.s::<8>("kernargs_0x00", self.args0(), kernel())?;
         p.s::<2>("y_base", ARGS1, Live::Whole)?;
         // `_acc` recomputes its addresses from M, TILE16 and RBASE after the K loop.
         let keep = |first: bool| if acc && first { Live::Whole } else { kernel() };
@@ -789,7 +819,7 @@ fn emit_on<T: Gfx11>(spec: Spec) -> Result<Emitted, String> {
         arch: spec.arch,
         symbol: spec.symbol(),
         kernargs: spec.kernargs(),
-        user_sgpr_count: 2,
+        user_sgpr_count: USER_SGPRS,
         system_sgpr_workgroup_id_y: true,
         workgroup_size: spec.threads() as u16,
         group_segment_fixed_size: spec.lds_bytes(),
