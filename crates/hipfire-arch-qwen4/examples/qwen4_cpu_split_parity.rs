@@ -746,6 +746,7 @@ fn load(args: &Args, max_seq: usize) -> R<Model> {
                         slab_recipe,
                         false,
                     ),
+                    0,
                 )?;
                 match resolved {
                     Some(n) => {

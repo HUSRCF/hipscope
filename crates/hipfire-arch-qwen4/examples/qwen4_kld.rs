@@ -83,9 +83,10 @@
 //! `--untiered d2|pcie` is the shipped un-tiered pair instead (eval/s11ref with `--decode`,
 //! or speed; no `--hot-budget-mib`/`--hotset`): no hot set and no tier lease, the loader's
 //! placement unchanged (`HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS` unset or `auto` resolves the
-//! product's automatic placement through `expert_residency::incumbent_auto_resident_layers`;
-//! a fixed count is an optional diagnostic override, set the same in both arms). The
-//! resolved placement is read back from the placed
+//! product's automatic placement through `expert_residency::incumbent_auto_resident_layers`,
+//! which also leaves this tool's own logits buffer free (`logit_rows` x vocab F32: ~1.9 GiB for a
+//! 2048-row all-row eval chunk, which the product never holds); a fixed count is an optional
+//! diagnostic override, set the same in both arms). The resolved placement is read back from the placed
 //! weights and recorded as `host_placed_trunk_layers` + `placement_digest`; a pair is only
 //! comparable when both digests are equal. The same code24 decode n10 route runs in both
 //! arms, so the pair differs only in who multiplies the host-mapped experts. `d2` needs
@@ -856,6 +857,9 @@ impl Model {
                             slab_recipe,
                             false,
                         ),
+                        // The all-row logits `Self::load` allocates after the placement
+                        // (the product keeps the last row only): left free by the placement.
+                        residency::all_row_logits_bytes(logit_rows, receipt.config.vocab_size)?,
                     )?;
                     match resolved {
                         Some(layers) => {

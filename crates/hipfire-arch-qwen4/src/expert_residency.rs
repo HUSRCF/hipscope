@@ -2357,12 +2357,39 @@ pub fn incumbent_placement_layers(
     .map(Some)
 }
 
+/// Device bytes of an all-row F32 logits buffer for `rows` rows of `vocab`
+/// logits: what a lab scorer that keeps every row's logits (`qwen4_kld`'s
+/// cold-prefill route) allocates beside the load, and the product never does
+/// (it keeps the last row and the speculative verify rows only, already in the
+/// forward term). Pass it as `lab_device_bytes` to
+/// [`incumbent_auto_resident_layers`].
+pub fn all_row_logits_bytes(rows: usize, vocab: usize) -> Result<u64, String> {
+    rows.checked_mul(vocab)
+        .and_then(|elements| elements.checked_mul(std::mem::size_of::<f32>()))
+        .and_then(|bytes| u64::try_from(bytes).ok())
+        .ok_or_else(|| format!("all-row logits bytes for {rows} rows x {vocab} overflow"))
+}
+
+/// `base_reserve` ([`AutoReserve::bytes`]) plus `lab_device_bytes` of device
+/// memory the caller allocates after the placement: the one place the lab term
+/// joins the reserve [`incumbent_auto_resident_layers`] sizes against.
+pub fn reserve_with_lab_bytes(base_reserve: u64, lab_device_bytes: u64) -> Result<u64, String> {
+    base_reserve
+        .checked_add(lab_device_bytes)
+        .ok_or_else(|| "auto expert VRAM reserve with lab device bytes overflows".to_string())
+}
+
 /// [`incumbent_placement_layers`] for a loaded single-device, no-MTP artifact
 /// on `gpu`: sizes the inputs exactly as the product loader does
 /// ([`placement_inputs`] at the requested prefill chunk, free VRAM from the
 /// device, one rank, no native MTP head) and returns the layers the product
 /// keeps resident (`None`: fully resident, also on unified memory). The shared
 /// lab loader's answer when no explicit layer count is set.
+///
+/// `lab_device_bytes` is device memory the caller allocates after the
+/// placement that the product never holds ([`all_row_logits_bytes`]); it is
+/// added to the base reserve, so the placement leaves it free. `0` is the
+/// product's own placement byte for byte.
 #[allow(clippy::too_many_arguments)]
 pub fn incumbent_auto_resident_layers(
     gpu: &rdna_compute::Gpu,
@@ -2375,6 +2402,7 @@ pub fn incumbent_auto_resident_layers(
     state_format: crate::Qwen4StateFormat,
     scratch_mode: Qwen4ForwardScratchMode,
     dedicated_stage: bool,
+    lab_device_bytes: u64,
 ) -> Result<Option<usize>, String> {
     if gpu.is_uma() {
         return Ok(None);
@@ -2408,7 +2436,8 @@ pub fn incumbent_auto_resident_layers(
         routed,
         inputs.layer_experts,
         config.num_hidden_layers,
-        inputs.reserve.bytes(),
+        reserve_with_lab_bytes(inputs.reserve.bytes(), lab_device_bytes)
+            .map_err(|error| format!("qwen4: {error}"))?,
         dedicated_stage,
     )
     .map_err(|error| format!("qwen4: {error}"))
@@ -4507,6 +4536,74 @@ mod tests {
             Full,
             0,
         )
+    }
+
+    /// The 7900 XTX `qwen4_kld eval` pilot (hipx `iu4kldP-1-wt2-iu4-p1`): `n_ctx` 2048 gives a 2048-row
+    /// chunk and `auto` placed layers 0..10. The tool then allocates a 2048 x 248320 F32 logits buffer
+    /// (1940 MiB) the product never holds; the first prefill ran out of device memory with only 210 MiB
+    /// left beyond the reserve and the safety margin. The placement must leave that buffer free.
+    #[test]
+    fn kld_all_row_logits_are_left_free_by_the_auto_placement() {
+        const MIB: u64 = 1 << 20;
+        let config = crate::config::compact_test_config();
+        let (max_seq, chunk) = (2048usize, 2048usize);
+        let base = auto_vram_reserve(
+            &config,
+            &crate::Qwen4ContextCommit::legacy(max_seq),
+            chunk,
+            Full,
+            target_state_format().layout(),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            base / MIB,
+            5788,
+            "the pilot's historical reserve at a 2048-row chunk"
+        );
+        // The pilot's measured inputs (the same card's daemon placement lines).
+        let (free, non_expert, layer, routed) = (24376 * MIB, 5115 * MIB, 1275 * MIB, 62475 * MIB);
+        let place = |lab: u64| {
+            incumbent_placement_layers(
+                free,
+                non_expert,
+                routed,
+                layer,
+                48,
+                reserve_with_lab_bytes(base, lab).unwrap(),
+                false,
+            )
+            .unwrap()
+        };
+        let logits = all_row_logits_bytes(2048, config.vocab_size).unwrap();
+        assert_eq!(logits, 2_034_237_440);
+        assert_eq!(logits / MIB, 1940);
+        // Without the term: ten layers, leaving only 210 MiB over the reserve and margin.
+        let uncharged = place(0).unwrap();
+        assert_eq!(uncharged, 10);
+        let left = |layers: usize| free - non_expert - layers as u64 * layer - base - 512 * MIB;
+        assert_eq!(left(uncharged) / MIB, 210);
+        assert!(
+            left(uncharged) < logits,
+            "the pilot placement cannot hold the logits"
+        );
+        // With it: eight layers, and every layer count the placement returns leaves the buffer free.
+        let charged = place(logits).unwrap();
+        assert_eq!(charged, 8);
+        assert!(left(charged) >= logits);
+        assert!(
+            left(charged + 1) < logits,
+            "the placement keeps the largest fitting count"
+        );
+        // The code24 corpus scores 512-row chunks: its logits are a quarter of that.
+        assert_eq!(
+            all_row_logits_bytes(512, config.vocab_size).unwrap(),
+            logits / 4
+        );
+        assert_eq!(reserve_with_lab_bytes(base, 0).unwrap(), base);
+        assert!(reserve_with_lab_bytes(u64::MAX, 1).is_err());
+        assert!(all_row_logits_bytes(usize::MAX, 2).is_err());
     }
 
     /// Both reserve formulas read `qwen4_forward_device_bytes` as their forward term, once and
