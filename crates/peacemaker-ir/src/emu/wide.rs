@@ -11,7 +11,10 @@
 //! Carry/borrow masks are wave32 dwords whose inactive lanes are zero (ISA: "Inactive lanes write zero into this
 //! carry-out"). DPP, SDWA, OMOD and OP_SEL have no meaning here and are errors.
 use super::{Result, State, Wide};
-use crate::{operand::Omod, Arch, Inst};
+use crate::{
+    operand::{Omod, Operand, Special},
+    Arch, Inst,
+};
 
 fn stem(name: &str) -> &str {
     name.strip_suffix("_e32")
@@ -33,6 +36,8 @@ pub(super) fn handles(name: &str) -> bool {
             | "v_lshlrev_b64"
             | "v_subrev_co_u32"
             | "v_sub_co_ci_u32"
+            | "v_mad_u64_u32"
+            | "v_mad_i64_i32"
     )
 }
 
@@ -89,6 +94,10 @@ pub(super) fn execute(_arch: Arch, name: &str, i: &Inst, s: &mut State) -> Resul
     let mut vals = [0u64; 32];
     let mut carry = 0u32;
     let explicit_carry = matches!(op, "v_sub_co_ci_u32") && o.len() >= 5 || op == "v_subrev_co_u32";
+    let sdst_null = matches!(o.get(1), Some(Operand::Special(Special::Null)));
+    if op == "v_mad_i64_i32" && !sdst_null {
+        return Err(format!("{name}: the signed form's carry/overflow output is not specified; SDST must be null"));
+    }
     for lane in 0..32 {
         if s.exec >> lane & 1 == 0 {
             continue;
@@ -169,6 +178,21 @@ pub(super) fn execute(_arch: Arch, name: &str, i: &Inst, s: &mut State) -> Resul
             "v_lshlrev_b64" => {
                 s.read_wide(src(2)?, lane, Wide::Unsigned)? << (s.read(src(1)?, lane, 0)? & 63)
             }
+            // { carry, D0.u64 } = 65'(S0.u32) * 65'(S1.u32) + 65'(S2.u64); the carry bit goes to the SDST lane mask.
+            "v_mad_u64_u32" => {
+                let (a, b) = (s.read(src(2)?, lane, 0)?, s.read(src(3)?, lane, 0)?);
+                let c = s.read_wide(src(4)?, lane, Wide::Unsigned)?;
+                let r = u128::from(a) * u128::from(b) + u128::from(c);
+                carry |= u32::from(r >> 64 != 0) << lane;
+                r as u64
+            }
+            // D0.i64 = S0.i32 * S1.i32 + S2.i64 (wrapping). The ISA's carry/overflow output of the signed form is not
+            // specified by the pseudocode, so a non-null SDST is refused below.
+            "v_mad_i64_i32" => {
+                let (a, b) = (s.read(src(2)?, lane, 0)? as i32, s.read(src(3)?, lane, 0)? as i32);
+                let c = s.read_wide(src(4)?, lane, Wide::Signed)? as i64;
+                (i64::from(a) * i64::from(b)).wrapping_add(c) as u64
+            }
             // tmp = S1 - S0; carry-out = S0 > S1 (unsigned borrow).
             "v_subrev_co_u32" => {
                 let (a, b) = (s.read(src(2)?, lane, 0)?, s.read(src(3)?, lane, 0)?);
@@ -204,6 +228,8 @@ pub(super) fn execute(_arch: Arch, name: &str, i: &Inst, s: &mut State) -> Resul
                 | "v_min_f64"
                 | "v_lshrrev_b64"
                 | "v_lshlrev_b64"
+                | "v_mad_u64_u32"
+                | "v_mad_i64_i32"
         ) {
             s.put_wide(&o[0], lane, vals[lane])?;
         } else {
@@ -213,6 +239,7 @@ pub(super) fn execute(_arch: Arch, name: &str, i: &Inst, s: &mut State) -> Resul
     match op {
         "v_subrev_co_u32" | "v_sub_co_ci_u32" if explicit_carry => s.put(src(1)?, 0, 0, carry)?,
         "v_sub_co_ci_u32" => s.vcc = carry,
+        "v_mad_u64_u32" if !sdst_null => s.put(src(1)?, 0, 0, carry)?,
         _ => {}
     }
     Ok(())

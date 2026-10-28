@@ -1017,6 +1017,15 @@ fn vector(
             Class::F32,
             legacy_select(arch, g(0, false)?, g(1, false)?, false)?,
         ),
+        // gfx1100 VOPD `v_dual_max_f32`/`v_dual_min_f32`: the same compare-select as `v_max_f32`/`v_min_f32`.
+        "v_dual_max_f32" => (
+            Class::F32,
+            legacy_select(arch, g(0, false)?, g(1, false)?, true)?,
+        ),
+        "v_dual_min_f32" => (
+            Class::F32,
+            legacy_select(arch, g(0, false)?, g(1, false)?, false)?,
+        ),
         "v_max3_f32" => (
             Class::F32,
             legacy_select(
@@ -1033,6 +1042,26 @@ fn vector(
                 legacy_select(arch, g(0, false)?, g(1, false)?, false)?,
                 g(2, false)?,
                 false,
+            )?,
+        ),
+        // gfx11 VOP3 three-operand legacy min/max (RDNA3 ISA): `v_maxmin_f32 = min(max(S0, S1), S2)` and
+        // `v_minmax_f32 = max(min(S0, S1), S2)`, each stage the legacy compare-select of `v_max_f32`/`v_min_f32`.
+        "v_maxmin_f32" => (
+            Class::F32,
+            legacy_select(
+                arch,
+                legacy_select(arch, g(0, false)?, g(1, false)?, true)?,
+                g(2, false)?,
+                false,
+            )?,
+        ),
+        "v_minmax_f32" => (
+            Class::F32,
+            legacy_select(
+                arch,
+                legacy_select(arch, g(0, false)?, g(1, false)?, false)?,
+                g(2, false)?,
+                true,
             )?,
         ),
         "v_max_num_f32" | "v_dual_max_num_f32" => (Class::F32, num_select(f(0)?, f(1)?, true)),
@@ -1285,6 +1314,57 @@ fn vector(
                 Class::Own,
                 u32::from(convert::f32_to_f16_rtz(a)) | u32::from(convert::f32_to_f16_rtz(b)) << 16,
             )
+        }
+        // D.f16 = fma(S0.f16, S1.f16, S2.f16) (`v_fmac_f16`: S2 is the destination half), ONE rounding (the product of two
+        // halves is exact in f64, `fma_f16` rounds the odd-rounded sum once to nearest even). Finite operands only: NaN and
+        // infinite halves are not measured. The destination is a true16 half; the other half is preserved.
+        "v_fma_f16" | "v_fmac_f16" => {
+            half_dst(o)?;
+            plain_16(i, d, true)?;
+            let finite = |x: u32| -> Result<u32> {
+                if x >> 23 & 0xff == 0xff {
+                    Err(format!("{name}: infinite f16 operand is not modeled"))
+                } else {
+                    Ok(x)
+                }
+            };
+            let (a, b) = (finite(f16_operand(s, o, i, lane, 0)?)?, finite(f16_operand(s, o, i, lane, 1)?)?);
+            let c = if stem(name) == "v_fma_f16" {
+                finite(f16_operand(s, o, i, lane, 2)?)?
+            } else {
+                finite(f16_in(half_src(s, &o[0], i, lane, 2)?)?)?
+            };
+            let mut h = fma_f16(a, b, c);
+            if m.clamp {
+                h = clamp_f16(h);
+            }
+            (Class::Own, u32::from(h))
+        }
+        // D.b16 = S0.b16 (true16: the other half of the destination is preserved).
+        "v_mov_b16" => {
+            half_dst(o)?;
+            plain_16(i, d, false)?;
+            if m.clamp {
+                return Err("clamp on v_mov_b16 is not modeled".into());
+            }
+            (Class::Own, u32::from(half_src(s, o.get(1).ok_or("missing vector operand")?, i, lane, 0)?))
+        }
+        // D.f16 = u16_to_f16(S0.u16): a u16 is exact in binary32, so one rounding to binary16 (65520.. rounds to infinity).
+        "v_cvt_f16_u16" => {
+            half_dst(o)?;
+            plain_16(i, d, false)?;
+            let x = half_src(s, o.get(1).ok_or("missing vector operand")?, i, lane, 0)?;
+            let mut h = convert::f32_to_f16(f32::from(x).to_bits());
+            if m.clamp {
+                h = clamp_f16(h);
+            }
+            (Class::Own, u32::from(h))
+        }
+        "v_or3_b32" => (Class::Int, raw(0)? | raw(1)? | raw(2)?),
+        // D.i32 = S0.i24 * S1.i24 (low 32 bits of the product).
+        "v_mul_i32_i24" => {
+            let sext = |x: u32| ((x << 8) as i32) >> 8;
+            (Class::Int, sext(raw(0)?).wrapping_mul(sext(raw(1)?)) as u32)
         }
         "v_exp_f32" | "v_rcp_f32" | "v_rcp_iflag_f32" | "v_log_f32" | "v_rsq_f32"
         | "v_sqrt_f32" => {
@@ -2042,6 +2122,15 @@ fn scalar(name: &str, i: &Inst, s: &mut State) -> Result<()> {
         s.scc = value != 0;
         return Ok(());
     }
+    // gfx11 `s_and_not1_saveexec_b32` (= `s_andn2_saveexec_b32`): D = EXEC; EXEC = S0 & ~EXEC; SCC = EXEC != 0.
+    if name == "s_and_not1_saveexec_b32" {
+        let mask = rd(s, 1)?;
+        let old = s.exec;
+        s.put(o.first().ok_or("missing scalar operand")?, 0, 0, old)?;
+        s.exec = mask & !old;
+        s.scc = s.exec != 0;
+        return Ok(());
+    }
     // Save the old wave32 EXEC, then intersect EXEC with S0 and report nonempty EXEC.
     // Capture S0 first because native divergence masks can alias the saved destination.
     if name == "s_and_saveexec_b32" {
@@ -2149,6 +2238,17 @@ fn scalar(name: &str, i: &Inst, s: &mut State) -> Result<()> {
         "s_xor_b32" => nonzero(a ^ b),
         "s_andn2_b32" => nonzero(a & !b),
         "s_orn2_b32" => nonzero(a | !b),
+        // gfx11 spelling of `s_andn2_b32` / `s_orn2_b32`.
+        "s_and_not1_b32" => nonzero(a & !b),
+        "s_or_not1_b32" => nonzero(a | !b),
+        // D = |S0.i32| (wrapping for i32::MIN); SCC = D != 0.
+        "s_abs_i32" => nonzero((a as i32).wrapping_abs() as u32),
+        // tmp = (S0.u32 << N) + S1.u32 in 64 bits; D = tmp[31:0]; SCC = tmp >= 2^32.
+        "s_lshl1_add_u32" | "s_lshl2_add_u32" | "s_lshl3_add_u32" | "s_lshl4_add_u32" => {
+            let n = u32::from(name.as_bytes()[6] - b'0');
+            let sum = (u64::from(a) << n) + u64::from(b);
+            (sum as u32, Some(sum >> 32 != 0))
+        }
         "s_not_b32" => nonzero(!a),
         "s_brev_b32" => (a.reverse_bits(), None),
         "s_lshl_b32" => nonzero(a << (b & 31)),
@@ -3358,10 +3458,7 @@ mod tests {
         i.mods.op_sel = 0b10;
         i.mods.op_sel_hi = 0b10;
         run("v_pk_add_f16", &i, &mut st).unwrap();
-        assert_eq!(
-            st.v[0][0], 0x4700_4700,
-            "a low (2.0) + b high (5.0) in both results"
-        );
+        assert_eq!(st.v[0][0], 0x4700_4700, "a low (2.0) + b high (5.0) in both results");
     }
 
     #[test]

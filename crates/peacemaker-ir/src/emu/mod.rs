@@ -10,6 +10,8 @@ mod dot;
 mod memory;
 pub mod mma;
 #[cfg(test)]
+mod gate_ops_tests;
+#[cfg(test)]
 mod swmmac_fixtures;
 pub mod trans;
 mod wide;
@@ -39,6 +41,10 @@ impl WriteSet {
     }
     pub fn count(&self) -> usize {
         self.bits.iter().map(|b| b.count_ones() as usize).sum()
+    }
+    /// First byte of `[start, start+len)` that was never written, if any (bytes past the set count as unwritten).
+    pub fn first_unwritten(&self, start: usize, len: usize) -> Option<usize> {
+        (start..start + len).find(|&b| !self.contains(b))
     }
     fn mark(&mut self, start: usize, len: usize) {
         let mut pos = start;
@@ -107,6 +113,24 @@ impl Memory {
         r.bytes[o..o + bytes.len()].copy_from_slice(bytes);
         r.written.mark(o, bytes.len());
         Ok(())
+    }
+    /// Maps `bytes` as its own region placed above every existing region with at least `guard` unmapped bytes before it
+    /// (and, for the first region, below it), 4 KiB aligned; returns the base. The region is exactly `bytes.len()` long, so any
+    /// access past either end lands in unmapped space and `locate` refuses it.
+    pub fn map_guarded(&mut self, name: String, bytes: Vec<u8>, guard: u64) -> Result<u64> {
+        let top = self
+            .regions
+            .iter()
+            .map(|r| r.base + r.bytes.len() as u64)
+            .max()
+            .unwrap_or(0);
+        let base = top
+            .checked_add(guard)
+            .and_then(|b| b.checked_add(0xfff))
+            .ok_or("region address overflow")?
+            & !0xfff;
+        self.map(name, base, bytes)?;
+        Ok(base)
     }
 }
 
@@ -181,9 +205,13 @@ impl State {
             sg += n;
         }
         let rs = d.compute_pgm_rsrc2.0;
-        if sg != ((rs >> 1) & 31) as usize {
+        // hipcc gfx11 kernels declare more user SGPRs than they enable (padding between the last enabled user
+        // register and the workgroup ids, left 0); the ids follow the DECLARED count. gfx1201 ids are in ttmps.
+        let declared = ((rs >> 1) & 31) as usize;
+        if sg > declared || (sg != declared && arch == Arch::Gfx1201) {
             return Err("descriptor user SGPR count disagrees with enabled properties".into());
         }
+        sg = declared;
         if arch == Arch::Gfx1201 {
             st.t[9] = launch.workgroup[0];
             st.t[7] = if rs & (1 << 8) != 0 {
@@ -383,6 +411,7 @@ pub struct Emulator<'a> {
     kernel: &'a Kernel,
     arch: Arch,
     steps: Vec<Step<'a>>,
+    strict_lds: bool,
 }
 impl<'a> Emulator<'a> {
     pub fn new(program: &'a Program, symbol: &str) -> Result<Self> {
@@ -416,9 +445,30 @@ impl<'a> Emulator<'a> {
             kernel,
             arch: program.target.arch,
             steps,
+            strict_lds: false,
         })
     }
+    /// Track which LDS bytes the workgroup has written; a read of any other LDS byte (including by an LDS atomic) is an
+    /// error. Off by default so existing differential tests keep their (zero-initialised LDS) behaviour.
+    pub fn strict_lds(mut self) -> Self {
+        self.strict_lds = true;
+        self
+    }
+    /// Execute a gfx1100 program with gfx1151's (RDNA3.5) numerics and WMMA model. The emulator has no hardware-
+    /// qualified gfx1100 model (WMMA fragments, V_EXP/LOG/RCP/RSQ/SQRT), so gfx1100 programs are refused without this.
+    /// Only valid where emulated arms are compared with each other or with an exact CPU reference (the pre-card safety
+    /// gate), never as a claim about gfx1100 hardware ulps. Instruction decode still uses the gfx1100 tables.
+    pub fn gfx1100_as_gfx1151(mut self) -> Self {
+        if self.arch == Arch::Gfx1100 {
+            self.arch = Arch::Gfx1151;
+        }
+        self
+    }
     pub fn run_workgroup(&self, launch: &Launch, mem: &mut Memory) -> Result<()> {
+        self.run_workgroup_counted(launch, mem).map(|_| ())
+    }
+    /// As `run_workgroup`, returning the number of instructions the workgroup's waves executed.
+    pub fn run_workgroup_counted(&self, launch: &Launch, mem: &mut Memory) -> Result<u64> {
         let kernel = self.kernel;
         let symbol = &kernel.symbol.0;
         let Abi::Hsa { descriptor: d, .. } = &kernel.abi else {
@@ -440,6 +490,7 @@ impl<'a> Emulator<'a> {
                 .checked_add(launch.dynamic_lds)
                 .ok_or("LDS size overflow")? as usize
         ];
+        let mut defined = self.strict_lds.then(|| WriteSet::new(lds.len()));
         let mut executed = 0u64;
         while states.iter().any(|s| !s.ended) {
             let mut progress = false;
@@ -459,7 +510,9 @@ impl<'a> Emulator<'a> {
                 let result = match step.class {
                     Class::Wait => Ok(()),
                     Class::Control => control(name, inst, st, kernel),
-                    Class::Memory => memory::execute(name, inst, st, mem, &mut lds),
+                    Class::Memory => {
+                        memory::execute_tracked(name, inst, st, mem, &mut lds, defined.as_mut())
+                    }
                     Class::Alu => alu::execute(self.arch, name, inst, st),
                 };
                 result.map_err(|e| {
@@ -485,7 +538,7 @@ impl<'a> Emulator<'a> {
                 return Err("workgroup barrier deadlock".into());
             }
         }
-        Ok(())
+        Ok(executed)
     }
 }
 /// Err-path only: exact architectural bits of the failing wave state and every
@@ -1006,5 +1059,105 @@ mod tests {
         );
         assert!(m.read(0x1003, 2).is_err());
         assert!(m.map("alias".into(), 0x1002, vec![0; 4]).is_err());
+    }
+    /// One-block straight-line program ending in `s_endpgm`, symbol "exchange", 256 bytes of static LDS.
+    fn straight(ops: Vec<(&str, Vec<Operand>)>) -> Program {
+        use crate::{
+            cfg::{Block, BlockId, Terminator},
+            inst::{Setting, Target},
+        };
+        let mut body = crate::Body::default();
+        let mut n = 0;
+        for (name, o) in ops {
+            let id = body.insts.insert(insn(name, o));
+            body.layout.push(id);
+            n += 1;
+        }
+        let id = body.insts.insert(insn("s_endpgm", vec![]));
+        body.layout.push(id);
+        body.blocks.push(Block {
+            id: BlockId(0),
+            range: (0, n + 1),
+            term: Terminator::EndPgm,
+            preds: Default::default(),
+            succs: Default::default(),
+        });
+        Program {
+            target: Target {
+                arch: Arch::Gfx1201,
+                xnack: Setting::Any,
+                sramecc: Setting::Any,
+                abi_version: 4,
+            },
+            kernels: vec![kernel(body)],
+            source: None,
+        }
+    }
+    fn run_straight(p: &Program, strict: bool) -> Result<u64> {
+        let emu = Emulator::new(p, "exchange").unwrap();
+        let emu = if strict { emu.strict_lds() } else { emu };
+        emu.run_workgroup_counted(
+            &Launch {
+                kernarg_ptr: 0,
+                workgroup: [0, 0, 0],
+                block: [32, 1, 1],
+                dynamic_lds: 0,
+            },
+            &mut Memory::default(),
+        )
+    }
+    #[test]
+    fn strict_lds_rejects_read_before_write_only_when_enabled() {
+        let p = straight(vec![("ds_load_b32", vec![v(3), v(1)])]);
+        assert_eq!(run_straight(&p, false).unwrap(), 2);
+        let e = run_straight(&p, true).unwrap_err();
+        assert!(e.contains("never written in this workgroup"), "{e}");
+        assert!(e.contains("ds_load_b32"), "{e}");
+        assert!(e.contains("inst=0"), "{e}");
+    }
+    #[test]
+    fn strict_lds_accepts_read_after_write_and_rejects_partial_cover() {
+        // v1 == 0 in every lane: all lanes store dword 0, then load it back.
+        let ok = straight(vec![
+            ("ds_store_b32", vec![v(1), v(0)]),
+            ("ds_load_b32", vec![v(3), v(1)]),
+        ]);
+        assert_eq!(run_straight(&ok, true).unwrap(), 3);
+        // A b64 load over a dword that was only half written reads an unwritten byte 4.
+        let partial = straight(vec![
+            ("ds_store_b32", vec![v(1), v(0)]),
+            ("ds_load_b64", vec![reg(Kind::V, 4, 2), v(1)]),
+        ]);
+        assert_eq!(run_straight(&partial, false).unwrap(), 3);
+        let e = run_straight(&partial, true).unwrap_err();
+        assert!(e.contains("byte 0x4 never written"), "{e}");
+    }
+    #[test]
+    fn strict_lds_still_reports_out_of_bounds() {
+        // LDS is 256 bytes; offset 0x100 is past the end.
+        let mut o = vec![v(3), v(1)];
+        o.push(Operand::Imm(ImmField::DsOffset(0x100)));
+        let p = straight(vec![("ds_load_b32", o)]);
+        for strict in [false, true] {
+            let e = run_straight(&p, strict).unwrap_err();
+            assert!(e.contains("LDS read out of bounds"), "{e}");
+        }
+    }
+    #[test]
+    fn map_guarded_leaves_unmapped_gaps_around_exact_size_regions() {
+        let mut m = Memory::default();
+        let a = m.map_guarded("a".into(), vec![1; 64], 0x10000).unwrap();
+        let b = m.map_guarded("b".into(), vec![2; 4096], 0x10000).unwrap();
+        assert!(a >= 0x10000 && a % 0x1000 == 0 && b % 0x1000 == 0);
+        assert!(b >= a + 64 + 0x10000);
+        assert!(m.read(a, 64).is_ok() && m.read(b, 4096).is_ok());
+        // one byte past the end, one byte before the start, and the whole gap are unmapped
+        assert!(m.read(a + 64, 1).is_err());
+        assert!(m.read(a - 1, 1).is_err());
+        assert!(m.read(b - 1, 1).is_err());
+        assert!(m.read(b + 4096, 4).is_err());
+        assert!(m.read(a + 60, 8).is_err());
+        let w = WriteSet::new(10);
+        assert_eq!(w.first_unwritten(2, 3), Some(2));
     }
 }

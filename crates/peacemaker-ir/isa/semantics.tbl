@@ -373,6 +373,8 @@ v_and_or_b32	alu
 v_cmp_gt_f32_e32	alu
 v_max_num_f32_e64	alu
 v_maxmin_num_f32	alu
+v_maxmin_f32	alu
+v_minmax_f32	alu
 v_add_lshl_u32	alu
 v_cmpx_eq_u32_e32	alu
 v_cmpx_gt_i32_e32	alu
@@ -394,3 +396,46 @@ v_mul_hi_i32	alu
 v_max_f32_e64	alu
 v_mul_f32_e64	alu
 v_subrev_f32_e32	alu
+# gfx1100 hipcc incumbents/candidates (PM-KRSI hip_loop --emu gate): rows backed by emu/alu.rs, emu/wide.rs, emu/memory.rs
+# and the unit tests in emu/gate_ops_tests.rs. `buffer_gl0_inv` (L0 cache invalidate), `s_sendmsg` (the end-of-kernel
+# MSG_DEALLOC_VGPRS hint) and `s_set_inst_prefetch_distance` (instruction prefetch hint) change no architectural state
+# the interpreter models: no-ops like s_nop.
+buffer_gl0_inv	wait
+s_sendmsg	wait
+s_set_inst_prefetch_distance	wait
+s_abs_i32	alu
+s_and_not1_b32	alu
+s_or_not1_b32	alu
+s_and_not1_saveexec_b32	alu
+s_lshl1_add_u32	alu
+s_lshl2_add_u32	alu
+s_lshl3_add_u32	alu
+s_lshl4_add_u32	alu
+v_cmp_ge_i32_e64	alu
+v_cmp_le_i32_e32	alu
+v_cmp_lt_f32_e32	alu
+v_cmp_lt_i32_e32	alu
+v_cmpx_lt_f32_e32	alu
+v_cmpx_lt_i32_e32	alu
+v_cvt_f16_f32_e64	alu
+v_cvt_f16_u16_e32	alu
+v_dual_max_f32	alu
+v_dual_min_f32	alu
+v_fma_f16	alu
+v_fmac_f16_e32	alu
+v_fmac_f16_e64	alu
+v_lshlrev_b64_e64	alu
+v_mad_i64_i32	alu
+v_mad_u64_u32	alu
+v_mov_b16_e32	alu
+v_mov_b16_e64	alu
+v_mul_i32_i24_e32	alu
+v_or3_b32	alu
+ds_load_2addr_b64	memory
+ds_store_2addr_b64	memory
+ds_load_i8	memory
+ds_load_u16_d16	memory
+global_load_d16_hi_b16	memory
+global_load_d16_i8	memory
+global_load_d16_u8	memory
+buffer_load_i8	memory

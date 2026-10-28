@@ -467,3 +467,11 @@ v_cmpx_eq_u16_e32	vopc	0xba	SRC0:16,VSRC1:16	implicit	SRC0,VSRC1	exec:w	-	v_cmpx
 v_cmpx_ne_u16_e32	vopc	0xbd	SRC0:16,VSRC1:16	implicit	SRC0,VSRC1	exec:w	-	v_cmpx_ne_u16_e32 0, v1.l	7D7A0280	-
 v_cmpx_lt_i64_e32	vopc	0xd1	SRC0:64,VSRC1:64	implicit	SRC0,VSRC1	exec:w	-	v_cmpx_lt_i64_e32 s[2:3], v[4:5]	7DA20802	-
 v_cmpx_eq_u64_e32	vopc	0xda	SRC0:64,VSRC1:64	implicit	SRC0,VSRC1	exec:w	-	v_cmpx_eq_u64_e32 s[2:3], v[4:5]	7DB40802	-
+v_cmpx_le_i32_e32	vopc	0xc3	SRC0:32,VSRC1:32	implicit	SRC0,VSRC1	exec:w	-	v_cmpx_le_i32_e32 s5, v2	7D860405	-
+v_cmpx_le_u32_e32	vopc	0xcb	SRC0:32,VSRC1:32	implicit	SRC0,VSRC1	exec:w	-	v_cmpx_le_u32_e32 v6, v2	7D960506	-
+v_cmpx_le_f32_e64	vop3	0x93	VDST:64,SRC0:32,SRC1:32,literal@last	VDST	SRC0,SRC1	exec:w	-	v_cmpx_le_f32_e64 0x48000000, |v6|	D493027E 02020CFF 48000000	src2_unused:ignored:0x1ff:0x00/0x80/0x101
+v_cmpx_ngt_f32_e64	vop3	0x9b	VDST:64,SRC0:32,SRC1:32,literal@last	VDST	SRC0,SRC1	exec:w	-	v_cmpx_ngt_f32_e64 0x3f200000, |v54|	D49B027E 02026CFF 3F200000	src2_unused:ignored:0x1ff:0x00/0x80/0x101
+v_bcnt_u32_b32	vop3	0x31e	VDST:32,SRC0:32,SRC1:32	VDST	SRC0,SRC1	-	-	v_bcnt_u32_b32 v16, v1, 0	D71E0010 02010101	src2_unused:ignored:0x1ff:0x00/0x80/0x101
+v_sub_f32_e64	vop3	0x104	VDST:32,SRC0:32,SRC1:32	VDST	SRC0,SRC1	-	-	v_sub_f32_e64 v7, s11, s10	D5040007 0200140B	src2_unused:ignored:0x1ff:0x00/0x80/0x101,neg:honored:0x7,abs:honored:0x7,omod:ignored:0x3:0x0/0x1/0x2/0x3
+v_subrev_f32_e32	vop2	0x5	VDST:32,SRC0:32,VSRC1:32	VDST	SRC0,VSRC1	-	-	v_subrev_f32_e32 v6, s10, v6	0A0C0C0A	-
+buffer_load_i8	buffer	0x11	VDATA:32,VADDR:64,RSRC:128,SOFFSET:32	VDATA	VADDR,RSRC,SOFFSET	-	Vm:1	buffer_load_i8 v59, v10, s[36:39], s0 offen	E0440000 00493B0A	-

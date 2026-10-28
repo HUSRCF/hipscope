@@ -2,7 +2,7 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-use super::{Memory, Result, State};
+use super::{Memory, Result, State, WriteSet};
 use crate::{
     operand::{ImmField, Operand, VmemToken},
     Inst,
@@ -60,6 +60,7 @@ fn ds_atomic_execute(
     i: &Inst,
     s: &mut State,
     lds: &mut [u8],
+    mut defined: Option<&mut WriteSet>,
 ) -> Result<()> {
     let ops = &i.operands;
     let (addr_op, data_op) = if returns { (1, 2) } else { (0, 1) };
@@ -90,8 +91,16 @@ fn ds_atomic_execute(
                 "{name}: two active lanes target LDS dword {addr:#x}; the ISA does not order them"
             ));
         }
+        let slot_at = addr as usize;
+        if let Some(w) = defined.as_deref() {
+            if let Some(b) = w.first_unwritten(slot_at, 4) {
+                return Err(format!(
+                    "{name}: LDS atomic reads byte {b:#x} never written in this workgroup"
+                ));
+            }
+        }
         let slot = lds
-            .get_mut(addr as usize..addr as usize + 4)
+            .get_mut(slot_at..slot_at + 4)
             .ok_or_else(|| format!("LDS atomic out of bounds {addr:#x}"))?;
         let old = u32::from_le_bytes((&*slot).try_into().unwrap());
         let data = s.read(&ops[data_op], lane, 0)?;
@@ -110,6 +119,9 @@ fn ds_atomic_execute(
             }
         };
         slot.copy_from_slice(&new.to_le_bytes());
+        if let Some(w) = defined.as_deref_mut() {
+            w.mark(slot_at, 4);
+        }
         if returns {
             s.put(&ops[0], lane, 0, old)?;
         }
@@ -185,6 +197,17 @@ pub(super) fn execute(
     s: &mut State,
     mem: &mut Memory,
     lds: &mut [u8],
+) -> Result<()> {
+    execute_tracked(name, i, s, mem, lds, None)
+}
+/// `defined`: when present, the per-workgroup set of LDS bytes written so far; a read of any other byte is an error.
+pub(super) fn execute_tracked(
+    name: &str,
+    i: &Inst,
+    s: &mut State,
+    mem: &mut Memory,
+    lds: &mut [u8],
+    mut defined: Option<&mut WriteSet>,
 ) -> Result<()> {
     if i.mods.ds.gds {
         return Err("GDS not modeled".into());
@@ -268,7 +291,7 @@ pub(super) fn execute(
         return Ok(());
     }
     if let Some((kind, returns)) = ds_atomic(name) {
-        return ds_atomic_execute(kind, returns, name, i, s, lds);
+        return ds_atomic_execute(kind, returns, name, i, s, lds, defined);
     }
     let load = name.contains("load");
     let ds = name.starts_with("ds_");
@@ -376,8 +399,16 @@ pub(super) fn execute(
                         continue;
                     }
                     let src = if ds {
-                        lds.get(cur as usize + offset..cur as usize + offset + size)
-                            .ok_or_else(|| format!("LDS read out of bounds {cur:#x}+{n}"))?
+                        let lo = cur as usize + offset;
+                        let bytes = lds
+                            .get(lo..lo + size)
+                            .ok_or_else(|| format!("LDS read out of bounds {cur:#x}+{n}"))?;
+                        if let Some(b) = defined.as_deref().and_then(|w| w.first_unwritten(lo, size)) {
+                            return Err(format!(
+                                "LDS read of byte {b:#x} never written in this workgroup (access {cur:#x}+{n})"
+                            ));
+                        }
+                        bytes
                     } else {
                         mem.read(cur + offset as u64, size)?
                     };
@@ -418,9 +449,13 @@ pub(super) fn execute(
                         continue;
                     }
                     if ds {
-                        lds.get_mut(cur as usize + offset..cur as usize + offset + size)
+                        let lo = cur as usize + offset;
+                        lds.get_mut(lo..lo + size)
                             .ok_or_else(|| format!("LDS write out of bounds {cur:#x}+{n}"))?
                             .copy_from_slice(&bytes[offset..offset + size]);
+                        if let Some(w) = defined.as_deref_mut() {
+                            w.mark(lo, size);
+                        }
                     } else {
                         mem.write(cur + offset as u64, &bytes[offset..offset + size])?;
                     }
