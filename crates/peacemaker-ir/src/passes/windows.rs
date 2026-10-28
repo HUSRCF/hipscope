@@ -235,6 +235,14 @@ fn clause_length(mods: &Modifiers) -> Option<usize> {
 /// blocks. Clause violations and delay consumers past the block end reject;
 /// backward producer over-reach across joins goes ambiguous (never rejects).
 pub fn check_windows(body: &Body) -> Result<WindowFacts, WindowError> {
+    check_windows_with(body, false)
+}
+
+/// As [`check_windows`]; with `lenient_delay` an `s_delay_alu` whose skip counts across a block boundary that is not a
+/// plain fall-through (hipcc legally emits a hint whose second consumer lies past a conditional branch or in the
+/// fall-through block of one) resolves to `Ambiguous` instead of rejecting. The hint is performance-only (NO_DEP is
+/// always sound; the interpreter ignores it), so ambiguity loses nothing; PM-authored code keeps the strict rule.
+pub fn check_windows_with(body: &Body, lenient_delay: bool) -> Result<WindowFacts, WindowError> {
     if body.blocks.is_empty() {
         return Err(WindowError::BlocksNotBuilt);
     }
@@ -302,7 +310,7 @@ pub fn check_windows(body: &Body) -> Result<WindowFacts, WindowError> {
                 let block = containing_block(body, id).expect("inst is laid out in a block");
                 facts
                     .delays
-                    .push(resolve_delay(body, id, block, pos, hint)?);
+                    .push(resolve_delay(body, id, block, pos, hint, lenient_delay)?);
             }
             _ => {}
         }
@@ -316,6 +324,7 @@ fn resolve_delay(
     block: BlockId,
     pos: usize,
     raw: crate::operand::DelayAluHint,
+    lenient: bool,
 ) -> Result<DelayFact, WindowError> {
     let ambiguous = DelayFact::ambiguous(hint, block);
     let (_, end) = body.blocks[block.0].range;
@@ -339,14 +348,14 @@ fn resolve_delay(
     if pos + 1 >= end || pos + 1 + fwd >= end {
         let last = pos + 1 + fwd;
         if body.layout.get(last).is_none() {
-            return Err(WindowError::DelayCrossesLeader { index: pos });
+            return if lenient { Ok(ambiguous) } else { Err(WindowError::DelayCrossesLeader { index: pos }) };
         }
         let mut b = block.0;
         while body.blocks[b].range.1 <= last {
             let fall = body.blocks[b].term == Terminator::FallThrough;
             let next = b + 1;
             if !fall || body.blocks.get(next).is_none_or(|n| n.range.0 != body.blocks[b].range.1) {
-                return Err(WindowError::DelayCrossesLeader { index: pos });
+                return if lenient { Ok(ambiguous) } else { Err(WindowError::DelayCrossesLeader { index: pos }) };
             }
             b = next;
         }
@@ -595,6 +604,17 @@ mod tests {
             check_windows(&body),
             Err(WindowError::DelayCrossesLeader { index: 0 })
         );
+    }
+    #[test]
+    fn hipcc_delay_skip_over_a_branch_is_accepted_as_ambiguous() {
+        // Same shape as `delay_skip_over_a_branch_rejects`: hipcc emits such hints (consumer in the fall-through
+        // block of a conditional branch); the lenient check keeps them as ambiguous, performance-only facts.
+        let mut body = body_of(vec![delay_hint(1, 2, 1), valu(), branch_to(1), valu(), endpgm()]);
+        build_blocks(&mut body, crate::inst::Arch::Gfx1201).unwrap();
+        assert_eq!(check_windows(&body), Err(WindowError::DelayCrossesLeader { index: 0 }));
+        let facts = check_windows_with(&body, true).unwrap();
+        assert_eq!(facts.delays.len(), 1);
+        assert!(facts.delays[0].is_ambiguous());
     }
     #[test]
     fn smem_clause_of_mixed_widths_validates() {

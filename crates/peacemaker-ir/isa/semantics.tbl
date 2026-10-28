@@ -529,3 +529,4 @@ v_mad_co_u64_u32	alu
 global_inv	wait
 s_code_end	control
 v_mbcnt_hi_u32_b32	alu
+s_wait_storecnt_dscnt	wait

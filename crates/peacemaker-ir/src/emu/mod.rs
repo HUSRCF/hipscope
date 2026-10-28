@@ -1562,6 +1562,67 @@ mod tests {
         assert!(e.contains("[in-flight]") && e.contains("store source") && e.contains("ds_store_b32"), "{e}");
         assert!(run_gate(&ds(true), 32, true).0.is_ok());
     }
+    /// Same pattern as `gfx12_store_data_is_locked_until_dscnt_retires`, but the object comes from stock hipcc: LLVM
+    /// leaves `ds_store_b128 v39, v[17:20]` ... `v_mov_b32 v17, 0` unwaited in shipped, card-proven gfx1201 objects
+    /// (gated_delta_net_q8_fast, gdn_chunk_scan, ...), so the gate model reads store data at issue for them; the
+    /// strict variant (and PM-builder objects, the test above) still flag it.
+    #[test]
+    fn hipcc_objects_read_ds_store_data_at_issue_on_gfx1201() {
+        let hipcc = |mut p: Program| {
+            p.kernels[0].origin = crate::inst::KernelOrigin::Frontend {
+                kind: crate::inst::Frontend::Hipcc,
+                object_sha256: [0; 32],
+                entry_va: 0,
+                size: 0,
+            };
+            p
+        };
+        let ds = |wait: bool| {
+            let mut b = srd_prologue();
+            b.push(insn("ds_store_b32", vec![v(1), v(0)]));
+            if wait {
+                b.push(winsn("s_wait_dscnt", &[(crate::wait::Counter::Ds, 0)]));
+            }
+            b.push(insn("v_mov_b32_e32", vec![v(0), v(1)]));
+            prog(b)
+        };
+        let run = |p: &Program, strict: bool| {
+            let mut mem = Memory::default();
+            mem.map("buf".into(), 0x10000, (0..=255u8).collect()).unwrap();
+            let emu = Emulator::new(p, "exchange").unwrap();
+            let emu = if strict { emu.hw_model_strict_store_sources() } else { emu.hw_model() };
+            emu.run_workgroup_report(
+                &Launch { kernarg_ptr: 0, workgroup: [0, 0, 0], block: [32, 1, 1], dynamic_lds: 0 },
+                &mut mem,
+            )
+        };
+        assert!(run(&hipcc(ds(false)), false).is_ok(), "hipcc: no store-source lock");
+        assert!(run(&ds(false), false).unwrap_err().contains("store source"), "builder object keeps it");
+        assert!(run(&hipcc(ds(false)), true).unwrap_err().contains("store source"), "strict variant keeps it");
+        assert!(run(&hipcc(ds(true)), true).is_ok());
+    }
+    /// gfx12 combined waits (`s_wait_storecnt_dscnt`, `s_wait_loadcnt_dscnt`; simm16 = {cnt[13:8], dscnt[5:0]}) retire
+    /// both counters in the gate model.
+    #[test]
+    fn combined_storecnt_dscnt_wait_retires_ds_and_stores() {
+        use crate::wait::Counter;
+        for name in ["s_wait_storecnt_dscnt", "s_wait_loadcnt_dscnt"] {
+            let counter = if name.contains("store") { Counter::Store } else { Counter::Load };
+            let mk = |wait: bool| {
+                let mut b = srd_prologue();
+                b.push(insn("ds_store_b32", vec![v(1), v(1)]));
+                b.push(insn("ds_load_b32", vec![v(3), v(1)]));
+                if wait {
+                    b.push(winsn(name, &[(counter, 0), (Counter::Ds, 0)]));
+                }
+                b.push(insn("v_add_f32_e32", vec![v(4), v(3), v(3)]));
+                prog(b)
+            };
+            let e = run_gate(&mk(false), 32, true).0.unwrap_err();
+            assert!(e.contains("[in-flight]") && e.contains("reads v3"), "{name}: {e}");
+            assert!(run_gate(&mk(true), 32, true).0.is_ok(), "{name}");
+        }
+    }
     /// Every thread stores `tid` at `4*tid`, then (optionally after a wait and a barrier) loads the slot of the thread 32 away.
     fn exchange(wait_before_barrier: bool, barrier: bool) -> Program {
         use crate::wait::Counter;

@@ -449,8 +449,12 @@ impl Node for LaneWo {
                                     }
                                 }
                                 let (b, c) = (&outs[0][..written], &outs[1][..written]);
-                                // The product gate: RAW bits, NaN payloads included.
-                                let d = compare(c, b, true);
+                                // The product gate (`tests/a3b_lane_wo.rs`): RAW bits, NaN payloads included, for
+                                // every weight kind whose headers are finite. `Wild` headers carry random f16 NaN
+                                // payloads, whose propagation depends on the compiler's free choice of commutative
+                                // operand order (fma/mul src0 vs src1): NaN meets NaN there (the lane_proj policy).
+                                let strict = wk != WKind::Wild;
+                                let d = compare(c, b, strict);
                                 if d.mismatches > 0 {
                                     let f = d.first.unwrap_or(0);
                                     mx.fail(format!(
@@ -459,7 +463,7 @@ impl Node for LaneWo {
                                     ));
                                 }
                                 mx.cand_vs_base.add(&d);
-                                let (db, dc) = (compare(b, &cpu, true), compare(c, &cpu, true));
+                                let (db, dc) = (compare(b, &cpu, strict), compare(c, &cpu, strict));
                                 mx.base_vs_cpu.add(&db);
                                 mx.cand_vs_cpu.add(&dc);
                                 if db.mismatches > 0 {
@@ -480,7 +484,10 @@ impl Node for LaneWo {
         ybuf.free(gpu);
         result?;
         let mut j = mx.json(true);
-        // Strict: NaN payload differences between candidate and incumbent already failed above.
+        j["policy"] = json!(
+            "raw bits (NaN payloads included) for every finite-header weight kind; NaN meets NaN for Wild headers \
+             (random f16 NaN payloads: payload propagation follows the compiler's commutative operand order)"
+        );
         j["m"] = json!(ms);
         if j["cpu_ref_identical"]["baseline"] != json!(true) {
             eprintln!(

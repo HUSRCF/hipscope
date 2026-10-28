@@ -104,7 +104,7 @@ pub(super) struct StepHw {
     clears_store_locks: bool,
 }
 
-pub(super) fn build_step_hw(arch: Arch, wave: Wave, step: &Step, lock_gfx11_stores: bool) -> StepHw {
+pub(super) fn build_step_hw(arch: Arch, wave: Wave, step: &Step, reads_at_issue: bool) -> StepHw {
     let inst = step.inst;
     let eff = &inst.effects;
     // A MUBUF access with neither OFFEN nor IDXEN (`off`) ignores VADDR, but the decoder still yields the encoded
@@ -220,11 +220,14 @@ pub(super) fn build_step_hw(arch: Arch, wave: Wave, step: &Step, lock_gfx11_stor
             },
             def_mask: operand_mask(inst, arch, 0),
             // A store the effect table says reads its sources after issue (`SrcRead::Deferred`: LDS stores) locks them
-            // until its counter retires it, on gfx12 (the PM builder's own rule). gfx11 stores read their data at
-            // issue: stock hipcc redefines a DS/VMEM store's data VGPR immediately (card-proven everywhere).
-            locks: if load
-                || m.src_read != SrcRead::Deferred
-                || (!lock_gfx11_stores && matches!(arch, Arch::Gfx1100 | Arch::Gfx1151))
+            // until its counter retires it: the PM builder's own rule on gfx12. No lock (`reads_at_issue`) for gfx11
+            // stores and for ANY object lifted from the stock compiler (`Frontend::Hipcc`), gfx1201 included: hipcc
+            // redefines a DS store's data VGPR immediately and LLVM inserts no wait there. Card-proven evidence: shipped
+            // gfx1201 hipcc objects (gated_delta_net_q8_fast `ds_store_b128 v39, v[17:20]` then `v_mov_b32 v17, 0`,
+            // gdn_chunk_scan, gdn_chunk_kkt_solve, attention_fp8_e4m3_fa2_gqa_qresident_gfx1201,
+            // gemm_mq4g256v2_residual_mmq_iu4_gfx12_symfold, sample_top_p_parallel: 6 of 38 objects of the pristine
+            // kernel cache) contain exactly that pattern and run correctly.
+            locks: if load || m.src_read != SrcRead::Deferred || reads_at_issue
             {
                 Vec::new()
             } else {
@@ -527,18 +530,24 @@ impl<'a> Emulator<'a> {
     pub fn hw_model(self) -> Self {
         self.hw_model_with(false)
     }
-    /// The gate model plus the PM builder's own store-source rule on gfx11 too: an LDS store's data VGPRs may not be
-    /// redefined before `lgkmcnt` retires it. Stock hipcc output violates this (gfx11 reads store data at issue), so
-    /// no gate uses it; it names the hazard class in regression tests and in audits that ask for the strict reading.
+    /// The gate model plus the PM builder's own store-source rule on every object: an LDS store's data VGPRs may not be
+    /// redefined before `lgkmcnt`/`dscnt` retires it. Stock hipcc output violates this (it reads store data at issue,
+    /// see `build_step_hw`), so no gate uses it; it names the hazard class in regression tests and in audits.
     pub fn hw_model_strict_store_sources(self) -> Self {
         self.hw_model_with(true)
     }
-    fn hw_model_with(mut self, lock_gfx11_stores: bool) -> Self {
+    fn hw_model_with(mut self, strict_store_sources: bool) -> Self {
         let arch = self.decode_arch;
+        let hipcc = matches!(
+            self.kernel.origin,
+            crate::inst::KernelOrigin::Frontend { kind: crate::inst::Frontend::Hipcc, .. }
+        );
+        let reads_at_issue =
+            !strict_store_sources && (hipcc || matches!(arch, Arch::Gfx1100 | Arch::Gfx1151));
         self.hw = Some(
             self.steps
                 .iter()
-                .map(|s| build_step_hw(arch, self.kernel.wave, s, lock_gfx11_stores))
+                .map(|s| build_step_hw(arch, self.kernel.wave, s, reads_at_issue))
                 .collect(),
         );
         self.strict_lds = true;
