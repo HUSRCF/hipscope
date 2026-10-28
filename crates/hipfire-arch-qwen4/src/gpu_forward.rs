@@ -4107,20 +4107,21 @@ impl Qwen4MoeLayerRuntime {
         // `HIPFIRE_QWEN4_D2_RETURN`, `HIPFIRE_QWEN4_D2_READY` and
         // `HIPFIRE_QWEN4_D2_JOIN` are read from the immutable process snapshot
         // for this load: an invalid spelling refuses the load before any
-        // executor storage exists. `copy`, `sync` and `host` (the defaults and
-        // the kill values) leave the executor exactly as `new` built it. A
-        // refused `mapped` or `cpwait` is capability routing, logged here and
-        // summarized once per load by the loader, never silent.
+        // executor storage exists. `copy`, `sync` and `host` leave the executor
+        // exactly as `new` built it; they are the kill values, and unset
+        // return/join are `copy`/`host` except on gfx1100, where the arch
+        // default requests `mapped`/`cpwait` (`default_d2_transport`; an
+        // explicit value always wins). A refused `mapped` or `cpwait` is
+        // capability routing, logged here and summarized once per load by the
+        // loader, never silent.
         // The initial ctor keeps the legacy default-4 executor rows; the
         // load-only post-admission prewarm (`reserve_d2_wide_rows`) resizes an
         // armed layer to the real need before the first window.
-        let request = hipfire_config::memory::qwen4_d2_return().map_err(|error| {
+        let transport = hipfire_config::memory::qwen4_d2_transport(&gpu.arch).map_err(|error| {
             Qwen4GpuForwardError::Dispatch(format!("layer {} D2 attach: {error}", self.label))
         })?;
+        let (request, join) = (transport.ret, transport.join);
         let ready = hipfire_config::memory::qwen4_d2_ready().map_err(|error| {
-            Qwen4GpuForwardError::Dispatch(format!("layer {} D2 attach: {error}", self.label))
-        })?;
-        let join = hipfire_config::memory::qwen4_d2_join().map_err(|error| {
             Qwen4GpuForwardError::Dispatch(format!("layer {} D2 attach: {error}", self.label))
         })?;
         let built = self.new_split_executor(gpu, config, &placement, rows, request, ready, join);
@@ -4564,13 +4565,11 @@ impl Qwen4MoeLayerRuntime {
         // re-reading them here yields exactly what the initial ctor applied,
         // so the resized executor preserves them. Snapshot refusal before any
         // new storage exists (same as the initial path).
-        let request = hipfire_config::memory::qwen4_d2_return().map_err(|error| {
+        let transport = hipfire_config::memory::qwen4_d2_transport(&gpu.arch).map_err(|error| {
             Qwen4GpuForwardError::Dispatch(format!("layer {} D2 prewarm: {error}", self.label))
         })?;
+        let (request, join) = (transport.ret, transport.join);
         let ready = hipfire_config::memory::qwen4_d2_ready().map_err(|error| {
-            Qwen4GpuForwardError::Dispatch(format!("layer {} D2 prewarm: {error}", self.label))
-        })?;
-        let join = hipfire_config::memory::qwen4_d2_join().map_err(|error| {
             Qwen4GpuForwardError::Dispatch(format!("layer {} D2 prewarm: {error}", self.label))
         })?;
         let placement = self

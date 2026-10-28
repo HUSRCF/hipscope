@@ -10515,26 +10515,105 @@ pub mod memory {
         }
     }
 
-    /// Pure body of [`qwen4_d2_return`]: unset is `Copy`; `copy` and `mapped`
-    /// (exact, lower-case) select a mode; every other spelling, including the
-    /// empty string, is an error that names the accepted values. A mistyped
-    /// transport must refuse the load, never silently run the other one.
-    pub fn parse_d2_return(raw: Option<&str>) -> std::result::Result<D2Return, String> {
+    /// Pure body of [`qwen4_d2_transport`]'s return half: unset is `None` (the
+    /// caller applies the arch default, see [`default_d2_transport`]); `copy`
+    /// and `mapped` (exact, lower-case) select a mode; every other spelling,
+    /// including the empty string, is an error that names the accepted values.
+    /// A mistyped transport must refuse the load, never silently run the other
+    /// one.
+    pub fn parse_d2_return_explicit(
+        raw: Option<&str>,
+    ) -> std::result::Result<Option<D2Return>, String> {
         match raw {
-            None => Ok(D2Return::Copy),
-            Some("copy") => Ok(D2Return::Copy),
-            Some("mapped") => Ok(D2Return::Mapped),
+            None => Ok(None),
+            Some("copy") => Ok(Some(D2Return::Copy)),
+            Some("mapped") => Ok(Some(D2Return::Mapped)),
             Some(other) => Err(format!(
                 "HIPFIRE_QWEN4_D2_RETURN={other:?} is not a D2 return mode: expected `mapped` or `copy`"
             )),
         }
     }
 
-    /// `developer.qwen4_d2_return` (env `HIPFIRE_QWEN4_D2_RETURN`): the D2
-    /// cold-result transport, read from the process snapshot. Resolve it once
-    /// per load; an invalid value is an `Err` the loader must propagate.
-    pub fn qwen4_d2_return() -> std::result::Result<D2Return, String> {
-        parse_d2_return(process_value("HIPFIRE_QWEN4_D2_RETURN").as_deref())
+    /// [`parse_d2_return_explicit`] with the arch-independent legacy default:
+    /// unset is `Copy`. The arch default lives in [`default_d2_transport`].
+    pub fn parse_d2_return(raw: Option<&str>) -> std::result::Result<D2Return, String> {
+        parse_d2_return_explicit(raw).map(Option::unwrap_or_default)
+    }
+
+    /// The D2 return and join requests a load resolves for one arch.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct D2Transport {
+        pub ret: D2Return,
+        pub join: D2Join,
+        /// `true` when the arch default moved at least one request off the
+        /// legacy `copy` / `host` value (no explicit env value was given for
+        /// it), so the load log can name the provenance.
+        pub arch_default: bool,
+    }
+
+    /// Pure default of the D2 transport requests.
+    ///
+    /// An explicit `HIPFIRE_QWEN4_D2_RETURN` / `HIPFIRE_QWEN4_D2_JOIN` value
+    /// always wins. Unset on exact `gfx1100` the request is `mapped` + `cpwait`
+    /// (byte-exact transport and scheduling change; the per-layer capability
+    /// routing in `hipfire_dispatch::cpu_split` still decides: only all-cold
+    /// layers qualify, mixed layers keep `copy` / `host`). A defaulted join
+    /// follows the effective return: with `HIPFIRE_QWEN4_D2_RETURN=copy` the
+    /// CP-wait join would only be refused per layer, so the default join is
+    /// `host` and `copy` alone restores the old transport. Every other arch is
+    /// the legacy `copy` / `host`. `HIPFIRE_QWEN4_D2_RETURN=copy
+    /// HIPFIRE_QWEN4_D2_JOIN=host` is the kill switch on every arch.
+    pub fn default_d2_transport(
+        arch: &str,
+        explicit_return: Option<D2Return>,
+        explicit_join: Option<D2Join>,
+    ) -> (D2Return, D2Join) {
+        let gfx1100 = arch == "gfx1100";
+        let ret = explicit_return.unwrap_or(if gfx1100 {
+            D2Return::Mapped
+        } else {
+            D2Return::Copy
+        });
+        let join = explicit_join.unwrap_or(if gfx1100 && ret == D2Return::Mapped {
+            D2Join::CpWait
+        } else {
+            D2Join::Host
+        });
+        (ret, join)
+    }
+
+    /// Pure body of [`qwen4_d2_transport`]: parse both raw values and apply
+    /// [`default_d2_transport`]. An invalid spelling of either is an error.
+    pub fn resolve_d2_transport(
+        arch: &str,
+        raw_return: Option<&str>,
+        raw_join: Option<&str>,
+    ) -> std::result::Result<D2Transport, String> {
+        let explicit_return = parse_d2_return_explicit(raw_return)?;
+        let explicit_join = parse_d2_join_explicit(raw_join)?;
+        let (ret, join) = default_d2_transport(arch, explicit_return, explicit_join);
+        Ok(D2Transport {
+            ret,
+            join,
+            arch_default: (ret, join)
+                != (
+                    explicit_return.unwrap_or_default(),
+                    explicit_join.unwrap_or_default(),
+                ),
+        })
+    }
+
+    /// `developer.qwen4_d2_return` + `developer.qwen4_d2_join` (env
+    /// `HIPFIRE_QWEN4_D2_RETURN` / `HIPFIRE_QWEN4_D2_JOIN`): the D2 cold-result
+    /// transport and join requests for a device of `arch`, from the process
+    /// snapshot. Resolve once per load; an invalid value is an `Err` the
+    /// loader must propagate.
+    pub fn qwen4_d2_transport(arch: &str) -> std::result::Result<D2Transport, String> {
+        resolve_d2_transport(
+            arch,
+            process_value("HIPFIRE_QWEN4_D2_RETURN").as_deref(),
+            process_value("HIPFIRE_QWEN4_D2_JOIN").as_deref(),
+        )
     }
 
     /// Input-readiness mechanism of the D2 CPU split (`developer.qwen4_d2_ready`,
@@ -10608,25 +10687,27 @@ pub mod memory {
         }
     }
 
-    /// Pure body of [`qwen4_d2_join`]: unset is `Host`; `host` and `cpwait`
-    /// (exact, lower-case) select a mode; every other spelling, including the
-    /// empty string, is an error that names the accepted values.
-    pub fn parse_d2_join(raw: Option<&str>) -> std::result::Result<D2Join, String> {
+    /// Pure body of [`qwen4_d2_transport`]'s join half: unset is `None` (the
+    /// caller applies the arch default, see [`default_d2_transport`]); `host`
+    /// and `cpwait` (exact, lower-case) select a mode; every other spelling,
+    /// including the empty string, is an error that names the accepted values.
+    pub fn parse_d2_join_explicit(
+        raw: Option<&str>,
+    ) -> std::result::Result<Option<D2Join>, String> {
         match raw {
-            None => Ok(D2Join::Host),
-            Some("host") => Ok(D2Join::Host),
-            Some("cpwait") => Ok(D2Join::CpWait),
+            None => Ok(None),
+            Some("host") => Ok(Some(D2Join::Host)),
+            Some("cpwait") => Ok(Some(D2Join::CpWait)),
             Some(other) => Err(format!(
                 "HIPFIRE_QWEN4_D2_JOIN={other:?} is not a D2 join mode: expected `cpwait` or `host`"
             )),
         }
     }
 
-    /// `developer.qwen4_d2_join` (env `HIPFIRE_QWEN4_D2_JOIN`): the D2 join
-    /// mechanism, read from the process snapshot. Resolve it once per load; an
-    /// invalid value is an `Err` the loader must propagate.
-    pub fn qwen4_d2_join() -> std::result::Result<D2Join, String> {
-        parse_d2_join(process_value("HIPFIRE_QWEN4_D2_JOIN").as_deref())
+    /// [`parse_d2_join_explicit`] with the arch-independent legacy default:
+    /// unset is `Host`. The arch default lives in [`default_d2_transport`].
+    pub fn parse_d2_join(raw: Option<&str>) -> std::result::Result<D2Join, String> {
+        parse_d2_join_explicit(raw).map(Option::unwrap_or_default)
     }
 
     /// How much of a split step the GPU takes (`memory.offload_passback_share`).
@@ -10745,6 +10826,78 @@ pub mod memory {
             }
             for mode in [D2Join::Host, D2Join::CpWait] {
                 assert_eq!(parse_d2_join(Some(mode.as_str())), Ok(mode));
+            }
+        }
+
+        #[test]
+        fn d2_default_transport_table_over_arch_and_explicit_values() {
+            use D2Join::{CpWait, Host};
+            use D2Return::{Copy, Mapped};
+            let rows: &[(&str, Option<D2Return>, Option<D2Join>, (D2Return, D2Join))] = &[
+                // gfx1100: unset -> mapped + cpwait; explicit values always win.
+                ("gfx1100", None, None, (Mapped, CpWait)),
+                ("gfx1100", Some(Copy), Some(Host), (Copy, Host)), // kill switch
+                ("gfx1100", Some(Copy), None, (Copy, Host)),       // defaulted join follows return
+                ("gfx1100", None, Some(Host), (Mapped, Host)),
+                ("gfx1100", Some(Mapped), None, (Mapped, CpWait)),
+                ("gfx1100", None, Some(CpWait), (Mapped, CpWait)),
+                ("gfx1100", Some(Mapped), Some(Host), (Mapped, Host)),
+                ("gfx1100", Some(Copy), Some(CpWait), (Copy, CpWait)), // refused per layer
+                ("gfx1100", Some(Mapped), Some(CpWait), (Mapped, CpWait)),
+                // Every other arch keeps the legacy copy / host defaults.
+                ("gfx1201", None, None, (Copy, Host)),
+                ("gfx1151", None, None, (Copy, Host)),
+                ("gfx1030", None, None, (Copy, Host)),
+                ("gfx1100x", None, None, (Copy, Host)),
+                ("", None, None, (Copy, Host)),
+                ("gfx1201", Some(Mapped), None, (Mapped, Host)),
+                ("gfx1201", None, Some(CpWait), (Copy, CpWait)),
+                ("gfx1201", Some(Mapped), Some(CpWait), (Mapped, CpWait)),
+                ("gfx1201", Some(Copy), Some(Host), (Copy, Host)),
+            ];
+            for (arch, ret, join, want) in rows {
+                assert_eq!(
+                    default_d2_transport(arch, *ret, *join),
+                    *want,
+                    "{arch} return={ret:?} join={join:?}"
+                );
+            }
+        }
+
+        #[test]
+        fn d2_transport_resolution_parses_explicit_values_and_reports_provenance() {
+            let resolve = resolve_d2_transport;
+            let t = resolve("gfx1100", None, None).unwrap();
+            assert_eq!(
+                (t.ret, t.join, t.arch_default),
+                (D2Return::Mapped, D2Join::CpWait, true)
+            );
+            let t = resolve("gfx1100", Some("copy"), Some("host")).unwrap();
+            assert_eq!(
+                (t.ret, t.join, t.arch_default),
+                (D2Return::Copy, D2Join::Host, false)
+            );
+            let t = resolve("gfx1100", Some("copy"), None).unwrap();
+            assert_eq!(
+                (t.ret, t.join, t.arch_default),
+                (D2Return::Copy, D2Join::Host, false)
+            );
+            let t = resolve("gfx1100", Some("mapped"), Some("cpwait")).unwrap();
+            assert_eq!(
+                (t.ret, t.join, t.arch_default),
+                (D2Return::Mapped, D2Join::CpWait, false)
+            );
+            let t = resolve("gfx1201", None, None).unwrap();
+            assert_eq!(
+                (t.ret, t.join, t.arch_default),
+                (D2Return::Copy, D2Join::Host, false)
+            );
+            // An invalid spelling refuses the load on every arch, never defaults.
+            for arch in ["gfx1100", "gfx1201"] {
+                let error = resolve(arch, Some("Mapped"), None).unwrap_err();
+                assert!(error.contains("HIPFIRE_QWEN4_D2_RETURN"), "{error}");
+                let error = resolve(arch, None, Some("")).unwrap_err();
+                assert!(error.contains("HIPFIRE_QWEN4_D2_JOIN"), "{error}");
             }
         }
 

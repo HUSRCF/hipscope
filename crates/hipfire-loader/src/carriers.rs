@@ -6379,16 +6379,24 @@ fn load_qwen4_rank_scoped(
         } else {
             "measured D2 default"
         };
-        // Only a load that asked for `mapped` (or has a mapped layer) says
-        // anything about the cold return; the default copy load is unchanged.
+        // The cold return, readiness and join are reported from the per-layer
+        // effective modes; the request is the arch default on gfx1100 (mapped +
+        // cpwait, explicit env wins), so a load that asked for `mapped` /
+        // `cpwait` (or has such a layer) says so and names the provenance.
+        let transport = hipfire_config::memory::qwen4_d2_transport(&ctx.gpu.arch).ok();
+        let provenance = match transport {
+            Some(t) if t.arch_default => {
+                format!("; transport request: default ({})", ctx.gpu.arch)
+            }
+            _ => String::new(),
+        };
         let return_modes = bundle.split_return_modes();
         let mapped = return_modes
             .iter()
             .filter(|(_, mode)| *mode == "mapped")
             .count();
         let cold_return = if mapped > 0
-            || hipfire_config::memory::qwen4_d2_return()
-                == Ok(hipfire_config::memory::D2Return::Mapped)
+            || transport.is_some_and(|t| t.ret == hipfire_config::memory::D2Return::Mapped)
         {
             format!(
                 "; cold return: {mapped} mapped, {} copy",
@@ -6397,8 +6405,7 @@ fn load_qwen4_rank_scoped(
         } else {
             String::new()
         };
-        // Likewise the readiness and join mechanisms: only a load that asked
-        // for `event` / `cpwait` (or has such a layer) reports them.
+        // Likewise the readiness and join mechanisms.
         let ready_modes = bundle.split_ready_modes();
         let event = ready_modes
             .iter()
@@ -6421,7 +6428,7 @@ fn load_qwen4_rank_scoped(
             .filter(|(_, mode)| *mode == "cpwait")
             .count();
         let join = if cpwait > 0
-            || hipfire_config::memory::qwen4_d2_join() == Ok(hipfire_config::memory::D2Join::CpWait)
+            || transport.is_some_and(|t| t.join == hipfire_config::memory::D2Join::CpWait)
         {
             format!(
                 "; join: {cpwait} cpwait, {} host",
@@ -6431,7 +6438,7 @@ fn load_qwen4_rank_scoped(
             String::new()
         };
         eprintln!(
-            "  qwen4 routed experts: CPU split (D2) armed on {} layers ({}; {source}{cold_return}{ready}{join}): decode and <=4-row verify run their host-placed cold experts on the CPU; wider verify needs the qualified lab-wide CPU window (default 64 when admitted+prewarmed)",
+            "  qwen4 routed experts: CPU split (D2) armed on {} layers ({}; {source}{cold_return}{ready}{join}{provenance}): decode and <=4-row verify run their host-placed cold experts on the CPU; wider verify needs the qualified lab-wide CPU window (default 64 when admitted+prewarmed)",
             split_kinds.len(),
             by_kind.join(", ")
         );
