@@ -90,7 +90,8 @@
 //! so each epoch contributes `2C/4` instead of `(2C + s)/4`). The symbol is unchanged so
 //! the object is drop-in; keep these out of every candidate module.
 use peacemaker_author::{
-    End, Full, Gfx1100, Gfx1151, Gfx11Waits, MmaIu4, Scc, Target, WgUniform, Workgroup,
+    prime, retire_cur, rotate, End, Free, Full, Gfx1100, Gfx1151, Gfx11Waits, MmaIu4, Published,
+    Ring, Scc, Target, WgUniform, Workgroup,
 };
 use peacemaker_isa::{
     insn::{Instruction, MemoryClass},
@@ -112,6 +113,7 @@ pub mod e8p;
 pub mod epilogue;
 mod fold;
 mod kloop;
+mod pipe;
 mod prologue;
 mod unpack;
 pub use unpack::{bfi, mq4_unpack_model, w2_spread_model, w3_spread_model};
@@ -311,7 +313,9 @@ impl Spec {
         }
         Ok(())
     }
-    /// Static LDS bytes of the entry (E8P: the 1,536 B table stage; else 0).
+    /// Static LDS bytes of the entry (E8P: the 1,536 B table stage; else 0). The GateUp lockstep
+    /// regions are typed bookkeeping only: the ABI keeps the allocation at 0 bytes, so their
+    /// one-dword accesses are out of range (stores discarded, loads return 0).
     pub fn lds_bytes(self) -> u32 {
         self.codec.lds_bytes()
     }
@@ -579,6 +583,10 @@ impl Gen {
     fn tn(&self) -> u8 {
         tensors(self.spec.kind)
     }
+    /// The GateUp MQ4 K loop carries the per-epoch lockstep barrier.
+    fn lockstep(&self) -> bool {
+        self.spec.kind == Kind::GateUp && self.spec.codec == Codec::Mq4 && kloop::LOCK.is_some()
+    }
     fn planar(&self) -> bool {
         self.spec.codec != Codec::Mq4
     }
@@ -685,10 +693,16 @@ impl Gen {
                 p.v::<1>("scale_dword", self.hs(t), kernel())?;
             }
             p.v::<1>("d_act", self.d(), kernel())?;
-            for n in 0..2u8 {
-                let (x, y) = self.scratch(n);
-                p.v::<1>("unpack_tmp", x, kernel())?;
-                p.v::<1>("unpack_tmp", y, kernel())?;
+            // MQ4 unpacks with one in-place XOR: its scratch pairs are never touched. The pipelined
+            // Down path places operand set 1 over them.
+            if !pipe::applies(self) {
+                for n in 0..2u8 {
+                    let (x, y) = self.scratch(n);
+                    p.v::<1>("unpack_tmp", x, kernel())?;
+                    p.v::<1>("unpack_tmp", y, kernel())?;
+                }
+            } else {
+                pipe::plan_sets(&mut p, self, &kernel)?;
             }
         }
         // Epilogue scratch (aliases dead K-loop ranges) with its real lifetime.
@@ -789,9 +803,16 @@ fn body<T: Gfx11>(wg: &mut Wg<'_, T>, g: &Gen) -> Result<(), String> {
         epilogue_tail(wg, g)?;
         return wg.end(end);
     }
+    let lock = if g.lockstep() {
+        let r0 = wg.lds::<kloop::Lock>("lock0", 0, 4)?;
+        let r1 = wg.lds::<kloop::Lock>("lock1", 4, 4)?;
+        Some(Ring::new(r0, r1))
+    } else {
+        None
+    };
     let end = wg.exit(&g.label("end"))?;
     prologue::emit(wg, g, &end)?;
-    kloop::emit(wg, g)?;
+    kloop::emit(wg, g, lock)?;
     epilogue_tail(wg, g)?;
     wg.end(end)
 }

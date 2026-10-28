@@ -523,6 +523,14 @@ fn gfx1151_source_is_the_gfx1100_source_minus_arch_forced_deltas() {
                     let a = gfx11::emit(spec(Arch::Gfx1100, codec, kind, acc, negative)).unwrap();
                     let b = gfx11::emit(s1151(codec, kind, acc, negative)).unwrap();
                     let id = format!("{codec:?} {kind:?} acc {acc} {negative:?}");
+                    if codec == Codec::Mq4 && !acc && negative == Negative::None {
+                        // The round-2 gfx1100 card winners (gate/up lockstep, down K=640 pipeline)
+                        // are exact-gfx1100 only: gfx1151 keeps the plain loop, barrier-free.
+                        assert!(a.s_text.contains("s_barrier"), "{id}");
+                        assert!(!b.s_text.contains("s_barrier"), "{id}");
+                        entries += 1;
+                        continue;
+                    }
                     let (wa, wb) = (
                         a.s_text.matches(TRANS_WAIT).count(),
                         b.s_text.matches(TRANS_WAIT).count(),
