@@ -5352,10 +5352,13 @@ pub const SPLIT_MQ4V2_Z_BETAALPHA_SRC: &str =
 pub const GEMM_MQ4G256V2_RESIDUAL_IU4_V2C_GFX11_SRC: &str =
     include_str!("../../../kernels/src/gemm_mq4g256v2_residual_iu4_v2c.gfx11.hip");
 /// Certified gfx1100 builder code object, SHA-256
-/// e33ac75d5560ed61cffd0de71704f8ed740226992c11dc79bf4cd36b9fa5bcf5
+/// 32b64fe30b7bcf630ae69b4aa01d79e4427b8d27275f70359c5419d1a2cde776
 /// (local 4x4 tile-coordinate transpose for N>=4096 and complete groups;
 /// short/incomplete grids retain linear ordering; 56b49afb with the emitter's
-/// code-end tail fill appended to `.text`)
+/// code-end tail fill appended to `.text`; gfx1100 `FeatureUserSGPRInit16Bug`:
+/// 14 declared user SGPRs + workgroup id X/Y = 16, so the ids are `s14`/`s15` and
+/// the kernarg block moved to `s[56:63]`; the previous
+/// e33ac75d5560ed61cffd0de71704f8ed740226992c11dc79bf4cd36b9fa5bcf5 declared 2 + 2)
 /// (`peacemaker-isa emit --kernel iu4_v2c --epi all`, one contract-checked
 /// `peacemaker custom build --arch gfx1100` per symbol): the V2C algorithm's
 /// SET, ADD and F1-lite gate/up SiLU entries with every fold op VOPD-paired
