@@ -33,6 +33,10 @@ use serde_json::{json, Value};
 
 pub const PRESETS: [(&str, usize, usize); 2] = [("mix", 320, 10240), ("sel", 1, 2560)];
 pub const DEFAULT_N: usize = 768;
+/// The pre-card emulator gate's shape (`--emu`, preset `emu`): `(M, K, N)` = (144, 256, 24).
+/// M = 144 leaves a ragged last tile under the 64 production tile (64+64+16) and the 80-row
+/// candidate tiles (80+64); N = 24 is ragged under every 32/64-token tile; K = 256 is four k64 steps.
+pub const EMU: (usize, usize, usize) = (144, 256, 24);
 pub const SYMBOL: &str = "gemm_wmma_lds_64_64_32_64_k64_p";
 const MODULE: &str = "qwen4_gemm_wmma_lds256";
 const TILE: usize = 64;
@@ -61,15 +65,17 @@ impl HcMix {
     pub fn new(shape: &ShapeSpec) -> Result<Self> {
         let mut s = shape.clone();
         let preset = s.preset.clone().unwrap_or_else(|| "mix".to_owned());
+        let emu = preset == "emu";
         let (label, pm, pk) = match PRESETS.iter().find(|(n, _, _)| *n == preset) {
             Some((n, m, k)) => ((*n).to_owned(), Some(*m), Some(*k)),
+            None if emu => ("emu".to_owned(), Some(EMU.0), Some(EMU.1)),
             None => {
-                return Err(format!("hc_mix: unknown shape preset `{preset}` (have mix, sel)"));
+                return Err(format!("hc_mix: unknown shape preset `{preset}` (have mix, sel, emu)"));
             }
         };
         let m = s.take_usize("M", pm)?;
         let k = s.take_usize("K", pk)?;
-        let n = s.take_usize("N", Some(DEFAULT_N))?;
+        let n = s.take_usize("N", Some(if emu { EMU.2 } else { DEFAULT_N }))?;
         s.no_leftover()?;
         if m == 0 || n == 0 || k == 0 || k % 64 != 0 {
             return Err(format!("hc_mix: M={m} N={n} K={k}: need positive dims and K % 64 == 0"));
@@ -79,6 +85,24 @@ impl HcMix {
 
     fn st(&self) -> Result<&State> {
         self.st.as_ref().ok_or_else(|| "hc_mix: setup has not run".to_owned())
+    }
+
+    /// Seeded host buffers `(A, X, Y0)` the GPU `setup` uploads and the emulator gate maps.
+    pub fn host_inputs(&self, seed: u64) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+        let mut r = Xs64::new(seed);
+        let amp = 1.0 / (self.k as f32).sqrt();
+        let mut a = Vec::with_capacity(self.m * self.k * 2);
+        for _ in 0..self.m * self.k {
+            a.extend_from_slice(&f16_bits(amp * r.normal()).to_le_bytes());
+        }
+        let mut x = Vec::with_capacity(self.n * self.k * 2);
+        for _ in 0..self.n * self.k {
+            x.extend_from_slice(&f16_bits(r.normal()).to_le_bytes());
+        }
+        let y: Vec<u8> = (0..self.n * self.m)
+            .flat_map(|_| SENTINEL.to_le_bytes())
+            .collect();
+        (a, x, y)
     }
 }
 
@@ -115,20 +139,32 @@ impl Node for HcMix {
         }
     }
 
+    fn emu_case(&self, seed: u64) -> Result<EmuCase> {
+        let (a, x, y) = self.host_inputs(seed);
+        Ok(EmuCase {
+            bufs: vec![
+                EmuBuf { name: "a", bytes: a },
+                EmuBuf { name: "x", bytes: x },
+                EmuBuf { name: "y", bytes: y },
+            ],
+            args: vec![
+                EmuArg::Buf(0),
+                EmuArg::Buf(1),
+                EmuArg::Buf(2),
+                EmuArg::Null,
+                EmuArg::I32(self.m as i32),
+                EmuArg::I32(self.k as i32),
+                EmuArg::I32(self.n as i32),
+                EmuArg::I32(0),
+                EmuArg::I32(self.k as i32),
+                EmuArg::I32(self.k as i32),
+            ],
+            out: 2,
+        })
+    }
+
     fn setup(&mut self, gpu: &rdna_compute::Gpu, seed: u64) -> Result<()> {
-        let mut r = Xs64::new(seed);
-        let amp = 1.0 / (self.k as f32).sqrt();
-        let mut a = Vec::with_capacity(self.m * self.k * 2);
-        for _ in 0..self.m * self.k {
-            a.extend_from_slice(&f16_bits(amp * r.normal()).to_le_bytes());
-        }
-        let mut x = Vec::with_capacity(self.n * self.k * 2);
-        for _ in 0..self.n * self.k {
-            x.extend_from_slice(&f16_bits(r.normal()).to_le_bytes());
-        }
-        let y: Vec<u8> = (0..self.n * self.m)
-            .flat_map(|_| SENTINEL.to_le_bytes())
-            .collect();
+        let (a, x, y) = self.host_inputs(seed);
         self.st = Some(State {
             a: Buf::from_bytes(gpu, &a)?,
             x: Buf::from_bytes(gpu, &x)?,

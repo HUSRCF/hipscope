@@ -55,6 +55,21 @@
 //!   `p_slower`. `--null-control aa`: the incumbent source compiled and loaded as
 //!   a SEPARATE module is the candidate (no `--cand`). With `R` rounds the best
 //!   possible p is `2^-R`: use R >= 11 for p < 1e-3.
+//! * `--emu` (offline, no device; implies `--offline`; default shape `emu`): the PRE-CARD SAFETY GATE. Both
+//!   arms' objects (`--base-object`/production compile, `--cand`/`--cand-object`) are lifted with
+//!   `peacemaker_lift::lift_object` and EVERY workgroup of the small `emu` shape's grid is run on the
+//!   PeaceMaker CPU emulator from the same host-side seeded inputs (`mq6_res` M=144 K=512 N=40, `hc_mix`
+//!   M=144 K=256 N=24, `qsa_hg4` 3 rows at position 102; ragged tails, production head/dim constants).
+//!   Each buffer is an exact-size emulator region with 1 MiB unmapped guards; the kernarg segment is its own
+//!   region (explicit args at the object's offsets, hidden args from the arm's geometry). FAIL (exit 1,
+//!   reason on stderr and in `emu_gate.reason`): any access outside a mapped buffer, LDS access beyond static +
+//!   dynamic LDS, a read of an LDS byte never written in the workgroup, a write into an input buffer or the
+//!   kernarg segment, a barrier deadlock, the instruction limit, an opcode without emulator semantics (named),
+//!   an emulator panic, or output bytes not bit-identical to the emulated incumbent. The receipt `emu_gate` has
+//!   `pass, reason, shape, seed, instructions{baseline,candidate}, workgroups{..}, output_sha256{..},
+//!   identical_to_baseline, guard_bytes, strict_lds, numerics_model, arms{..}`. The numerics are the gfx1151
+//!   model (`Emulator::gfx1100_as_gfx1151`) for both arms: it proves memory safety and arm-vs-arm identity at
+//!   the small shape, not gfx1100 hardware ulps. `--base-object` is trusted via its sidecar (no recompile).
 //!
 //! Exit status: 0 ok; 1 identity failure (record still printed); 2 usage; 3 the
 //! candidate (or the device) could not compile/launch (record printed with `error`).
@@ -69,6 +84,8 @@
 mod abba;
 #[path = "hip_loop/elf.rs"]
 mod elf;
+#[path = "hip_loop/emu.rs"]
+mod emu;
 #[path = "hip_loop/hc.rs"]
 mod hc;
 #[path = "hip_loop/jit.rs"]
@@ -90,7 +107,7 @@ const DEFAULT_ROUNDS: usize = 12;
 const NODES: [&str; 3] = ["mq6_res", "hc_mix", "qsa_hg4"];
 const USAGE: &str = "--node mq6_res|hc_mix|qsa_hg4 [--shape k=v,...] \
 (--cand FILE.hip | --cand-object FILE.co [--cand-geometry \"tile_m=.. tile_n=.. block=.. lds_dynamic=..\"] | --null-control aa) \
-[--base-object FILE.co] [--offline] [--time N] [--rounds R] [--seed S] [--out DIR]";
+[--base-object FILE.co] [--offline] [--emu] [--time N] [--rounds R] [--seed S] [--out DIR]";
 
 // ---------------------------------------------------------------------------
 // CLI
@@ -101,6 +118,7 @@ struct Opts {
     shape: Option<String>,
     cand: Option<PathBuf>,
     offline: bool,
+    emu: bool,
     null_control: bool,
     cand_object: Option<PathBuf>,
     base_object: Option<PathBuf>,
@@ -117,6 +135,7 @@ fn parse_args(args: &[String]) -> Result<Opts> {
         shape: None,
         cand: None,
         offline: false,
+        emu: false,
         null_control: false,
         cand_object: None,
         cand_geometry: None,
@@ -141,6 +160,10 @@ fn parse_args(args: &[String]) -> Result<Opts> {
             "--base-object" => o.base_object = Some(PathBuf::from(value("base-object")?)),
             "--cand-geometry" => o.cand_geometry = Some(value("cand-geometry")?),
             "--offline" => o.offline = true,
+            "--emu" => {
+                o.emu = true;
+                o.offline = true;
+            }
             "--null-control" => {
                 let v = value("null-control")?;
                 if v != "aa" {
@@ -279,10 +302,11 @@ fn prepare(o: &Opts, node: &dyn Node, workdir: &Path, rec: &mut Value) -> std::r
         jit::isolate_caches(workdir).map_err(stage("compile"))?;
     }
     // Compile only what is needed: the incumbent unless `--base-object` supplies it (offline
-    // still recompiles it, to verify the object), the candidate unless it is a prebuilt object
+    // still recompiles it, to verify the object, except under `--emu`, where the sidecar-certified
+    // object is trusted as on the device), the candidate unless it is a prebuilt object
     // or an A/A against `--base-object` on the device (both arms load that object).
     let aa_from_object = o.null_control && o.base_object.is_some() && !o.offline;
-    let want_base = o.base_object.is_none() || o.offline;
+    let want_base = o.base_object.is_none() || (o.offline && !o.emu);
     let want_cand = cand_source.is_some() && !aa_from_object;
     let (compiled_base, compiled_cand) = std::thread::scope(|s| {
         let b = want_base.then(|| s.spawn(|| jit::compile(workdir, "baseline", &inc, &inc.source)));
@@ -455,7 +479,8 @@ fn run(o: &Opts) -> (Value, Outcome) {
         "shape": Value::Null, "symbol": Value::Null, "error": Value::Null,
         "offline": o.offline,
     });
-    let mut node = match build_node(&o.node, o.shape.as_deref()) {
+    let shape = o.shape.clone().or_else(|| o.emu.then(|| "emu".to_owned()));
+    let mut node = match build_node(&o.node, shape.as_deref()) {
         Ok(n) => n,
         Err(e) => return fail(rec, "args", e),
     };
@@ -477,10 +502,41 @@ fn run(o: &Opts) -> (Value, Outcome) {
         Ok(p) => p,
         Err((stage, e)) => return fail(rec, &stage, e),
     };
+    if o.emu {
+        return emu_stage(o, node.as_ref(), &prep, rec);
+    }
     if o.offline {
         return (rec, Outcome::Ok);
     }
     gpu_stage(o, node.as_mut(), &prep, rec)
+}
+
+// ---------------------------------------------------------------------------
+// Emulator gate (`--emu`)
+
+/// The pre-card gate: both arms' objects lifted and emulated over the full small grid on the
+/// PeaceMaker CPU emulator, output bytes bit-compared (`emu.rs`). Exit 1 and the reason on stderr
+/// when it fails; `rec["emu_gate"]` is the receipt either way.
+fn emu_stage(o: &Opts, node: &dyn Node, prep: &Prep, mut rec: Value) -> (Value, Outcome) {
+    let case = match node.emu_case(o.seed) {
+        Ok(c) => c,
+        Err(e) => return fail(rec, "emu_case", e),
+    };
+    let (pass, receipt) = emu::gate(
+        &prep.inc.symbol,
+        &case,
+        (&prep.base.image, &prep.base_geo),
+        (&prep.cand.image, &prep.cand_geo),
+        node.shape_json(),
+        o.seed,
+    );
+    rec["emu_gate"] = receipt;
+    if pass {
+        (rec, Outcome::Ok)
+    } else {
+        eprintln!("hip_loop: emu_gate FAIL: {}", rec["emu_gate"]["reason"].as_str().unwrap_or("?"));
+        (rec, Outcome::IdentityFailed)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -864,6 +920,7 @@ mod tests {
             shape: Some(shape.into()),
             cand: Some(cand),
             offline: true,
+            emu: false,
             null_control: false,
             cand_object: None,
             cand_geometry: None,
@@ -965,6 +1022,7 @@ mod tests {
             shape: Some("ba".into()),
             cand: Some(cand.clone()),
             offline: true,
+            emu: false,
             null_control: false,
             cand_object: None,
             cand_geometry: None,
@@ -997,6 +1055,7 @@ mod tests {
             shape: Some("ba".into()),
             cand: None,
             offline: true,
+            emu: false,
             null_control: true,
             cand_object: None,
             cand_geometry: None,
@@ -1039,6 +1098,7 @@ mod object_tests {
             shape: Some("ba".into()),
             cand: None,
             offline: true,
+            emu: false,
             null_control: false,
             cand_object: Some(object),
             cand_geometry: geometry.map(str::to_owned),
@@ -1152,6 +1212,7 @@ mod base_object_tests {
             shape: Some("ba".into()),
             cand,
             offline: true,
+            emu: false,
             null_control: aa,
             cand_object: None,
             cand_geometry: None,
@@ -1284,5 +1345,101 @@ mod base_object_tests {
         let (rec, outcome) = run(&opts(dir.join("o9"), None, Some(other), true));
         assert_eq!(outcome, Outcome::Unusable);
         assert_eq!(rec["error"]["stage"], "base_object");
+    }
+}
+
+#[cfg(test)]
+mod emu_tests {
+    use super::*;
+
+    fn tmp(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("hip_loop-emutest-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn emu_shapes_are_small_ragged_and_use_the_production_kernarg_layout() {
+        // mq6: M=144 K=512 N=40, forced MW8: grid 9x1, ragged under every candidate tile.
+        let n = build_node("mq6_res", Some("emu")).unwrap();
+        assert_eq!(n.shape_label(), "emu");
+        assert_eq!(n.geometry().grid, [9, 1, 1]);
+        let c = n.emu_case(1).unwrap();
+        assert_eq!(c.args.len(), 6);
+        assert_eq!(c.bufs[0].bytes.len(), 144 * 2 * 200);
+        assert_eq!(c.bufs[1].bytes.len(), 40 * 512 * 2);
+        assert_eq!(c.bufs[2].bytes.len(), 40 * 144 * 4);
+        assert_eq!(c.out, 2);
+        for (g, grid) in [("tile_m=128 tile_n=256 block=256", [2, 1, 1]), ("tile_m=64 tile_n=128 block=128", [3, 1, 1])] {
+            let mut h = Header::parse_list(g).unwrap();
+            assert_eq!(n.geometry_with(&mut h).unwrap().grid, grid, "{g}");
+        }
+        // Same seed, same bytes; another seed differs.
+        assert_eq!(c.bufs[0].bytes, n.emu_case(1).unwrap().bufs[0].bytes);
+        assert_ne!(c.bufs[0].bytes, n.emu_case(2).unwrap().bufs[0].bytes);
+        // hc: M=144 K=256 N=24; (A, X, Y, Bias=null, M, K, N, has_bias, lda, ldx).
+        let n = build_node("hc_mix", Some("emu")).unwrap();
+        assert_eq!(n.geometry().grid, [3, 1, 1]);
+        let c = n.emu_case(1).unwrap();
+        assert_eq!(c.args.len(), 10);
+        assert_eq!(c.args[3], node::EmuArg::Null);
+        let mut h = Header::parse_list("tile_m=80 tile_n=64 block=128").unwrap();
+        assert_eq!(n.geometry_with(&mut h).unwrap().grid, [2, 1, 1]);
+        // qsa: 3 rows at position 102 -> visible 103/104/105, selected_len below the budget, a row on a
+        // block boundary (104 = 26 whole blocks), production head/dim constants.
+        let n = build_node("qsa_hg4", Some("emu")).unwrap();
+        assert_eq!(n.geometry().grid, [6, 1, 3]);
+        let c = n.emu_case(1).unwrap();
+        assert_eq!(c.args.len(), 14);
+        assert_eq!(c.bufs[1].bytes.len(), 105 * 544);
+        let sel: Vec<i32> = c.bufs[3].bytes.chunks_exact(4).map(|b| i32::from_le_bytes(b.try_into().unwrap())).collect();
+        let live: Vec<usize> = (0..3).map(|r| sel[r * 2051..(r + 1) * 2051].iter().filter(|&&t| t >= 0).count()).collect();
+        assert_eq!(live, [103, 104, 105]);
+        assert!(c.bufs[4].bytes.iter().all(|&b| b == 0xff));
+    }
+
+    /// The gate passes an incumbent against itself and fails closed on an out-of-buffer access and on
+    /// a launch that leaves output unwritten (different bytes from the incumbent's).
+    #[test]
+    fn emu_gate_passes_the_incumbent_and_fails_closed() {
+        if !jit::hipcc_available() {
+            eprintln!("SKIP: no hipcc");
+            return;
+        }
+        for node_name in ["mq6_res", "hc_mix"] {
+            let dir = tmp(node_name);
+            jit::isolate_caches(&dir).unwrap();
+            let node = build_node(node_name, Some("emu")).unwrap();
+            let inc = node.incumbent().unwrap();
+            let built = jit::compile(&dir, "baseline", &inc, &inc.source).unwrap();
+            let geo = node.geometry();
+            let case = node.emu_case(1).unwrap();
+            let run = |case: &node::EmuCase, cand_geo: &Geometry| {
+                emu::gate(&inc.symbol, case, (&built.image, &geo), (&built.image, cand_geo), node.shape_json(), 1)
+            };
+            let (pass, rec) = run(&case, &geo);
+            assert!(pass, "{node_name}: {rec}");
+            assert_eq!(rec["identical_to_baseline"], true);
+            assert_eq!(rec["output_sha256"]["baseline"], rec["output_sha256"]["candidate"]);
+            let wgs = u64::from(geo.grid[0]) * u64::from(geo.grid[1]) * u64::from(geo.grid[2]);
+            assert_eq!(rec["workgroups"]["baseline"], wgs);
+            assert!(rec["instructions"]["baseline"].as_u64().unwrap() > 1000);
+            assert!(rec["guard_bytes"].as_u64().unwrap() >= 64 * 1024);
+            // A buffer one dword short: the kernel's last read lands in the unmapped guard.
+            let mut short = case.clone();
+            let x = short.bufs.iter_mut().find(|b| b.name == "x").unwrap();
+            x.bytes.truncate(x.bytes.len() - 4);
+            let (pass, rec) = run(&short, &geo);
+            assert!(!pass, "{node_name}: a short input buffer must fail");
+            assert!(rec["reason"].as_str().unwrap().contains("unmapped memory access"), "{rec}");
+            // A candidate launched on a grid that skips a workgroup: output differs from the incumbent's.
+            let mut small = geo;
+            small.grid[0] -= 1;
+            let (pass, rec) = run(&case, &small);
+            assert!(!pass);
+            assert!(rec["reason"].as_str().unwrap().contains("differs"), "{rec}");
+            assert_eq!(rec["identical_to_baseline"], false);
+        }
     }
 }

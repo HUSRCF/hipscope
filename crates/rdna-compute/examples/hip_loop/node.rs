@@ -75,6 +75,35 @@ pub struct Work {
     pub bytes: f64,
 }
 
+/// One explicit kernel argument of an emulated launch (natural alignment, as [`Args`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum EmuArg {
+    /// Pointer to `EmuCase::bufs[i]` (resolved to the emulator address of that region).
+    Buf(usize),
+    /// A pointer argument that is null on the card too.
+    Null,
+    I32(i32),
+    U32(u32),
+    F32(f32),
+}
+
+/// One host-side input/output buffer of an emulated launch: mapped as its own exact-size
+/// emulator region with unmapped guard gaps on both sides.
+#[derive(Clone, Debug)]
+pub struct EmuBuf {
+    pub name: &'static str,
+    pub bytes: Vec<u8>,
+}
+
+/// The host-side twin of a node's `setup`: seeded inputs and the production kernarg layout at the
+/// node's small `emu` shape, with no device. `out` is the buffer the identity compare reads.
+#[derive(Clone, Debug)]
+pub struct EmuCase {
+    pub bufs: Vec<EmuBuf>,
+    pub args: Vec<EmuArg>,
+    pub out: usize,
+}
+
 /// One hipcc incumbent at one shape.
 pub trait Node {
     /// Node name as on the command line (`mq6_res`, `hc_mix`, `qsa_hg4`).
@@ -100,6 +129,11 @@ pub trait Node {
     /// Extra node-specific record fields (merged into the top-level record).
     fn record_extra(&self) -> Value {
         Value::Null
+    }
+    /// The host-side seeded inputs + explicit kernargs of the pre-card emulator gate (`--emu`),
+    /// at this node's shape (the `emu` preset by default). Deterministic in `seed`, GPU-free.
+    fn emu_case(&self, _seed: u64) -> Result<EmuCase> {
+        Err(format!("{}: no host-side emulator case", self.name()))
     }
 
     /// Allocate seeded valid inputs and the output; keep a pristine copy of

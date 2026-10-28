@@ -38,6 +38,10 @@ pub const PRESETS: [(&str, usize, usize); 5] = [
     ("ba", 48, 2560),
 ];
 pub const DEFAULT_N: usize = 768;
+/// The pre-card emulator gate's shape (`--emu`, preset `emu`): M=144 (rows tile 16..=128 all leave a
+/// ragged last tile: 144 = 128 + 16), K=512 (two MQ6 groups), N=40 (ragged under every token tile,
+/// 16*NW .. 256), forced MW8 (production routes N < 416 off this kernel).
+pub const EMU: (usize, usize, usize) = (144, 512, 40);
 const MODULE: &str = "gemm_mqv2_wmma_gfx1100_mw_lds";
 const GROUP_BYTES: usize = rdna_compute::MQ6G256V2_GROUP_BYTES;
 
@@ -69,14 +73,16 @@ pub struct Mq6Res {
 impl Mq6Res {
     pub fn new(shape: &ShapeSpec) -> Result<Self> {
         let mut s = shape.clone();
+        let emu = s.preset.as_deref() == Some("emu");
         let (label, pm, pk) = match &s.preset {
+            Some(_) if emu => ("emu".to_owned(), Some(EMU.0), Some(EMU.1)),
             Some(p) => {
                 let (_, m, k) = PRESETS
                     .iter()
                     .find(|(n, _, _)| n == p)
                     .ok_or_else(|| {
                         let names: Vec<&str> = PRESETS.iter().map(|p| p.0).collect();
-                        format!("mq6_res: unknown shape preset `{p}` (have {})", names.join(", "))
+                        format!("mq6_res: unknown shape preset `{p}` (have {}, emu)", names.join(", "))
                     })?;
                 (p.clone(), Some(*m), Some(*k))
             }
@@ -84,13 +90,14 @@ impl Mq6Res {
         };
         let m = s.take_usize("M", pm)?;
         let k = s.take_usize("K", pk)?;
-        let n = s.take_usize("N", Some(DEFAULT_N))?;
+        let n = s.take_usize("N", Some(if emu { EMU.2 } else { DEFAULT_N }))?;
         let waves = match s.kv.remove("waves") {
             Some(w) => match w.as_str() {
                 "4" => 4,
                 "8" => 8,
                 _ => return Err(format!("mq6_res: waves={w}: must be 4 or 8")),
             },
+            None if emu => 8,
             None => production_waves(n).ok_or_else(|| {
                 format!("mq6_res: N={n}: production does not route MW below N=416 (pass waves=4|8 to force)")
             })?,
@@ -125,6 +132,21 @@ impl Mq6Res {
             }
         }
         w
+    }
+
+    /// Seeded host buffers `(W, X, Y0)` the GPU `setup` uploads and the emulator gate maps.
+    pub fn host_inputs(&self, seed: u64) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+        let w = Self::synth_weights(self.m, self.k, seed);
+        let mut r = Xs64::new(seed ^ 0x9E37_79B9_7F4A_7C15);
+        let mut x = Vec::with_capacity(self.n * self.k * 2);
+        for _ in 0..self.n * self.k {
+            x.extend_from_slice(&f16_bits(r.normal()).to_le_bytes());
+        }
+        let mut y = Vec::with_capacity(self.n * self.m * 4);
+        for _ in 0..self.n * self.m {
+            y.extend_from_slice(&(0.5 * r.unit()).to_le_bytes());
+        }
+        (w, x, y)
     }
 }
 
@@ -162,17 +184,28 @@ impl Node for Mq6Res {
         }
     }
 
+    fn emu_case(&self, seed: u64) -> Result<EmuCase> {
+        let (w, x, y) = self.host_inputs(seed);
+        Ok(EmuCase {
+            bufs: vec![
+                EmuBuf { name: "a", bytes: w },
+                EmuBuf { name: "x", bytes: x },
+                EmuBuf { name: "y", bytes: y },
+            ],
+            args: vec![
+                EmuArg::Buf(0),
+                EmuArg::Buf(1),
+                EmuArg::Buf(2),
+                EmuArg::I32(self.m as i32),
+                EmuArg::I32(self.k as i32),
+                EmuArg::I32(self.n as i32),
+            ],
+            out: 2,
+        })
+    }
+
     fn setup(&mut self, gpu: &rdna_compute::Gpu, seed: u64) -> Result<()> {
-        let w = Self::synth_weights(self.m, self.k, seed);
-        let mut r = Xs64::new(seed ^ 0x9E37_79B9_7F4A_7C15);
-        let mut x = Vec::with_capacity(self.n * self.k * 2);
-        for _ in 0..self.n * self.k {
-            x.extend_from_slice(&f16_bits(r.normal()).to_le_bytes());
-        }
-        let mut y = Vec::with_capacity(self.n * self.m * 4);
-        for _ in 0..self.n * self.m {
-            y.extend_from_slice(&(0.5 * r.unit()).to_le_bytes());
-        }
+        let (w, x, y) = self.host_inputs(seed);
         let ybuf = Buf::from_bytes(gpu, &y)?;
         let y0 = Buf::from_bytes(gpu, &y)?;
         self.st = Some(State {

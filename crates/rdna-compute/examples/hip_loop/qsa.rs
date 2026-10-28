@@ -55,6 +55,13 @@ const LDS_LIMIT: usize = 64 * 1024;
 const TILE_ROWS: usize = 768;
 /// FN S1 prefill length (22 tiles of 768); the K/V cache capacity.
 const FN_TOKENS: usize = 22 * TILE_ROWS;
+/// Pre-card emulator gate shape (`--shape emu`): 3 rows at `position_start` 102 -> visible 103, 104,
+/// 105: every row far below the 2048-token budget (selected_len 103/104/105 < capacity, 25/26/26
+/// blocks, tails 3/0/1: row 1 crosses a 4-token block boundary), full causal context (every visible
+/// token selected), shape constants (24/2 heads, head_dim 256, budget 512 blocks, capacity 2051) as
+/// production.
+const EMU_POSITION: usize = 102;
+const EMU_ROWS: usize = 3;
 /// Q8_0 K or V bytes per token row: kv_heads * (head_dim / 32) * 34.
 const KV_ROW_BYTES: usize = N_KV_HEADS * (HEAD_DIM / 32) * 34;
 const Q_ROW_FLOATS: usize = 2 * N_HEADS * HEAD_DIM;
@@ -103,17 +110,20 @@ impl QsaHg4 {
             }
             pos = Some(p);
         }
-        let rows = s.take_usize("rows", Some(TILE_ROWS))?;
+        let emu = pos.as_deref() == Some("emu");
+        let rows = s.take_usize("rows", Some(if emu { EMU_ROWS } else { TILE_ROWS }))?;
         s.no_leftover()?;
         // Tile 11 of 22 (mid-window) is the representative default, tile 21 the
-        // late one; an integer is an explicit position_start.
+        // late one; an integer is an explicit position_start; `emu` is the pre-card
+        // emulator gate's small shape.
         let (label, position_start) = match pos.as_deref() {
             None | Some("mid") | Some("fn") => ("mid".to_owned(), 11 * TILE_ROWS),
             Some("late") => ("late".to_owned(), 21 * TILE_ROWS),
+            Some("emu") => ("emu".to_owned(), EMU_POSITION),
             Some(n) => {
                 let p = n
                     .parse::<usize>()
-                    .map_err(|e| format!("--shape pos={n}: expected mid|late|<position_start>: {e}"))?;
+                    .map_err(|e| format!("--shape pos={n}: expected mid|late|emu|<position_start>: {e}"))?;
                 (format!("p{p}"), p)
             }
         };
@@ -123,7 +133,8 @@ impl QsaHg4 {
                 "--shape rows={rows}: production routes < 2 rows off hg4 (decode policies)"
             ));
         }
-        let full_capacity = (position_start + rows).max(FN_TOKENS);
+        // The emulator gate maps the K/V cache exactly: no tokens past the last visible one.
+        let full_capacity = if emu { position_start + rows } else { (position_start + rows).max(FN_TOKENS) };
         Ok(Self { label, rows, position_start, full_capacity, dev: None })
     }
 
@@ -235,6 +246,38 @@ impl Node for QsaHg4 {
                 "kv": "Q8_0 blocks (f16 scale + 32 int8), 34 B x 8 per head, 2 heads",
                 "work_note": "flops = 4*hd*heads*sum(selected_len); bytes nominal, no cache reuse",
             }
+        })
+    }
+
+    fn emu_case(&self, seed: u64) -> Result<EmuCase> {
+        let inputs = generate(self.rows, self.position_start, self.full_capacity, seed);
+        validate_selection(&inputs.sel, self.rows, self.position_start, self.full_capacity)?;
+        let out_bytes = self.rows * OUT_ROW_FLOATS * 4;
+        let mut args = vec![EmuArg::Buf(0), EmuArg::Buf(1), EmuArg::Buf(2), EmuArg::Buf(3), EmuArg::Buf(4)];
+        for v in [
+            self.rows,
+            self.position_start,
+            N_HEADS,
+            N_KV_HEADS,
+            HEAD_DIM,
+            BUDGET_BLOCKS,
+            COMPRESS,
+            CAPACITY,
+            self.full_capacity,
+        ] {
+            args.push(EmuArg::I32(i32::try_from(v).map_err(err)?));
+        }
+        Ok(EmuCase {
+            bufs: vec![
+                EmuBuf { name: "q", bytes: inputs.q },
+                EmuBuf { name: "k", bytes: inputs.k },
+                EmuBuf { name: "v", bytes: inputs.v },
+                EmuBuf { name: "sel", bytes: bytemuck_i32(&inputs.sel).to_vec() },
+                // NaN-filled like the card's pristine output.
+                EmuBuf { name: "out", bytes: vec![0xFFu8; out_bytes] },
+            ],
+            args,
+            out: 4,
         })
     }
 
