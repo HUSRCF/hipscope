@@ -4963,7 +4963,8 @@ impl Gpu {
     }
 
     /// Whether this Gpu backs the gathered QSA workspace with a stable-VA
-    /// VMM owner: gfx1151 or gfx1201 (the arches with evidence for it), a
+    /// VMM owner: gfx1151, gfx1201, or gfx1100 unless
+    /// `HIPFIRE_QWEN4_VMM_GFX1100=0` (the arches with evidence for it), a
     /// platform the VMM KV backend is certified on (not native Windows, not
     /// WSL without its unsafe override), and a runtime answering the VMM
     /// granularity query. Everything else keeps the legacy contiguous slot.
@@ -4971,7 +4972,7 @@ impl Gpu {
         (self.arch_caps.is_gfx1151()
             || self.arch_caps.is_gfx1201()
             || (self.arch_caps.is_gfx1100()
-                && hipfire_config::devices::qwen4_vmm_gfx1100_optin()))
+                && hipfire_config::devices::qwen4_vmm_gfx1100_enabled()))
             && hipfire_config::devices::vmm_kv_platform_refusal().is_none()
             && self.vmm_recommended_granularity().is_ok()
     }
@@ -4998,16 +4999,20 @@ impl Gpu {
             return self.qsa_gather_legacy(reserve_bytes).map(drop);
         }
         let reserve_bytes = reserve_bytes.max(1);
-        if self
-            .scratch
-            .qsa_gather_vmm
-            .as_ref()
-            .is_some_and(|workspace| workspace.byte_size() >= reserve_bytes)
-        {
+        let action = crate::scratch::qsa_gather_reserve_action(
+            self.scratch
+                .qsa_gather_vmm
+                .as_ref()
+                .map(GpuTensor::byte_size),
+            reserve_bytes,
+        );
+        if action == crate::scratch::QsaGatherReserve::Keep {
             return Ok(());
         }
         self.refuse_qsa_gather_growth_while_armed(reserve_bytes)?;
-        if self.scratch.qsa_gather_vmm.is_some() {
+        if action == crate::scratch::QsaGatherReserve::ReplaceRetiring {
+            // Never unmap/remap the live VA in place: release retires it (the
+            // range stays reserved) and the allocation below takes a new one.
             self.invalidate_for_scratch_growth();
             self.release_qsa_gather_workspace()?;
         }
