@@ -31,7 +31,7 @@
 //! groups run before the loop in one of three arms (`wg_if_else` on `r`; arm `r` starts its rings
 //! at buffer `(3 - r) % 3`, runs the staging of slabs 0 and 1 and `r` full groups) that leave the
 //! rings in one state. Code: 3 arm groups + 3 body groups + 1 peeled group.
-use super::{fold_and_b2, label, seed_fill, tail_label, trips_cmp, Pr, Stage, Work};
+use super::{fold_and_b2, label, seed_fill, tail_label, trips_cmp, Hooks, Pr, Stage, Work};
 use crate::kernels::mq6_i8_gemm::{
     blocks, prologue, publish, spec, Gen, Lds, MetaD, MetaS, PayA, PayW, Wg, EPI, K_BEGIN, K_LOOP,
     K_LOOP_END,
@@ -163,7 +163,7 @@ fn block3(
         queue_slab(&mut st, &sets[0], 0, srd_next, false)?;
     }
     // The seed octet is the decode scratch: decode starts after the last seeded WMMA.
-    st.phase(wg, &sets[0], slot_a, true, 8, 3)?;
+    st.phase(wg, &sets[0], slot_a, true, 8, 3, Hooks::default())?;
     st.flush(wg, &sets[0])?;
     if blk.pub_next {
         // Next block's token word and packed row header (header word of the next half; across a
@@ -195,7 +195,7 @@ fn block3(
         st.w.begin(wg)?;
         queue_slab(&mut st, &sets[1], 1, srd_next, true)?;
     }
-    st.phase(wg, &sets[1], slot_b, false, 6, 3)?;
+    st.phase(wg, &sets[1], slot_b, false, 6, 3, Hooks::default())?;
     st.flush(wg, &sets[1])?;
 
     // ------------------------------------------------------------------ fold + B2

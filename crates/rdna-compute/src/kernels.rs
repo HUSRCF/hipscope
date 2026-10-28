@@ -4601,7 +4601,11 @@ pub const QWEN4_MQ6_X4_PM_GFX1201: &[u8] =
 /// (`gemm_mq6_i8::mq6_i8_pm_admits`).
 /// Default on exact gfx1201 where the launch meets those preconditions
 /// (`HIPFIRE_MQ6_I8_PM=0` keeps the hipcc kernel).
-/// SHA-256 1c2dcba4b9433e71acba6ba27fabe96c21cedf1a1497e5abed79b0804952e5da
+/// The four `set` / `set_bf16` entries run the stacked K-loop schedule with `s_delay_alu` hints
+/// (`Spec::stacked`: the next block's metadata fetch and the half-1 refetch issue after WMMA 7,
+/// `StoreA(1)` of each phase is held to after WMMA 24, phase B publishes the metadata first;
+/// GPU-timed 0.90-0.93x of the previous schedule, bit-identical); `set_nr` is unchanged.
+/// SHA-256 c1458584a1b8ab53e613c982c9a3e87c530c80e83e76223ed4f677d594bad300 (was 1c2dcba4…)
 /// (`sha256sum kernels/gemm_mq6g256v2_mmq_i8_pm_gfx1201.hxaco`).
 pub const GEMM_MQ6G256V2_MMQ_I8_PM_GFX1201: &[u8] =
     include_bytes!("../../../kernels/gemm_mq6g256v2_mmq_i8_pm_gfx1201.hxaco");

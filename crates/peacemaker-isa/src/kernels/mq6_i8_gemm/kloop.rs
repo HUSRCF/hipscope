@@ -10,10 +10,12 @@
 //! weight dwords in `a_pf` / `w_pf`, token/row planes `h` published):
 //! - Phase A: four K16 steps from slot 0 on the two fragment sets (`F0`, `F1` ping-pong: the
 //!   next-but-one step loads while the current one issues), interleaved with the decode and
-//!   publication of slab 1 into slot 1; fetch of the next block's metadata; B1 retires slot 0
-//!   and publishes slot 1.
+//!   publication of slab 1 into slot 1; the next block's metadata fetch (issued with the half-1
+//!   refetch after WMMA 7; `StoreA(1)` is held to after WMMA 24, see `Spec::stacked`); B1
+//!   retires slot 0 and publishes slot 1.
 //! - Phase B: next-block slab-0 fetch; four K16 steps from slot 1 interleaved with the decode and
-//!   publication of the next block's slab 0 into slot 0 and of its metadata; the fold of this
+//!   publication of the next block's slab 0 into slot 0 and of its metadata (published first);
+//!   the fold of this
 //!   block (row group 0 first; row group 1's `sc` lands in the already folded accumulators'
 //!   dead registers, its `z'` in the decode scratch); B2 is signalled after the last LDS load and
 //!   waited at the block end, overlapping the fold's remaining packets. The block's last
@@ -118,8 +120,36 @@ enum Work {
     Insn(Instruction),
     StoreW(usize),
     StoreA(u32),
-    FetchA { slab: u32, sb: u32, srd: u8 },
+    FetchA {
+        slab: u32,
+        sb: u32,
+        srd: u8,
+    },
+    /// The next block's token word and packed row header (`fetch_meta(h, off)`).
+    FetchMeta {
+        h: usize,
+        off: u32,
+    },
     Meta,
+}
+
+/// Units a phase places at fixed WMMAs besides the steady `per`-per-WMMA drain: `burst` units
+/// after WMMA `burst_at`, and `hold` appended and drained after WMMA `hold_at` (none by default).
+struct Hooks {
+    burst_at: usize,
+    burst: usize,
+    hold_at: usize,
+    hold: Vec<Work>,
+}
+impl Default for Hooks {
+    fn default() -> Self {
+        Self {
+            burst_at: usize::MAX,
+            burst: 0,
+            hold_at: usize::MAX,
+            hold: Vec::new(),
+        }
+    }
 }
 
 /// The four rings plus the queue of work to interleave between WMMAs.
@@ -162,6 +192,7 @@ impl<const D: usize> Stage<D> {
                     }
                     publish::fetch_a(wg.isa(), g, slab, sb, srd)?
                 }
+                Work::FetchMeta { h, off } => publish::fetch_meta(wg.isa(), g, h, off)?,
                 Work::Meta => {
                     let (rd, rs) = (self.d.free()?, self.s.free()?);
                     let (sd, ss) = publish::publish_meta(wg, g, rd, rs)?;
@@ -193,7 +224,8 @@ impl<const D: usize> Stage<D> {
         self.a.ds_load(wg, a1)
     }
 
-    /// Four K16 steps from `slot`; after the `n`-th WMMA (`n >= start`) `per` work units run.
+    /// Four K16 steps from `slot`; after the `n`-th WMMA (`n >= start`) `per` work units run, plus
+    /// the units `hooks` places at fixed WMMAs.
     fn phase(
         &mut self,
         wg: &mut Wg,
@@ -202,6 +234,7 @@ impl<const D: usize> Stage<D> {
         first: bool,
         start: usize,
         per: usize,
+        mut hooks: Hooks,
     ) -> Result<(), String> {
         self.step_loads(wg, g, slot, 0, 0)?;
         self.step_loads(wg, g, slot, 1, 1)?;
@@ -209,11 +242,20 @@ impl<const D: usize> Stage<D> {
             let set = (step & 1) as usize;
             let base = 8 * step as usize;
             mma_step(wg, g, step, set, first && step == 0, &mut |wg, i| {
-                if base + i >= start {
-                    self.pump(wg, g, per)
-                } else {
-                    Ok(())
+                if base + i == hooks.burst_at {
+                    self.pump(wg, g, hooks.burst)?;
                 }
+                if base + i >= start {
+                    self.pump(wg, g, per)?;
+                }
+                if base + i == hooks.hold_at {
+                    // Held units (the last-queued consumer of the global refetch) are appended and
+                    // run now: the refetch had the whole span in between to land.
+                    self.work.extend(hooks.hold.drain(..));
+                    let n = self.work.len();
+                    self.pump(wg, g, n)?;
+                }
+                Ok(())
             })?;
             if step + 2 < 4 {
                 self.step_loads(wg, g, slot, step + 2, set)?;
@@ -275,6 +317,11 @@ fn block_with(
     };
 
     // ------------------------------------------------------------------ phase A
+    // The stacked schedule (every epilogue but `SetNr`, `Spec::stacked`) queues the half-1
+    // refetch and the next block's metadata fetch first (issued after WMMA 7, so both are long
+    // landed when phase B consumes them) and holds `StoreA(1)`, the last consumer of the
+    // refetch, to after WMMA 24.
+    let stacked = g.spec.stacked();
     st.slot = st.a.begin(wg)?;
     st.w.begin(wg)?;
     let mut insns = Vec::new();
@@ -282,13 +329,28 @@ fn block_with(
     // refill of the raw staging registers (which must wait for these stores to read them) finds
     // them long drained.
     st.work.push_back(Work::StoreA(0));
-    publish::decode_round(&mut insns, g, 0)?;
-    st.push_insns(std::mem::take(&mut insns));
-    st.work.push_back(Work::FetchA {
+    let fetch_half1 = Work::FetchA {
         slab: 1,
         sb: 1,
         srd: g.srd_a[h],
-    });
+    };
+    if stacked {
+        st.work.push_back(fetch_half1);
+        if fetch_next {
+            // Next block's token word and packed row header (header word of the next half; across
+            // a group boundary the group stride, since `goff` has not advanced).
+            st.work.push_back(Work::FetchMeta {
+                h,
+                off: if h == 0 { 4 } else { spec::GROUP_BYTES },
+            });
+        }
+        publish::decode_round(&mut insns, g, 0)?;
+        st.push_insns(std::mem::take(&mut insns));
+    } else {
+        publish::decode_round(&mut insns, g, 0)?;
+        st.push_insns(std::mem::take(&mut insns));
+        st.work.push_back(fetch_half1);
+    }
     st.work.push_back(Work::StoreW(0));
     // A tile with one weight round (128 rows on 512 threads) has no second round to decode.
     if g.w_pf.len() > 1 {
@@ -296,11 +358,21 @@ fn block_with(
         st.push_insns(std::mem::take(&mut insns));
         st.work.push_back(Work::StoreW(1));
     }
-    st.work.push_back(Work::StoreA(1));
     // The seed octet is the decode scratch: decode starts after the last seeded WMMA.
-    st.phase(wg, g, 0, true, 8, 3)?;
+    let hooks = if stacked {
+        Hooks {
+            burst_at: 7,
+            burst: if fetch_next { 3 } else { 2 },
+            hold_at: 24,
+            hold: vec![Work::StoreA(1)],
+        }
+    } else {
+        st.work.push_back(Work::StoreA(1));
+        Hooks::default()
+    };
+    st.phase(wg, g, 0, true, 8, 3, hooks)?;
     st.flush(wg, g)?;
-    if fetch_next {
+    if fetch_next && !stacked {
         // Next block's token word and packed row header (header word of the next half; across a
         // group boundary the group stride, since `goff` has not advanced).
         publish::fetch_meta(wg.isa(), g, h, if h == 0 { 4 } else { spec::GROUP_BYTES })?;
@@ -328,9 +400,15 @@ fn block_with(
     st.w = Pr::Free(rw);
 
     // ------------------------------------------------------------------ phase B
+    // Stacked: the metadata publication first (its words land ahead of the slab-0 raw fetch),
+    // `StoreA(1)` held to after WMMA 24.
+    let mut hooks = Hooks::default();
     if fetch_next {
         st.slot = st.a.begin(wg)?;
         st.w.begin(wg)?;
+        if stacked {
+            st.work.push_back(Work::Meta);
+        }
         publish::decode_round(&mut insns, g, 0)?;
         st.push_insns(std::mem::take(&mut insns));
         st.work.push_back(Work::StoreW(0));
@@ -345,10 +423,15 @@ fn block_with(
             st.push_insns(insns);
             st.work.push_back(Work::StoreW(1));
         }
-        st.work.push_back(Work::StoreA(1));
-        st.work.push_back(Work::Meta);
+        if stacked {
+            hooks.hold_at = 24;
+            hooks.hold = vec![Work::StoreA(1)];
+        } else {
+            st.work.push_back(Work::StoreA(1));
+            st.work.push_back(Work::Meta);
+        }
     }
-    st.phase(wg, g, 1, false, 6, 3)?;
+    st.phase(wg, g, 1, false, 6, 3, hooks)?;
     st.flush(wg, g)?;
 
     // ------------------------------------------------------------------ fold

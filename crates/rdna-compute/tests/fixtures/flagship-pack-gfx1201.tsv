@@ -318,7 +318,7 @@ fn-ar	gfx1201	hip	silu_mul	silu_mul_f32	--genco --offload-arch=gfx1201 -O3 --no-
 fn-ar	gfx1201	hip	tensor_ops	argmax_f32	--genco --offload-arch=gfx1201 -O3 --no-offload-compress -fuse-cuid=none -mcode-object-version=6 -DIU4_A4_CANDIDATES=2	default	44f2f8122e0cb2f1040076d7bf56c379a52e6ff031d6c31cb354806873578407
 fn-ar	gfx1201	hip	topk8_rescore_mq6g256v2	topk8_rescore_mq6g256v2_k2560	--genco --offload-arch=gfx1201 -O3 --no-offload-compress -fuse-cuid=none -mcode-object-version=6 -DIU4_A4_CANDIDATES=2	default	beefb0caa84e8afda5ad01a1cacaf7128a356dcfa8d795e3d9358cc7e4ab798d
 fn-ar	gfx1201	hip	zero_f32	zero_f32	--genco --offload-arch=gfx1201 -O3 --no-offload-compress -fuse-cuid=none -mcode-object-version=6 -DIU4_A4_CANDIDATES=2	default	4baff33a459998d1a2dfd25a04818bd87e70c6496a5f4b20762ea2046e827b32
-fn-ar	gfx1201	embedded	gemm_mq6g256v2_mmq_i8_pm_gfx1201	gemm_mq6g256v2_mmq_i8_pm_set_gfx1201			1c2dcba4b9433e71acba6ba27fabe96c21cedf1a1497e5abed79b0804952e5da
+fn-ar	gfx1201	embedded	gemm_mq6g256v2_mmq_i8_pm_gfx1201	gemm_mq6g256v2_mmq_i8_pm_set_gfx1201			c1458584a1b8ab53e613c982c9a3e87c530c80e83e76223ed4f677d594bad300
 fn-ar	gfx1201	embedded	qsa_gather_pm_gfx1201	indexed_attention_gathered_wmma_f16_pm_gfx1201			e3b1c677b9b71c6d7a4c7693d8442afb53dd9581137644f158134aba2d740e02
 fn-ar	gfx1201	embedded	qwen4_moe_down_gp_pm_gfx1201	moe_rotate_i4_gp_pm_gfx1201			e136e40e9df122b938a7942f28d1c55be7af9359ce7a800b317aadb2e733b972
 fn-ar	gfx1201	embedded	qwen4_moe_iu4_sym_pm_gfx1201	qwen4_moe_gate_up_silu_iu4_sym_pm_gfx1201_nt4			0eea1673a530880586dc0cd179b7a3ef3dfd491660dff439f7b54e921792791e
@@ -392,7 +392,7 @@ fn-mtp	gfx1201	hip	silu_mul	silu_mul_f32	--genco --offload-arch=gfx1201 -O3 --no
 fn-mtp	gfx1201	hip	tensor_ops	argmax_f32	--genco --offload-arch=gfx1201 -O3 --no-offload-compress -fuse-cuid=none -mcode-object-version=6 -DIU4_A4_CANDIDATES=2	default	44f2f8122e0cb2f1040076d7bf56c379a52e6ff031d6c31cb354806873578407
 fn-mtp	gfx1201	hip	topk8_rescore_mq6g256v2	topk8_rescore_mq6g256v2_k2560	--genco --offload-arch=gfx1201 -O3 --no-offload-compress -fuse-cuid=none -mcode-object-version=6 -DIU4_A4_CANDIDATES=2	default	beefb0caa84e8afda5ad01a1cacaf7128a356dcfa8d795e3d9358cc7e4ab798d
 fn-mtp	gfx1201	hip	zero_f32	zero_f32	--genco --offload-arch=gfx1201 -O3 --no-offload-compress -fuse-cuid=none -mcode-object-version=6 -DIU4_A4_CANDIDATES=2	default	4baff33a459998d1a2dfd25a04818bd87e70c6496a5f4b20762ea2046e827b32
-fn-mtp	gfx1201	embedded	gemm_mq6g256v2_mmq_i8_pm_gfx1201	gemm_mq6g256v2_mmq_i8_pm_set_gfx1201			1c2dcba4b9433e71acba6ba27fabe96c21cedf1a1497e5abed79b0804952e5da
+fn-mtp	gfx1201	embedded	gemm_mq6g256v2_mmq_i8_pm_gfx1201	gemm_mq6g256v2_mmq_i8_pm_set_gfx1201			c1458584a1b8ab53e613c982c9a3e87c530c80e83e76223ed4f677d594bad300
 fn-mtp	gfx1201	embedded	qsa_gather_pm_gfx1201	indexed_attention_gathered_wmma_f16_pm_gfx1201			e3b1c677b9b71c6d7a4c7693d8442afb53dd9581137644f158134aba2d740e02
 fn-mtp	gfx1201	embedded	qwen4_moe_down_gp_pm_gfx1201	moe_rotate_i4_gp_pm_gfx1201			e136e40e9df122b938a7942f28d1c55be7af9359ce7a800b317aadb2e733b972
 fn-mtp	gfx1201	embedded	qwen4_moe_iu4_sym_pm_gfx1201	qwen4_moe_gate_up_silu_iu4_sym_pm_gfx1201_nt4			0eea1673a530880586dc0cd179b7a3ef3dfd491660dff439f7b54e921792791e

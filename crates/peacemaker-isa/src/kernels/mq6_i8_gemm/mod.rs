@@ -606,6 +606,9 @@ pub fn emit(spec: Spec) -> Result<Emitted, String> {
     spec.validate()?;
     let g = Gen::new(spec)?;
     let mut b = Builder::new(g.kernel_spec(), g.plan()?);
+    if spec.stacked() {
+        b.enable_delay_alu();
+    }
     let mut wg = Wg::new(&mut b)?;
     if spec.tune.ring == RingDepth::Three {
         // Validate refused `SetNr`: no epilogue reads the rings.

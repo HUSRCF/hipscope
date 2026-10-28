@@ -28,7 +28,7 @@ wg.wait_arrived(b1)?;                                  // B1, second half
 
 The natives return `Instruction`s for everything that touches LDS and emit straight into `wg.isa()` for everything else. A native owns no ring, so there is nothing to lend: the driver sees every store, load, wait and barrier and checks it as it does any script.
 
-Between the WMMAs the block runs queued work units (`enum Work { Insn, StoreW, StoreA, FetchA, Meta }`). `phase(wg, g, st, slot, first, start, per)` issues four K16 steps and, after each WMMA from index `start` on, runs `per` units. The order of the `st.work.push(..)` lines, `start` and `per` are the placement.
+Between the WMMAs the block runs queued work units (`enum Work { Insn, StoreW, StoreA, FetchA, FetchMeta, Meta }`). `phase(wg, g, st, slot, first, start, per, io_at, io_n, hold_at, hold, ..)` issues four K16 steps and, after each WMMA from index `start` on, runs `per` units; `io_n` more units run after WMMA `io_at`, and the `hold` units are appended and drained after WMMA `hold_at` (`99` = never; the trailing fold arguments are likewise off). The order of the `st.work.push(..)` lines, `start`, `per`, `io_at` / `io_n` and `hold_at` are the placement.
 
 ## Move a wait
 
@@ -48,12 +48,12 @@ The ring waits are the same kind of statement. `wg.wait_all((st.a, st.w))` befor
 
 ## Move the split-barrier signal
 
-B1 is split: `wg.signal` after the stores drain, the next block's raw slab-0 fetch (VMEM) overlaps the rendezvous, `wg.wait_arrived` completes it. Production issues the next block's token word and row header (`mq6::fetch_meta`) *before* the signal. To make that fetch overlap the rendezvous too, move the block after the signal:
+B1 is split: `wg.signal` after the stores drain, the next block's raw slab-0 fetch (VMEM) overlaps the rendezvous, `wg.wait_arrived` completes it. Production issues the next block's token word and row header (`mq6::fetch_meta`) as the queued unit `Work::FetchMeta`, right behind the half-1 refetch after WMMA 7, so it is long landed by the signal. To make that fetch overlap the rendezvous instead, drop the `st.work.push(Work::FetchMeta(..))` and issue it after the signal:
 
 ```text
     let (da, dw) = wg.wait_all((st.a, st.w))?;
     let b1 = wg.signal((rotate(st.a, da), rotate(st.w, dw)))?;
-    if fetch_next {                                    // was above the wait_all
+    if fetch_next {                                    // was the queued `Work::FetchMeta`
         mq6::fetch_meta(wg, g, h, if h == 0 { 4 } else { group })?;
     }
     if fetch_next {
@@ -71,16 +71,16 @@ What the driver refuses, wherever you put the signal: a read of a ring the barri
 
 ## Decode placement relative to the MMAs
 
-The weight decode (`mq6::decode_insns(g, r)`, 31 VALU instructions per round) is spread between the WMMAs so the tensor and vector pipes overlap. In `phase(wg, g, &mut st, 0, true, 8, 3)` the first K16 step's bundle is the seeded one: the seed octet *is* the decode scratch, so decode may only start after the last seeded WMMA (index 8). From there three work units run after every WMMA. Change it:
+The weight decode (`mq6::decode_insns(g, r)`, 31 VALU instructions per round) is spread between the WMMAs so the tensor and vector pipes overlap. In `phase(wg, g, &mut st, 0, true, 8, 3, ..)` the first K16 step's bundle is the seeded one: the seed octet *is* the decode scratch, so decode may only start after the last seeded WMMA (index 8). From there three work units run after every WMMA. Change it:
 
 ```text
-    phase(wg, g, &mut st, 0, true, 12, 3)?;   // decode starts after the 12th WMMA
-    phase(wg, g, &mut st, 1, false, 6, 2)?;   // two units per WMMA in phase B
+    phase(wg, g, &mut st, 0, true, 12, 3, ..)?;   // decode starts after the 12th WMMA
+    phase(wg, g, &mut st, 1, false, 6, 2, ..)?;   // two units per WMMA in phase B
 ```
 
-Both build, keep every instruction and leave the output bit-identical (interpreter). A start below 8 is the experiment the seed forbids: the decode overwrites the `0x4B400000` octet the first WMMAs still read. `phase(.., 0, true, 4, 3)` builds, because the builder has no model of that arithmetic, and computes another result. The interpreter is what catches it (`decoding_before_the_seed_is_consumed_builds_but_changes_the_output`), so run a variation there before the card.
+Both build, keep every instruction and leave the output bit-identical (interpreter). A start below 8 is the experiment the seed forbids: the decode overwrites the `0x4B400000` octet the first WMMAs still read. `phase(.., 0, true, 4, 3, ..)` builds, because the builder has no model of that arithmetic, and computes another result. The interpreter is what catches it (`decoding_before_the_seed_is_consumed_builds_but_changes_the_output`), so run a variation there before the card.
 
-The queue order is a placement knob as well: `Work::StoreW(0)` after the first decode round is the earliest the decoded operand can be stored; `Work::FetchA(.., sb = 1, ..)` sits between the stores so the raw staging registers refill as soon as their stores have drained.
+The queue order is a placement knob as well: `Work::StoreW(0)` after the first decode round is the earliest the decoded operand can be stored; `Work::FetchA(.., sb = 1, ..)` is queued right after the first `StoreA` so the raw staging registers refill as soon as their stores have drained, and `StoreA(1)`, the last consumer of that refetch, is held to after WMMA 24 (`hold_at`) so the refetch has the whole span to land.
 
 ## VOPD fold pairing
 

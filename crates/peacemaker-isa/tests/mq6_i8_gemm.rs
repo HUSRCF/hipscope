@@ -837,7 +837,7 @@ fn set_nr_validates_only_on_the_wide_row_tile() {
 }
 
 /// The norm+RoPE epilogue changes nothing in the K loop: `set_nr`'s hot-loop census equals the plain
-/// `256x128` entry's, the kernel stays inside the occupancy ceiling, and what it adds after the K
+/// `256x128` entry's (bar the plain entry's `s_delay_alu` hints and `s_wait_dscnt` placement), the kernel stays inside the occupancy ceiling, and what it adds after the K
 /// loop is the documented epilogue: four staging passes and the RoPE exchange (16 b128 stores
 /// each), the inverse-RMS store, one `v_rsq_f32` and 13 barriers (the K loop's rings retire, two per
 /// staging pass, two each for the inverse RMS and the exchange).
@@ -845,10 +845,18 @@ fn set_nr_validates_only_on_the_wide_row_tile() {
 fn set_nr_keeps_the_hot_loop_and_adds_the_documented_epilogue() {
     let plain = mq6_i8_gemm::emit(Spec::product(Epi::Set).with_tile(Tile::T256x128)).unwrap();
     let nr = mq6_i8_gemm::emit(Spec::product(Epi::SetNr).with_tile(Tile::T256x128)).unwrap();
-    assert_eq!(
-        mq6_i8_gemm::hot_loop_census(&plain.s_text),
-        mq6_i8_gemm::hot_loop_census(&nr.s_text)
-    );
+    // The plain entries run the stacked schedule (`Spec::stacked`): `s_delay_alu` issue hints and
+    // another `s_wait_dscnt` placement; `set_nr` keeps the plain schedule. Every other counted
+    // instruction of the loop is the same.
+    let census = |text: &str| {
+        let mut c = mq6_i8_gemm::hot_loop_census(text);
+        c.remove("s_delay_alu");
+        c.remove("s_wait_dscnt");
+        c
+    };
+    assert!(mq6_i8_gemm::hot_loop_census(&plain.s_text).contains_key("s_delay_alu"));
+    assert!(!mq6_i8_gemm::hot_loop_census(&nr.s_text).contains_key("s_delay_alu"));
+    assert_eq!(census(&plain.s_text), census(&nr.s_text));
     assert!(nr.shape.next_free_vgpr <= spec::VGPR_CEILING);
     assert_eq!(nr.shape.wmma, plain.shape.wmma);
     let count = |text: &str, name: &str| {

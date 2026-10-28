@@ -61,6 +61,7 @@ region PayA, PayW, MetaD, MetaS;
 fn emit(spec: Spec) -> Result<Emitted, String> {
     let g = Mq6Gen::new(mq6_spec(&spec.variant, spec.arch)?)?;
     let mut b = Builder::new(g.kernel_spec(), g.plan()?);
+    b.enable_delay_alu();
     let mut wg = Workgroup::new(&mut b, spec.arch)?;
     author(&mut wg, &g)?;
     b.finish()
@@ -265,6 +266,7 @@ enum Work {
     StoreW(usize),
     StoreA(u32),
     FetchA(u32, u32, u8),
+    FetchMeta(usize, u32),
     Meta,
 }
 
@@ -317,6 +319,9 @@ fn pump<T: Target>(wg: &mut Wg<T>, g: &Mq6Gen, st: &mut Stage, n: usize) -> Resu
                 }
                 mq6::fetch_a(wg, g, slab, sb, srd)?;
             }
+            Work::FetchMeta(h, off) => {
+                mq6::fetch_meta(wg, g, h, off)?;
+            }
             Work::Meta => {
                 // The VALU words first, then the DS / SZ rings begin their write.
                 let plane = st.d.next_index();
@@ -349,7 +354,7 @@ fn step_loads<T: Target>(wg: &mut Wg<T>, g: &Mq6Gen, st: &Stage, slot: usize, st
 
 // Four K16 steps from `slot` on the two fragment sets (the next-but-one step loads while the
 // current one issues); after the n-th WMMA (n >= start) `per` work units run.
-fn phase<T: Target>(wg: &mut Wg<T>, g: &Mq6Gen, st: &mut Stage, slot: usize, first: bool, start: usize, per: usize) -> Result<(), String> {
+fn phase<T: Target>(wg: &mut Wg<T>, g: &Mq6Gen, st: &mut Stage, slot: usize, first: bool, start: usize, per: usize, io_at: usize, io_n: usize, hold_at: usize, hold: Vec<Work>, fold_at: usize, fold_h: usize, fold_sz: bool) -> Result<(), String> {
     step_loads(wg, g, st, slot, 0, 0)?;
     step_loads(wg, g, st, slot, 1, 1)?;
     for step in 0..4u32 {
@@ -357,8 +362,39 @@ fn phase<T: Target>(wg: &mut Wg<T>, g: &Mq6Gen, st: &mut Stage, slot: usize, fir
         let base = 8 * (step as usize);
         for i in 0..8usize {
             mq6::mma(wg, g, step, set, first && step == 0, i)?;
+            if base + i == io_at {
+                pump(wg, g, st, io_n)?;
+            }
             if base + i >= start {
                 pump(wg, g, st, per)?;
+            }
+            // The fold's token (d, float(s)) pairs and their address do not alias any fragment /
+            // decode register: issue the four loads before the last K16 steps instead of after the
+            // last WMMA, so the fold's first multiply does not wait on a cold LDS round trip.
+            if base + i == fold_at {
+                mq6::fold_addr(wg, g, fold_h)?;
+                for nb in 0..4usize {
+                    wg.ds_load_cur(st.d, mq6::fold_token_load_insn(g, nb)?)?;
+                }
+            }
+            // Step 3 reads only fragment set 1 (v140..151): set 0 (v128..139) is dead, so row group
+            // 0's sc octet and row group 1's z' octet (decode scratch, queue drained) load now.
+            if fold_sz && base + i == fold_at + 4 {
+                let fsc = g.reg("fold_sc").unwrap();
+                let fscr = g.reg("scratch").unwrap();
+                sz_load(wg, g, st, fold_h, fsc, 0)?;
+                sz_load(wg, g, st, fold_h, fsc + 4, 16)?;
+                sz_load(wg, g, st, fold_h, fscr, 64 + 512)?;
+                sz_load(wg, g, st, fold_h, fscr + 4, 64 + 512 + 16)?;
+            }
+            // Held units (the last-queued consumer of the global refetch) are appended and run
+            // after WMMA `hold_at`: the refetch gets the whole span in between to land.
+            if base + i == hold_at {
+                for w in hold.clone() {
+                    st.work.push(w);
+                }
+                let n = st.work.len() - st.pos;
+                pump(wg, g, st, n)?;
             }
         }
         if step + 2 < 4 {
@@ -420,23 +456,22 @@ fn block<T: Target>(
     // of the raw staging registers (which must wait for these stores to read them) finds them long
     // drained.
     st.work.push(Work::StoreA(0));
-    queue_decode(&mut st, mq6::decode_insns(g, 0)?);
     st.work.push(Work::FetchA(1, 1, srd_a[h]));
+    if fetch_next {
+        // Early producer: the next block's token word / row header issue right behind the half-1
+        // refetch (after WMMA 7), so they are long landed when phase B's Meta consumes them.
+        st.work.push(Work::FetchMeta(h, if h == 0 { 4 } else { group }));
+    }
+    queue_decode(&mut st, mq6::decode_insns(g, 0)?);
     st.work.push(Work::StoreW(0));
     // A tile with one weight round (128 rows on 512 threads) has no second round to decode.
     if g.w_rounds() > 1 {
         queue_decode(&mut st, mq6::decode_insns(g, 1)?);
         st.work.push(Work::StoreW(1));
     }
-    st.work.push(Work::StoreA(1));
     // The seed octet is the decode scratch: decode starts after the last seeded WMMA.
-    phase(wg, g, &mut st, 0, true, 8, 3)?;
+    phase(wg, g, &mut st, 0, true, 8, 3, 7, if fetch_next { 3 } else { 2 }, 24, vec![Work::StoreA(1)], 99, 0, false)?;
     flush(wg, g, &mut st)?;
-    if fetch_next {
-        // Next block's token word and packed row header (header word of the next half; across a
-        // group boundary the group stride, since `goff` has not advanced).
-        mq6::fetch_meta(wg, g, h, if h == 0 { 4 } else { group })?;
-    }
     // B1 is split: the next block's raw slab-0 fetch (VMEM, its registers are free once the stores
     // drained) overlaps the rendezvous.
     let (da, dw) = wg.wait_all((st.a, st.w))?;
@@ -452,6 +487,8 @@ fn block<T: Target>(
         st.slot = st.a.next_index();
         let _ = wg.begin_write(st.a);
         let _ = wg.begin_write(st.w);
+        // The metadata publication first (LMQ6-1): its words land ahead of the slab-0 raw fetch.
+        st.work.push(Work::Meta);
         queue_decode(&mut st, mq6::decode_insns(g, 0)?);
         st.work.push(Work::StoreW(0));
         st.work.push(Work::StoreA(0));
@@ -460,10 +497,9 @@ fn block<T: Target>(
             queue_decode(&mut st, mq6::decode_insns(g, 1)?);
             st.work.push(Work::StoreW(1));
         }
-        st.work.push(Work::StoreA(1));
-        st.work.push(Work::Meta);
     }
-    phase(wg, g, &mut st, 1, false, 6, 3)?;
+    let hold_b: Vec<Work> = if fetch_next { vec![Work::StoreA(1)] } else { Vec::new() };
+    phase(wg, g, &mut st, 1, false, 6, 3, 99, 0, 24, hold_b, 99, h, false)?;
     flush(wg, g, &mut st)?;
 
     // ---------------------------------------------------------------- fold
@@ -639,7 +675,7 @@ fn block3<T: Target>(
         queue_slab3(&mut st, g0, 0, srd_a[h ^ 1], false)?;
     }
     // The seed octet is the decode scratch: decode starts after the last seeded WMMA.
-    phase(wg, g0, &mut st, slot_a, true, 8, 3)?;
+    phase(wg, g0, &mut st, slot_a, true, 8, 3, 99, 0, 99, Vec::new(), 99, 0, false)?;
     flush(wg, g0, &mut st)?;
     if pub_next {
         // Next block's token word and packed row header.
@@ -665,7 +701,7 @@ fn block3<T: Target>(
         let _ = wg.begin_write(st.w);
         queue_slab3(&mut st, g1, 1, srd_a[h ^ 1], true)?;
     }
-    phase(wg, g1, &mut st, slot_b, false, 6, 3)?;
+    phase(wg, g1, &mut st, slot_b, false, 6, 3, 99, 0, 99, Vec::new(), 99, 0, false)?;
     flush(wg, g1, &mut st)?;
 
     // ---------------------------------------------------------------- fold + B2

@@ -307,8 +307,8 @@ fn a_variation_without_the_k_loop_priority_builds_and_differs() {
 #[test]
 fn moving_the_decode_between_other_wmmas_reorders_without_losing_work() {
     let src = edit(
-        "phase(wg, g, &mut st, 0, true, 8, 3)?;",
-        "phase(wg, g, &mut st, 0, true, 12, 3)?;",
+        "phase(wg, g, &mut st, 0, true, 8, 3,",
+        "phase(wg, g, &mut st, 0, true, 12, 3,",
     );
     let base = build(TWIN, SET).unwrap();
     let varied = build(&src, SET).unwrap();
@@ -337,16 +337,21 @@ fn reordering_the_row_group_1_fragments_changes_the_packet_sequence() {
     assert_eq!(count(&base.s_text), count(&varied.s_text));
 }
 
-/// Split-barrier position (B1): the next block's token/row-header fetch moves after the signal, so
-/// it overlaps the rendezvous together with the slab-0 fetch.
+/// The next block's token word / row header fetch is a queued work unit (issued behind the half-1
+/// refetch, after WMMA 7). Split-barrier position (B1): it moves after the signal instead, so it
+/// overlaps the rendezvous together with the slab-0 fetch.
+const META_QUEUED: &str = "    if fetch_next {\n        // Early producer: the next block's token word / row header issue right behind the half-1\n        // refetch (after WMMA 7), so they are long landed when phase B's Meta consumes them.\n        st.work.push(Work::FetchMeta(h, if h == 0 { 4 } else { group }));\n    }\n";
+const META_AFTER_SIGNAL: &str = "    if fetch_next {\n        mq6::fetch_meta(wg, g, h, if h == 0 { 4 } else { group })?;\n    }\n";
+
 #[test]
 fn signalling_b1_before_the_meta_fetch_builds_and_differs() {
-    let meta = "    if fetch_next {\n        // Next block's token word and packed row header (header word of the next half; across a\n        // group boundary the group stride, since `goff` has not advanced).\n        mq6::fetch_meta(wg, g, h, if h == 0 { 4 } else { group })?;\n    }\n";
     let signal = "    let b1 = wg.signal((rotate(st.a, da), rotate(st.w, dw)))?;\n";
-    assert!(TWIN.contains(meta) && TWIN.contains(signal));
-    let moved = TWIN
-        .replacen(meta, "", 1)
-        .replacen(signal, &format!("{signal}{meta}"), 1);
+    assert!(TWIN.contains(META_QUEUED) && TWIN.contains(signal));
+    let moved = TWIN.replacen(META_QUEUED, "", 1).replacen(
+        signal,
+        &format!("{signal}{META_AFTER_SIGNAL}"),
+        1,
+    );
     let base = build(TWIN, SET).unwrap();
     let varied = build(&moved, SET).unwrap();
     assert_ne!(base.s_text, varied.s_text);
@@ -432,8 +437,8 @@ fn a_block_native_refuses_out_of_range_indices() {
             "mma: step",
         ),
         (
-            "mq6::decode_insns(g, 0)?);\n    st.work.push(Work::FetchA(1, 1",
-            "mq6::decode_insns(g, 2)?);\n    st.work.push(Work::FetchA(1, 1",
+            "queue_decode(&mut st, mq6::decode_insns(g, 0)?);\n    st.work.push(Work::StoreW(0));",
+            "queue_decode(&mut st, mq6::decode_insns(g, 2)?);\n    st.work.push(Work::StoreW(0));",
             "decode_round: round 2 out of range",
         ),
         (
@@ -582,21 +587,20 @@ fn moved_decode_split_barrier_and_fold_order_keep_the_output_bit_identical() {
         want.iter().any(|&b| b != 0xa5),
         "the baseline wrote no output"
     );
-    let meta = "    if fetch_next {\n        // Next block's token word and packed row header (header word of the next half; across a\n        // group boundary the group stride, since `goff` has not advanced).\n        mq6::fetch_meta(wg, g, h, if h == 0 { 4 } else { group })?;\n    }\n";
     let signal = "    let b1 = wg.signal((rotate(st.a, da), rotate(st.w, dw)))?;\n";
     let variations = [
         (
             "decode starts after the 12th WMMA",
-            edit("phase(wg, g, &mut st, 0, true, 8, 3)?;", "phase(wg, g, &mut st, 0, true, 12, 3)?;"),
+            edit("phase(wg, g, &mut st, 0, true, 8, 3,", "phase(wg, g, &mut st, 0, true, 12, 3,"),
         ),
         (
             "two work units per WMMA",
-            edit("phase(wg, g, &mut st, 1, false, 6, 3)?;", "phase(wg, g, &mut st, 1, false, 6, 2)?;"),
+            edit("phase(wg, g, &mut st, 1, false, 6, 3,", "phase(wg, g, &mut st, 1, false, 6, 2,"),
         ),
         (
             "B1 signalled before the meta fetch",
-            TWIN.replacen(meta, "", 1)
-                .replacen(signal, &format!("{signal}{meta}"), 1),
+            TWIN.replacen(META_QUEUED, "", 1)
+                .replacen(signal, &format!("{signal}{META_AFTER_SIGNAL}"), 1),
         ),
         (
             "row group 1 folded in reverse order",
@@ -641,8 +645,8 @@ fn decoding_before_the_seed_is_consumed_builds_but_changes_the_output() {
         interpreter::run(&e, &peacemaker_rip::symbol_of(&e).unwrap())
     };
     let early = edit(
-        "phase(wg, g, &mut st, 0, true, 8, 3)?;",
-        "phase(wg, g, &mut st, 0, true, 4, 3)?;",
+        "phase(wg, g, &mut st, 0, true, 8, 3,",
+        "phase(wg, g, &mut st, 0, true, 4, 3,",
     );
     assert!(
         run(&early) != run(TWIN),
@@ -754,7 +758,7 @@ fn moves_keep_the_output_on_the_wide_tiles() {
         let want = run(TWIN);
         assert!(want.iter().any(|&b| b != 0xa5), "{variant}: no output");
         for src in [
-            edit("phase(wg, g, &mut st, 0, true, 8, 3)?;", "phase(wg, g, &mut st, 0, true, 12, 3)?;"),
+            edit("phase(wg, g, &mut st, 0, true, 8, 3,", "phase(wg, g, &mut st, 0, true, 12, 3,"),
             edit(
                 "    for nb in 0..4usize {\n        frag(wg, g, nb, 1, cacc, scratch)?;\n    }\n",
                 "    for nb in [3usize, 2, 1, 0] {\n        frag(wg, g, nb, 1, cacc, scratch)?;\n    }\n",

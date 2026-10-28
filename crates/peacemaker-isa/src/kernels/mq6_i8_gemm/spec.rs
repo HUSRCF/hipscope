@@ -350,6 +350,11 @@ impl Spec {
     pub fn with_tune(self, tune: Tune) -> Self {
         Self { tune, ..self }
     }
+    /// Whether the kernel takes `s_delay_alu` hints and (at ring depth 2) the stacked work-queue
+    /// schedule: every epilogue but `SetNr`, whose shipped bytes are the plain schedule's.
+    pub fn stacked(self) -> bool {
+        self.epi != Epi::SetNr
+    }
     pub fn module() -> &'static str {
         "gemm_mq6g256v2_mmq_i8_pm_gfx1201"
     }
