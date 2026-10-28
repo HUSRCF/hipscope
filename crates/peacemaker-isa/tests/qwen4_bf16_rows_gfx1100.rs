@@ -295,7 +295,8 @@ fn fixed_eight_row_dag_and_no_scalar_float_hc_retagging() {
                 "{forbidden}"
             );
         }
-        assert!(lines.contains(&"s_lshl_b32 s41, s3, 3"));
+        // gfx1100 FeatureUserSGPRInit16Bug: 14 declared user SGPRs, so Y is s15.
+        assert!(lines.contains(&"s_lshl_b32 s41, s15, 3"));
         assert!(lines.contains(&"s_cmp_gt_u32 s31, 64"));
         assert!(lines.contains(&"s_sub_u32 s45, s31, s41"));
         assert!(lines.contains(&"s_min_u32 s40, s45, 8"));
