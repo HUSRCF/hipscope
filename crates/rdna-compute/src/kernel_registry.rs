@@ -12327,6 +12327,53 @@ extern "C" __global__ void NAMED(int* p) {}
         }
     }
 
+    /// The two gfx1100 kernels of the MQ6-residual PM twin and the q8 HG4 low-LDS QSA twin are
+    /// installable without a device compiler. The Flash-Next gfx1100 route has no closed plan (it
+    /// loads as a predicted fallback: the arch's whole inventory is compiled before ready and
+    /// nothing binds eagerly, so every first dispatch binds lazily with one warning, planned or
+    /// not), so what a strict / pack-only install needs is: `tensor_ops` is in the gfx1100
+    /// pack (registry entry exporting the lite symbol, present in the predicted compile set,
+    /// kill-switched twin and incumbent in one module), and the PM image is an embedded
+    /// gfx1100 image that resolves by its recorded SHA-256 and carries both entry symbols.
+    #[test]
+    fn gfx1100_pack_ships_mq6_resid_pm_and_qsa_hg4_lite() {
+        use sha2::{Digest, Sha256};
+        const LITE: &str = "indexed_attention_attention_q8_batched_hg4_lite";
+        let inventory = entries("gfx1100", "").unwrap();
+        let tensor_ops = inventory
+            .iter()
+            .find(|e| e.module == "tensor_ops")
+            .expect("tensor_ops is a gfx1100 pack module");
+        assert!(tensor_ops.symbols.contains(&LITE));
+        assert!(tensor_ops.symbols.contains(&"indexed_attention_attention_q8_batched_hg4"));
+        assert!(tensor_ops.source().contains(LITE), "pack source lacks the lite kernel");
+        let predicted = predict("gfx1100", Some(16), false, &no_plan());
+        assert!(
+            predicted.modules.iter().any(|m| m.entry.module == "tensor_ops"
+                && m.entry.symbols.contains(&LITE)),
+            "the Flash-Next gfx1100 predicted set must compile tensor_ops with the lite symbol"
+        );
+        // The PM image is embedded: nothing to compile, so it is in no HIP module list.
+        const PM_MODULE: &str = "gemm_mq6g256v2_residual_pm_gfx1100";
+        assert!(!inventory.iter().any(|e| e.module == PM_MODULE));
+        let image = kernels::GEMM_MQ6G256V2_RESIDUAL_PM_GFX1100;
+        let sha = format!("{:x}", Sha256::digest(image));
+        assert_eq!(sha, kernels::GEMM_MQ6G256V2_RESIDUAL_PM_GFX1100_SHA256.trim());
+        assert_eq!(walked_arch_image("gfx1100", &sha), Some(image));
+        for other in ["gfx1151", "gfx1201"] {
+            assert!(walked_arch_image(other, &sha).is_none(), "{other}");
+        }
+        for symbol in [
+            "gemm_mq6g256v2_residual_pm_gfx1100_w4",
+            "gemm_mq6g256v2_residual_pm_gfx1100_w8",
+        ] {
+            assert!(
+                image.windows(symbol.len()).any(|w| w == symbol.as_bytes()),
+                "{symbol} missing from the embedded image"
+            );
+        }
+    }
+
     /// A traced family on an arch its fixture has no rows for is never
     /// completed from another arch's names: the whole inventory, compile-only.
     #[test]
