@@ -1179,6 +1179,123 @@ fn mq6_resid_pm_gfx1100_waves(
     }
 }
 
+/// Launch geometry of the exact-gfx1100 MQ6 residual hipcc "pk twin" ports
+/// (`kernels/src/gemm_mq6g256v2_residual_gfx1100_port.hip`). One kernel body, two tilings; both
+/// keep the incumbent's `A,X,Y,M,K,N` kernargs and bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Mq6ResidPortGeom {
+    /// `R2Mq6-01-pk-w8n256`: tile 128 rows x 256 tokens, block 256 (8 waves), 40 KiB static LDS.
+    W8N256,
+    /// `R2Mq6-04-pk-w4n128`: tile 64 rows x 128 tokens, block 128 (4 waves), 20 KiB static LDS.
+    W4N128,
+}
+
+impl Mq6ResidPortGeom {
+    const fn symbol(self) -> &'static str {
+        match self {
+            Self::W8N256 => "gemm_mq6g256v2_residual_gfx1100_port_w8n256",
+            Self::W4N128 => "gemm_mq6g256v2_residual_gfx1100_port_w4n128",
+        }
+    }
+    /// Output rows per workgroup (16 per wave).
+    const fn tile_m(self) -> usize {
+        match self {
+            Self::W8N256 => 128,
+            Self::W4N128 => 64,
+        }
+    }
+    /// Tokens per workgroup (16 per accumulator chain).
+    const fn tile_n(self) -> usize {
+        match self {
+            Self::W8N256 => 256,
+            Self::W4N128 => 128,
+        }
+    }
+    const fn block(self) -> usize {
+        match self {
+            Self::W8N256 => 256,
+            Self::W4N128 => 128,
+        }
+    }
+    /// Launch grid `[ceil(m / tile_m), ceil(n / tile_n), 1]`.
+    const fn grid(self, m: usize, n: usize) -> [u32; 3] {
+        [
+            m.div_ceil(self.tile_m()) as u32,
+            n.div_ceil(self.tile_n()) as u32,
+            1,
+        ]
+    }
+}
+
+/// Which gfx1100 kernel runs an MQ6 residual GEMM where hipcc would run MW8.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Mq6ResidGfx1100Route {
+    /// hipcc "pk twin" port ([`Mq6ResidPortGeom`]).
+    Port(Mq6ResidPortGeom),
+    /// Embedded certified PM twin with this many waves (`gemm_mq6g256v2_residual_pm_gfx1100_w{4,8}`).
+    Pm(usize),
+}
+
+/// Geometry of the gfx1100 MQ6 residual hipcc port for an MQ6 residual with `batch_size` tokens,
+/// `m` output rows and `k` inputs, or `None`. `enabled` is `FeatureFlags::mq6_resid_port_gfx1100`
+/// (`HIPFIRE_MQ6_RESID_PORT_GFX1100`, default on; `=0` kills it). Only where hipcc selects MW8
+/// (exact gfx1100, `batch_size >= 464`): `m >= 6144` -> w8n256, `2560 <= m < 6144` -> w4n128,
+/// smaller `m` (the 48-row `ba` projection) stays hipcc MW8. The port addresses weights and
+/// activations through raw buffer descriptors with 31-bit byte offsets, so shapes whose weight
+/// (`m * k/256 * 200` B) or fp16 activation (`batch_size * k * 2` B) extent reaches 2 GiB, and
+/// `k % 256 != 0`, are refused here and keep the incumbent. Card ratios port/hipcc (bit-identical
+/// outputs, N=768): w8n256 qkv (M10240) 0.508, qg (M12288) 0.479, z (M6144) 0.507; w4n128 out
+/// (M2560 K6144) 0.607, qkv 0.524.
+fn mq6_resid_port_gfx1100_geom(
+    arch: &str,
+    bits: u8,
+    batch_size: usize,
+    m: usize,
+    k: usize,
+    enabled: bool,
+) -> Option<Mq6ResidPortGeom> {
+    const EXTENT_LIMIT: u128 = 1 << 31;
+    if !enabled || bits != 6 || k == 0 || k % 256 != 0 {
+        return None;
+    }
+    if mqv2_mw_waves(arch, bits, MqV2PrefillProjection::Residual, batch_size) != Some(8) {
+        return None;
+    }
+    let weight_bytes =
+        m as u128 * (k / 256) as u128 * crate::dispatch::MQ6G256V2_GROUP_BYTES as u128;
+    let x_bytes = batch_size as u128 * k as u128 * 2;
+    if weight_bytes >= EXTENT_LIMIT || x_bytes >= EXTENT_LIMIT {
+        return None;
+    }
+    match m {
+        6144.. => Some(Mq6ResidPortGeom::W8N256),
+        2560..=6143 => Some(Mq6ResidPortGeom::W4N128),
+        _ => None,
+    }
+}
+
+/// Route of an exact-gfx1100 MQ6 residual GEMM where hipcc would run MW8, in precedence order:
+/// hipcc port ([`mq6_resid_port_gfx1100_geom`]) -> PM twin ([`mq6_resid_pm_gfx1100_waves`]) ->
+/// `None` (the generic path, hipcc MW8). `port_enabled` / `pm_enabled` are the two kill switches
+/// (`HIPFIRE_MQ6_RESID_PORT_GFX1100`, `HIPFIRE_MQ6_RESID_PM_GFX1100`).
+fn mq6_resid_gfx1100_route(
+    arch: &str,
+    bits: u8,
+    batch_size: usize,
+    m: usize,
+    k: usize,
+    port_enabled: bool,
+    pm_enabled: bool,
+) -> Option<Mq6ResidGfx1100Route> {
+    if bits != 6 || k % 256 != 0 {
+        return None;
+    }
+    if let Some(geom) = mq6_resid_port_gfx1100_geom(arch, bits, batch_size, m, k, port_enabled) {
+        return Some(Mq6ResidGfx1100Route::Port(geom));
+    }
+    mq6_resid_pm_gfx1100_waves(arch, bits, batch_size, m, pm_enabled).map(Mq6ResidGfx1100Route::Pm)
+}
+
 /// Developer A/B of the gfx1100 builder bundle with one binary (for example
 /// the previous certified bundle as a same-binary opt-out):
 /// `HIPFIRE_GFX1100_PM_BUNDLE=<path>` loads it from a file instead of the
@@ -42208,17 +42325,24 @@ impl Gpu {
         if self.replay.is_recording() || self.graphs.capture_mode {
             return Ok(false);
         }
-        if bits == 6 && k % 256 == 0 {
-            if let Some(waves) = mq6_resid_pm_gfx1100_waves(
-                self.arch.as_str(),
-                bits,
-                batch_size,
-                m,
-                *MQ6_RESID_PM_GFX1100,
-            ) {
-                self.gemm_mq6_residual_pm_gfx1100(waves, a_raw, x, y, m, k, batch_size)?;
-                return Ok(true);
+        if let Some(route) = mq6_resid_gfx1100_route(
+            self.arch.as_str(),
+            bits,
+            batch_size,
+            m,
+            k,
+            self.flags.mq6_resid_port_gfx1100_enabled(),
+            *MQ6_RESID_PM_GFX1100,
+        ) {
+            match route {
+                Mq6ResidGfx1100Route::Port(geom) => {
+                    self.gemm_mq6_residual_port_gfx1100(geom, a_raw, x, y, m, k, batch_size)?;
+                }
+                Mq6ResidGfx1100Route::Pm(waves) => {
+                    self.gemm_mq6_residual_pm_gfx1100(waves, a_raw, x, y, m, k, batch_size)?;
+                }
             }
+            return Ok(true);
         }
         if let Some(waves) = mqv2_mw_waves(
             self.arch.as_str(),
@@ -43156,6 +43280,87 @@ impl Gpu {
                 1,
             ],
             [(32 * waves) as u32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr);
+                b.push_ptr(x_ptr);
+                b.push_ptr(y_ptr);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b.push_i32(n_val);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
+    /// gfx1100 MQ6 residual hipcc "pk twin" ports (`gemm_mq6g256v2_residual_gfx1100_port_w8n256`
+    /// / `_w4n128`, JIT module `gemm_mq6g256v2_residual_gfx1100_port`): the card-proven
+    /// `R2Mq6-01-pk-w8n256` / `R2Mq6-04-pk-w4n128` candidates. Same `A X Y M K N` kernargs, WMMA
+    /// chain and `Y += acc` epilogue as the hipcc `gemm_mq6g256v2_residual_wmma_gfx11_mw8_lds`,
+    /// so bytes are identical. Block / grid / static LDS per [`Mq6ResidPortGeom`]
+    /// (grid `[ceil(M / tile_m), ceil(N / tile_n), 1]`, dynamic LDS 0). Selected by
+    /// [`mq6_resid_gfx1100_route`].
+    fn gemm_mq6_residual_port_gfx1100(
+        &mut self,
+        geom: Mq6ResidPortGeom,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        let func_name = geom.symbol();
+        if m == 0 || batch_size == 0 || k == 0 {
+            return Ok(());
+        }
+        if k % 256 != 0 {
+            return Err(hip_bridge::HipError::new(
+                1,
+                "gemm_mq6_residual_port_gfx1100: K must be a multiple of 256",
+            ));
+        }
+        if self.arch.as_str() != "gfx1100" {
+            return Err(hip_bridge::HipError::new(
+                1,
+                "gemm_mq6_residual_port_gfx1100: exact gfx1100 required",
+            ));
+        }
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemm_mq6g256v2_residual_gfx1100_port",
+            kernels::GEMM_MQ6G256V2_RESIDUAL_GFX1100_PORT_SRC,
+            func_name,
+        )?;
+        let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
+        let mut a_ptr = a_raw.buf.as_ptr();
+        let mut x_ptr = x_f16_ptr;
+        let mut y_ptr = y.buf.as_ptr();
+        let mut m_val = m as i32;
+        let mut k_val = k as i32;
+        let mut n_val = batch_size as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_ptr as *mut _ as *mut c_void,
+            &mut x_ptr as *mut _ as *mut c_void,
+            &mut y_ptr as *mut _ as *mut c_void,
+            &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut n_val as *mut _ as *mut c_void,
+        ];
+        let bytes = m * (k / 256) * crate::dispatch::MQ6G256V2_GROUP_BYTES
+            + batch_size * k * 2
+            + batch_size * m * 4 * 2;
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", func_name, bytes);
+        let result = self.launch_maybe_blob(
+            func_name,
+            geom.grid(m, batch_size),
+            [geom.block() as u32, 1, 1],
             0,
             &mut params,
             || {
@@ -57747,6 +57952,182 @@ mod mq6_resid_pm_gfx1100_selection {
             "gfx1151", "gfx1150", "gfx1152", "gfx1201", "gfx942", "gfx1101",
         ] {
             assert_eq!(pick(arch, 6, 768, 10240, true), None, "{arch}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod mq6_resid_port_gfx1100_selection {
+    use super::Mq6ResidGfx1100Route::{Pm, Port};
+    use super::Mq6ResidPortGeom::{W4N128, W8N256};
+    use super::{
+        mq6_resid_gfx1100_route as route, mq6_resid_port_gfx1100_geom as geom, Mq6ResidGfx1100Route,
+    };
+
+    /// Qwen4 Flash-Next prefill: QKV M10240 / QG M12288 / Z M6144 at K2560, out M2560 K6144, ba M48.
+    const N: usize = 768;
+
+    #[test]
+    fn m_boundaries_on_gfx1100() {
+        for (m, k, want) in [
+            (48, 2560, None),
+            (640, 2560, None),
+            (2559, 2560, None),
+            (2560, 6144, Some(W4N128)),
+            (2561, 2560, Some(W4N128)),
+            (6143, 2560, Some(W4N128)),
+            (6144, 2560, Some(W8N256)),
+            (10240, 2560, Some(W8N256)),
+            (12288, 2560, Some(W8N256)),
+        ] {
+            assert_eq!(geom("gfx1100", 6, N, m, k, true), want, "m={m}");
+        }
+    }
+
+    #[test]
+    fn n_boundaries_follow_hipcc_mw8_choice() {
+        // hipcc picks MW8 from N >= 464, MW4 for 416..=463 and no MW below 416.
+        for n in [1, 64, 415, 416, 417, 463] {
+            for m in [2560, 6143, 6144, 12288] {
+                assert_eq!(geom("gfx1100", 6, n, m, 2560, true), None, "n={n} m={m}");
+                assert_eq!(
+                    route("gfx1100", 6, n, m, 2560, true, true),
+                    None,
+                    "n={n} m={m}"
+                );
+            }
+        }
+        for n in [464, 465, 768, 1536, 16896] {
+            assert_eq!(
+                geom("gfx1100", 6, n, 10240, 2560, true),
+                Some(W8N256),
+                "n={n}"
+            );
+            assert_eq!(
+                geom("gfx1100", 6, n, 2560, 6144, true),
+                Some(W4N128),
+                "n={n}"
+            );
+            assert_eq!(geom("gfx1100", 6, n, 48, 2560, true), None, "n={n}");
+        }
+    }
+
+    /// Every (port, PM) switch combination at every M class: port -> PM twin -> hipcc MW8.
+    #[test]
+    fn precedence_for_every_flag_combination() {
+        type R = Option<Mq6ResidGfx1100Route>;
+        for (m, k, port_on, pm_on, want) in [
+            // M >= 6144 (w8n256 / PM w8)
+            (10240usize, 2560usize, true, true, Some(Port(W8N256))),
+            (10240, 2560, true, false, Some(Port(W8N256))),
+            (10240, 2560, false, true, Some(Pm(8))),
+            (10240, 2560, false, false, None),
+            (6144, 2560, true, true, Some(Port(W8N256))),
+            (6144, 2560, false, true, Some(Pm(8))),
+            (6144, 2560, false, false, None),
+            (12288, 2560, true, false, Some(Port(W8N256))),
+            (12288, 2560, false, true, Some(Pm(8))),
+            // 2560 <= M < 6144 (w4n128 / PM w4)
+            (6143, 2560, true, true, Some(Port(W4N128))),
+            (6143, 2560, true, false, Some(Port(W4N128))),
+            (6143, 2560, false, true, Some(Pm(4))),
+            (6143, 2560, false, false, None),
+            (2560, 6144, true, true, Some(Port(W4N128))),
+            (2560, 6144, true, false, Some(Port(W4N128))),
+            (2560, 6144, false, true, Some(Pm(4))),
+            (2560, 6144, false, false, None),
+            // M < 2560 (ba): hipcc MW8 under every combination
+            (2559, 2560, true, true, None),
+            (2559, 2560, false, true, None),
+            (640, 2560, true, true, None),
+            (48, 2560, true, true, None),
+            (48, 2560, true, false, None),
+            (48, 2560, false, true, None),
+            (48, 2560, false, false, None),
+        ] {
+            let got: R = route("gfx1100", 6, N, m, k, port_on, pm_on);
+            assert_eq!(got, want, "m={m} port={port_on} pm={pm_on}");
+        }
+    }
+
+    #[test]
+    fn other_bits_arches_and_k_are_unchanged() {
+        for bits in [2u8, 3, 4, 5, 8] {
+            assert_eq!(
+                geom("gfx1100", bits, N, 10240, 2560, true),
+                None,
+                "bits={bits}"
+            );
+            assert_eq!(
+                route("gfx1100", bits, N, 10240, 2560, true, true),
+                None,
+                "bits={bits}"
+            );
+        }
+        for arch in [
+            "gfx1151", "gfx1150", "gfx1152", "gfx1201", "gfx942", "gfx1101", "gfx906", "",
+        ] {
+            assert_eq!(geom(arch, 6, N, 10240, 2560, true), None, "{arch}");
+            assert_eq!(route(arch, 6, N, 10240, 2560, true, true), None, "{arch}");
+        }
+        for k in [1, 255, 257, 2559, 2561] {
+            assert_eq!(geom("gfx1100", 6, N, 10240, k, true), None, "k={k}");
+            assert_eq!(route("gfx1100", 6, N, 10240, k, true, true), None, "k={k}");
+        }
+        // k == 0 is never the port (the launchers return before launching, as before).
+        assert_eq!(geom("gfx1100", 6, N, 10240, 0, true), None);
+        assert_eq!(geom("gfx1100", 6, N, 0, 2560, true), None);
+        assert_eq!(geom("gfx1100", 6, 0, 10240, 2560, true), None);
+    }
+
+    /// The raw buffer descriptors carry 31-bit byte offsets; shapes that do not fit keep the
+    /// incumbent (and, with the PM twin on, the PM twin, which has its own admission).
+    #[test]
+    fn extents_that_exceed_31_bits_keep_the_incumbent() {
+        // fp16 X: n * k * 2 < 2^31.
+        let n_ok = ((1usize << 31) - 1) / (2 * 2560);
+        assert_eq!(geom("gfx1100", 6, n_ok, 10240, 2560, true), Some(W8N256));
+        assert_eq!(geom("gfx1100", 6, n_ok + 1, 10240, 2560, true), None);
+        assert_eq!(
+            route("gfx1100", 6, n_ok + 1, 10240, 2560, true, true),
+            Some(Pm(8))
+        );
+        // MQ6 weights: m * (k / 256) * 200 < 2^31.
+        let m_ok = ((1usize << 31) - 1) / (10 * 200);
+        assert_eq!(geom("gfx1100", 6, N, m_ok, 2560, true), Some(W8N256));
+        assert_eq!(geom("gfx1100", 6, N, m_ok + 1, 2560, true), None);
+        assert_eq!(geom("gfx1100", 6, N, usize::MAX / 4, 2560, true), None);
+    }
+
+    #[test]
+    fn launch_geometry_matches_the_carded_candidates() {
+        assert_eq!(
+            W8N256.symbol(),
+            "gemm_mq6g256v2_residual_gfx1100_port_w8n256"
+        );
+        assert_eq!(
+            W4N128.symbol(),
+            "gemm_mq6g256v2_residual_gfx1100_port_w4n128"
+        );
+        assert_eq!(
+            (W8N256.tile_m(), W8N256.tile_n(), W8N256.block()),
+            (128, 256, 256)
+        );
+        assert_eq!(
+            (W4N128.tile_m(), W4N128.tile_n(), W4N128.block()),
+            (64, 128, 128)
+        );
+        // Card grids: qkv 80x3 / 160x6, out (M2560) 20x3 / 40x6; ragged N rounds up.
+        assert_eq!(W8N256.grid(10240, 768), [80, 3, 1]);
+        assert_eq!(W8N256.grid(12288, 768), [96, 3, 1]);
+        assert_eq!(W8N256.grid(6144, 768), [48, 3, 1]);
+        assert_eq!(W4N128.grid(10240, 768), [160, 6, 1]);
+        assert_eq!(W4N128.grid(2560, 768), [40, 6, 1]);
+        assert_eq!(W8N256.grid(6145, 769), [49, 4, 1]);
+        assert_eq!(W4N128.grid(2561, 769), [41, 7, 1]);
+        // Block = 32 lanes per wave, one wave per 16 rows.
+        for g in [W8N256, W4N128] {
+            assert_eq!(g.block(), 32 * (g.tile_m() / 16));
         }
     }
 }

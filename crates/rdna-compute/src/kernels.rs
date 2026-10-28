@@ -5378,6 +5378,13 @@ pub const GEMM_MQ6G256V2_RESIDUAL_PM_GFX1100: &[u8] =
 /// Bare lowercase SHA-256 of [`GEMM_MQ6G256V2_RESIDUAL_PM_GFX1100`], without a newline.
 pub const GEMM_MQ6G256V2_RESIDUAL_PM_GFX1100_SHA256: &str =
     include_str!("../../../kernels/gemm_mq6g256v2_residual_pm_gfx1100.hxaco.sha256");
+/// Exact-gfx1100 MQ6 residual hipcc "pk twin" ports `gemm_mq6g256v2_residual_gfx1100_port_w8n256`
+/// (tile 128x256, block 256) and `..._w4n128` (tile 64x128, block 128): the card-proven
+/// `R2Mq6-01-pk-w8n256` / `R2Mq6-04-pk-w4n128` candidates, same `A,X,Y,M,K,N` kernargs and bytes
+/// as `gemm_mq6g256v2_residual_wmma_gfx11_mw8_lds`. Selected by `mq6_resid_gfx1100_route`
+/// (`HIPFIRE_MQ6_RESID_PORT_GFX1100=0` restores the PM twin / hipcc MW8).
+pub const GEMM_MQ6G256V2_RESIDUAL_GFX1100_PORT_SRC: &str =
+    include_str!("../../../kernels/src/gemm_mq6g256v2_residual_gfx1100_port.hip");
 /// gfx11 GEMM v2 "V2B" symmetric IU4 prefill tile (M256xN256, 16 waves, two
 /// 32 KiB K128 LDS slots, 1 CTA/WGP), dispatched on gfx1151. Same production
 /// operand layouts, staging permutation, fold numerics and 6-argument

@@ -817,6 +817,12 @@ pub struct FeatureFlags {
     pub qwen4_qsa_extent_sync: bool,
     /// Developer CPU-visible loaded-code snapshot; exactly `1`, default off.
     pub qwen4_qsa_code_check: bool,
+    /// `HIPFIRE_MQ6_RESID_PORT_GFX1100`: the exact-gfx1100 MQ6 residual prefill
+    /// GEMM runs the card-proven hipcc "pk twin" ports
+    /// (`gemm_mq6g256v2_residual_gfx1100_port_{w8n256,w4n128}`) wherever hipcc
+    /// picks MW8. Parsed on unless the value is exactly `0` (kill switch);
+    /// acted on for exact gfx1100 only (`mq6_resid_port_gfx1100_enabled`).
+    pub mq6_resid_port_gfx1100: bool,
     /// `HIPFIRE_QWEN4_QSA_HG4_Q8_LITE`: the q8 grouped prefill attention
     /// (`indexed_attention_attention_q8_batched_hg4`) runs its bit-identical
     /// low-LDS twin `..._hg4_lite`. Parsed on unless the value is exactly `0`
@@ -1442,6 +1448,10 @@ impl FeatureFlags {
             qwen4_qsa_extent_sync: qsa_extent_mode.as_deref() == Some("2"),
             qwen4_qsa_code_check: value("HIPFIRE_QWEN4_QSA_CODE_CHECK").ok().as_deref()
                 == Some("1"),
+            mq6_resid_port_gfx1100: value("HIPFIRE_MQ6_RESID_PORT_GFX1100")
+                .ok()
+                .as_deref()
+                != Some("0"),
             qwen4_qsa_hg4_q8_lite: value("HIPFIRE_QWEN4_QSA_HG4_Q8_LITE").ok().as_deref()
                 != Some("0"),
         }
@@ -1573,6 +1583,15 @@ impl FeatureFlags {
     /// [`Self::qwen4_qsa_decode_splitkv_q8_enabled`].
     pub fn qwen4_qsa_decode_splitk_enabled(&self) -> bool {
         self.qwen4_qsa_decode_splitk && self.arch == "gfx1151"
+    }
+
+    /// MQ6 residual hipcc "pk twin" ports
+    /// (`gemm_mq6g256v2_residual_gfx1100_port_{w8n256,w4n128}`): default on,
+    /// exact gfx1100 only (the only architecture they were carded on);
+    /// `HIPFIRE_MQ6_RESID_PORT_GFX1100=0` restores the PM twin
+    /// (`HIPFIRE_MQ6_RESID_PM_GFX1100`) or hipcc MW8. Bit-identical output.
+    pub fn mq6_resid_port_gfx1100_enabled(&self) -> bool {
+        self.mq6_resid_port_gfx1100 && self.arch == "gfx1100"
     }
 
     /// q8 grouped prefill attention low-LDS twin
@@ -2028,6 +2047,7 @@ impl FeatureFlags {
             qwen4_qsa_extent_check: false,
             qwen4_qsa_extent_sync: false,
             qwen4_qsa_code_check: false,
+            mq6_resid_port_gfx1100: false,
             qwen4_qsa_hg4_q8_lite: false,
         }
     }
@@ -2425,6 +2445,44 @@ mod tests {
         assert!(!FeatureFlags::for_test("gfx1151").qwen4_qsa_decode_splitk_enabled());
         assert!(!FeatureFlags::for_test("gfx1151").qwen4_qsa_decode_splitkv_q8_enabled());
         assert!(!FeatureFlags::for_test("gfx1100").qwen4_qsa_decode_splitkv_q8_enabled());
+    }
+
+    /// The MQ6 residual ports are default on for exact gfx1100 only; exactly `0`
+    /// is the kill switch and every other value keeps them on.
+    #[test]
+    fn mq6_resid_port_gfx1100_defaults_on_exact_gfx1100_and_zero_opts_out() {
+        for arch in [
+            "gfx906", "gfx1100", "gfx1101", "gfx1150", "gfx1151", "gfx1201",
+        ] {
+            let flags = |raw: Option<&str>| {
+                FeatureFlags::from_lookup(arch, |name| match raw {
+                    Some(v) if name == "HIPFIRE_MQ6_RESID_PORT_GFX1100" => Ok(v.into()),
+                    _ => Err(()),
+                })
+            };
+            let exact = arch == "gfx1100";
+            assert!(flags(None).mq6_resid_port_gfx1100, "{arch}: unset");
+            assert_eq!(
+                flags(None).mq6_resid_port_gfx1100_enabled(),
+                exact,
+                "{arch}"
+            );
+            assert!(!flags(Some("0")).mq6_resid_port_gfx1100, "{arch}: 0");
+            assert!(
+                !flags(Some("0")).mq6_resid_port_gfx1100_enabled(),
+                "{arch}: 0"
+            );
+            for raw in ["1", "", "true", "on", "2", " 0", "0 ", "00"] {
+                assert!(flags(Some(raw)).mq6_resid_port_gfx1100, "{arch}: {raw:?}");
+                assert_eq!(
+                    flags(Some(raw)).mq6_resid_port_gfx1100_enabled(),
+                    exact,
+                    "{arch}: {raw:?}"
+                );
+            }
+        }
+        // for_test zeroes every default-on flag.
+        assert!(!FeatureFlags::for_test("gfx1100").mq6_resid_port_gfx1100_enabled());
     }
 
     /// The q8 hg4 lite twin is default on for exact gfx1100 only; exactly `0`

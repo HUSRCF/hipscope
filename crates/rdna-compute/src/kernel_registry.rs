@@ -1968,6 +1968,14 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
             ["gemm_mq4g256v2_residual_wmma_gfx1100_ldsstage"]
         );
         add!(
+            "gemm_mq6g256v2_residual_gfx1100_port",
+            kernels::GEMM_MQ6G256V2_RESIDUAL_GFX1100_PORT_SRC,
+            [
+                "gemm_mq6g256v2_residual_gfx1100_port_w4n128",
+                "gemm_mq6g256v2_residual_gfx1100_port_w8n256"
+            ]
+        );
+        add!(
             "gemm_mqv2_wmma_gfx1100_mw_lds",
             kernels::GEMM_MQV2_WMMA_GFX11_MW_LDS_SRC,
             [
@@ -12702,6 +12710,57 @@ extern "C" __global__ void NAMED(int* p) {}
                 image.windows(symbol.len()).any(|w| w == symbol.as_bytes()),
                 "{symbol} missing from the embedded image"
             );
+        }
+    }
+
+    /// The two hipcc MQ6-residual "pk twin" ports are a registry module of the exact-gfx1100 pack
+    /// only: one module exporting both launch symbols, source carrying both kernels, in the
+    /// predicted compile set of the gfx1100 Flash-Next route, and on no other arch (other arches'
+    /// inventories and bytes are unchanged). Their incumbent (`mw4_lds` / `mw8_lds`) stays in its
+    /// own module as the kill-switch fallback.
+    #[test]
+    fn gfx1100_pack_ships_mq6_resid_port() {
+        const MODULE: &str = "gemm_mq6g256v2_residual_gfx1100_port";
+        const SYMBOLS: [&str; 2] = [
+            "gemm_mq6g256v2_residual_gfx1100_port_w4n128",
+            "gemm_mq6g256v2_residual_gfx1100_port_w8n256",
+        ];
+        let inventory = entries("gfx1100", "").unwrap();
+        let port = inventory
+            .iter()
+            .find(|e| e.module == MODULE)
+            .expect("the port module is a gfx1100 pack module");
+        assert_eq!(port.symbols, SYMBOLS.as_slice());
+        for symbol in SYMBOLS {
+            assert!(
+                port.source().contains(&format!("{symbol}(")),
+                "pack source lacks {symbol}"
+            );
+        }
+        let mw = inventory
+            .iter()
+            .find(|e| e.module == "gemm_mqv2_wmma_gfx1100_mw_lds")
+            .expect("the hipcc MW module stays in the gfx1100 pack (kill-switch fallback)");
+        assert!(mw
+            .symbols
+            .contains(&"gemm_mq6g256v2_residual_wmma_gfx11_mw8_lds"));
+        let predicted = predict("gfx1100", Some(16), false, &no_plan());
+        assert!(
+            predicted
+                .modules
+                .iter()
+                .any(|m| m.entry.module == MODULE && m.entry.symbols == SYMBOLS.as_slice()),
+            "the Flash-Next gfx1100 predicted set must compile the port module with both symbols"
+        );
+        for other in ["gfx1151", "gfx1201", "gfx1101", "gfx942"] {
+            if let Ok(other_entries) = entries(other, "") {
+                assert!(
+                    !other_entries.iter().any(
+                        |e| e.module == MODULE || e.symbols.iter().any(|s| SYMBOLS.contains(s))
+                    ),
+                    "{other} must not carry the gfx1100 port"
+                );
+            }
         }
     }
 
