@@ -156,6 +156,14 @@ pub trait Workload {
     /// shape if every instruction is qualified; otherwise
     /// `Value::String("refused (<reason>)")`. Never fabricate a result.
     fn emu(&self) -> Value;
+
+    /// `--emu`, pre-card gate: run `cand` and the incumbent `base` object on the peacemaker emulator
+    /// (complete grid, every buffer its own exact-size region with unmapped guard gaps, definedness-tracked
+    /// LDS) and return the `emu_gate` record `{status: "pass"|"fail", reason, shape, instructions,
+    /// workgroups, cand_out_sha256, base_out_sha256, ..}`. `None`: this workload has no emulator gate.
+    fn emu_gate(&self, _cand: &Object, _base: &Object) -> Option<Value> {
+        None
+    }
 }
 
 /// Construction context the driver hands a [`ChainWorkload`].

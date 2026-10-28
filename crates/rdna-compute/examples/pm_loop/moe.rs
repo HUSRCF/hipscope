@@ -207,6 +207,7 @@ use rayon::prelude::*;
 use rdna_compute::Gpu;
 use serde_json::{json, Value};
 use std::sync::OnceLock;
+use sha2::{Digest, Sha256};
 
 /// Contract-crate twin of `arch`; every arch of this adapter has a `qwen4_moe_sym` contract.
 fn abi_arch(arch: Arch) -> Result<AbiArch> {
@@ -514,13 +515,13 @@ fn pick_evenly(live: &[usize], n: usize) -> Vec<usize> {
 /// `(sc, zp)` header with `zp == -8*sc` exactly: independently varied normal
 /// scales of both signs (2^-12 .. 2^-4), plus zero groups of both zero signs.
 /// `examples/qwen4_moe_sym.rs:198-211`.
-fn sym_header(r: &mut Rng) -> (u16, u16) {
+fn sym_header(r: &mut Rng, span: u64) -> (u16, u16) {
     match r.below(64) {
         0 => (0x0000, 0x8000),
         1 => (0x8000, 0x0000),
         _ => {
             let sign = (r.below(2) as u16) << 15;
-            let exp = 3 + r.below(9) as u16;
+            let exp = 3 + r.below(span) as u16;
             let man = r.below(1024) as u16;
             let sc = sign | (exp << 10) | man;
             let zp = (sign ^ 0x8000) | ((exp + 3) << 10) | man;
@@ -532,12 +533,12 @@ fn sym_header(r: &mut Rng) -> (u16, u16) {
 /// One expert's rows: QT44 (136 B groups, `K % 256`) or QT53 (68 B groups,
 /// `K % 128`), every header symmetric, every nibble code uniform.
 /// `examples/qwen4_moe_sym.rs:223-244`.
-fn symmetric_weights_into(w: &mut [u8], group_bytes: usize, seed: u64) {
+fn symmetric_weights_into(w: &mut [u8], group_bytes: usize, seed: u64, span: u64) {
     let mut r = Rng(seed ^ 0x5eed_0000_0000_0001);
     let hdrs = group_bytes / 68;
     for g in w.chunks_exact_mut(group_bytes) {
         for h in 0..hdrs {
-            let (sc, zp) = sym_header(&mut r);
+            let (sc, zp) = sym_header(&mut r, span);
             g[4 * h..4 * h + 2].copy_from_slice(&sc.to_le_bytes());
             g[4 * h + 2..4 * h + 4].copy_from_slice(&zp.to_le_bytes());
         }
@@ -726,6 +727,9 @@ struct Problem {
     sorted: Vec<i32>,
     tiles: Vec<i32>,
     xq: OnceLock<Vec<u8>>,
+    /// Emulator gate only: narrow the synthetic weight scales (header exponent span 4 instead of 9) so no
+    /// accumulator reaches the SwiGLU divisions the emulator has not measured. Never set on a device run.
+    tame: bool,
 }
 
 impl Problem {
@@ -798,6 +802,7 @@ impl Problem {
             sorted,
             tiles,
             xq: OnceLock::new(),
+            tame: false,
         };
         let need = p.device_bytes();
         if need > DEVICE_CAP {
@@ -849,7 +854,7 @@ impl Problem {
         let seed = self.geo.seed
             ^ (idx as u64).wrapping_mul(GOLDEN)
             ^ (self.group_bytes as u64).wrapping_mul(0x1_0000_0001);
-        symmetric_weights_into(out, self.group_bytes, seed);
+        symmetric_weights_into(out, self.group_bytes, seed, if self.tame { 4 } else { 9 });
     }
 
     /// Epoch-major `[epochs][x_src_rows]` `block_i4_128` records: `d` a normal
@@ -1776,6 +1781,23 @@ pub fn new_with_cand_object(
     }))
 }
 
+/// Unmapped bytes between the exact-size buffers of an emulator-gate run (the gate demands >= 64 KiB).
+const EMU_GUARD: u64 = 0x2_0000;
+/// Tiny shapes of the emulator gate: an aligned and a ragged token count (grouped rows pad to 16 per expert).
+const EMU_GATE_SHAPES: [(&str, &str); 2] = [
+    ("tiny", "E=2,TOP=2,T=20,H=512,I=128"),
+    ("ragged", "E=2,TOP=2,T=37,H=512,I=128"),
+];
+
+/// One emulated arm of the gate: output bytes and counters.
+struct EmuArm {
+    y: Vec<u8>,
+    y_bytes_written: u64,
+    instructions: u64,
+    workgroups: u64,
+    lds_static: Option<u64>,
+}
+
 impl Moe {
     fn dev(&self) -> Result<&Dev> {
         self.dev
@@ -2146,6 +2168,213 @@ impl Moe {
             "tolerance": report.tolerance,
         }))
     }
+
+    /// One arm of [`Moe::emu_gate_run`]: lift `object`, run its complete grid on the emulator at `p` with
+    /// definedness-tracked LDS and every buffer an exact-size region of its own, `EMU_GUARD` unmapped bytes apart
+    /// (no slack: any access past a buffer is an unmapped-memory error). `Err` is the verbatim refusal.
+    fn emu_gate_arm(p: &Problem, entry: Entry, object: &Object) -> Result<EmuArm> {
+        use peacemaker_ir::emu::{Emulator, Launch as EmuLaunch, Memory};
+        let program = peacemaker_lift::lift_object(
+            &object.bytes,
+            peacemaker_lift::Options {
+                frontend: peacemaker_ir::inst::Frontend::Builder,
+            },
+        )
+        .map_err(|e| format!("lift: {e}"))?
+        .program;
+        let lds_static = program
+            .kernels
+            .iter()
+            .find(|k| k.symbol.0 == object.launch_symbol)
+            .and_then(|k| match &k.abi {
+                peacemaker_ir::inst::Abi::Hsa { descriptor, .. } => {
+                    Some(u64::from(descriptor.group_segment_fixed_size))
+                }
+                _ => None,
+            });
+        let emu = Emulator::new(&program, &object.launch_symbol)?
+            .strict_lds()
+            .gfx1100_as_gfx1151();
+        let geo = &p.geo;
+        let mut mem = Memory::default();
+        let mut table = Vec::with_capacity(geo.experts * 8);
+        for e in 0..geo.experts {
+            let mut w = vec![0u8; p.stride];
+            p.fill_weights(e % geo.distinct, &mut w);
+            let base = mem.map_guarded(format!("expert{e}"), w, EMU_GUARD)?;
+            table.extend_from_slice(&base.to_le_bytes());
+        }
+        let table_len = table.len() as u64;
+        let table_base = mem.map_guarded("table".into(), table, EMU_GUARD)?;
+        let tiles = Problem::i32_bytes(&p.tiles);
+        let tiles_len = tiles.len() as u64;
+        let tiles_base = mem.map_guarded("tiles".into(), tiles, EMU_GUARD)?;
+        let sorted = Problem::i32_bytes(&p.sorted);
+        let sorted_len = sorted.len() as u64;
+        let sorted_base = mem.map_guarded("sorted".into(), sorted, EMU_GUARD)?;
+        let xq = if entry.gp {
+            p.make_xq_gp()
+        } else {
+            p.xq().to_vec()
+        };
+        let xq_len = xq.len() as u64;
+        let xq_base = mem.map_guarded("xq".into(), xq, EMU_GUARD)?;
+        let y_len = p.y_bytes();
+        let y_base = mem.map_guarded("y".into(), vec![0u8; y_len], EMU_GUARD)?;
+        let launch = p.launch_for(
+            entry,
+            [
+                (table_base, table_len),
+                (tiles_base, tiles_len),
+                (sorted_base, sorted_len),
+                (xq_base, xq_len),
+                (y_base, y_len as u64),
+            ],
+        )?;
+        let kernarg = mem.map_guarded("kernarg".into(), launch.kernarg.clone(), EMU_GUARD)?;
+        let mut instructions = 0u64;
+        for gy in 0..launch.grid[1] {
+            for gx in 0..launch.grid[0] {
+                instructions += emu
+                    .run_workgroup_counted(
+                        &EmuLaunch {
+                            kernarg_ptr: kernarg,
+                            workgroup: [gx, gy, 0],
+                            block: launch.block,
+                            dynamic_lds: launch.lds,
+                        },
+                        &mut mem,
+                    )
+                    .map_err(|e| format!("workgroup ({gx},{gy}): {e}"))?;
+            }
+        }
+        let region = mem
+            .regions
+            .iter()
+            .find(|r| r.name == "y")
+            .ok_or("emulator memory lost the y region")?;
+        Ok(EmuArm {
+            y: region.bytes.clone(),
+            y_bytes_written: region.written.count() as u64,
+            instructions,
+            workgroups: u64::from(launch.grid[0]) * u64::from(launch.grid[1]),
+            lds_static,
+        })
+    }
+
+    /// The pre-card emulator gate (`--emu`): `cand` and `base` (the incumbent) each run their complete grid on the
+    /// emulator at the tiny shapes of [`EMU_GATE_SHAPES`]. It FAILS on: an access outside a mapped buffer, an LDS
+    /// access out of bounds or a read of LDS bytes this workgroup never wrote, a barrier deadlock, the instruction
+    /// limit, any instruction the emulator or lifter cannot execute (named), an output that is not bit-identical to
+    /// the emulated incumbent, and an output that fails the CPU reference. The record is `emu_gate`.
+    fn emu_gate_run(&self, cand: &Object, base: &Object) -> Value {
+        let arch = self.problem.geo.arch;
+        let (cand_entry, base_entry) = (self.cand, self.base.entry());
+        let mut cases = Vec::new();
+        let mut failures: Vec<String> = Vec::new();
+        let (mut instructions, mut workgroups) = (0u64, 0u64);
+        let (mut cand_hash, mut base_hash) = (Sha256::new(), Sha256::new());
+        let short = |e: &str| e.split(" | ").next().unwrap_or(e).to_owned();
+        for (name, shape) in EMU_GATE_SHAPES {
+            let built = Geo::parse(&format!("{shape},seed=7"), arch)
+                .and_then(|geo| Problem::new(&geo, cand_entry.spec.kind))
+                .map(|mut p| {
+                    p.tame = true;
+                    p
+                });
+            let p = match built {
+                Ok(p) => p,
+                Err(e) => {
+                    failures.push(format!("{name}: shape {shape}: {e}"));
+                    cases.push(json!({"name": name, "status": "fail", "reason": e}));
+                    continue;
+                }
+            };
+            let mut case = json!({"name": name, "shape": p.shape_json()});
+            let c = Self::emu_gate_arm(&p, cand_entry, cand);
+            let b = Self::emu_gate_arm(&p, base_entry, base);
+            let mut reasons: Vec<String> = Vec::new();
+            match (&c, &b) {
+                (Ok(c), Ok(b)) => {
+                    let identical = c.y == b.y;
+                    if !identical {
+                        let first = c.y.iter().zip(&b.y).position(|(x, y)| x != y);
+                        reasons.push(format!(
+                            "output not bit-identical to the emulated incumbent ({} of {} bytes differ, first at byte {})",
+                            c.y.iter().zip(&b.y).filter(|(x, y)| x != y).count(),
+                            c.y.len(),
+                            first.map_or("n/a".to_owned(), |i| i.to_string())
+                        ));
+                    }
+                    let reference = p.reference(Sample::Full);
+                    let report = |y: &[u8]| match p.compare(y, &reference, Sample::Full) {
+                        Ok(r) => (
+                            r.pass,
+                            json!({"reference": r.reference, "pass": r.pass,
+                                   "max_abs_err": r.max_abs_err, "tolerance": r.tolerance}),
+                        ),
+                        Err(e) => (false, json!({"pass": false, "error": e})),
+                    };
+                    let (cand_ok, cand_ref) = report(&c.y);
+                    let (base_ok, base_ref) = report(&b.y);
+                    if !cand_ok {
+                        reasons.push(format!("candidate output fails the CPU reference: {cand_ref}"));
+                    }
+                    if !base_ok {
+                        reasons.push(format!("emulated incumbent fails the CPU reference: {base_ref}"));
+                    }
+                    cand_hash.update(&c.y);
+                    base_hash.update(&b.y);
+                    instructions += c.instructions;
+                    workgroups += c.workgroups;
+                    case["workgroups"] = json!(c.workgroups);
+                    case["identical_to_incumbent"] = json!(identical);
+                    case["reference"] = json!({"candidate": cand_ref, "incumbent": base_ref});
+                }
+                _ => {}
+            }
+            for (who, r) in [("candidate", &c), ("incumbent", &b)] {
+                match r {
+                    Ok(a) => {
+                        case[who] = json!({
+                            "instructions": a.instructions,
+                            "workgroups": a.workgroups,
+                            "out_sha256": sha256_hex(&a.y),
+                            "out_bytes": a.y.len(),
+                            "out_bytes_written": a.y_bytes_written,
+                            "lds_static_bytes": a.lds_static,
+                        })
+                    }
+                    Err(e) => reasons.push(format!("{who}: {}", short(e))),
+                }
+            }
+            if reasons.is_empty() {
+                case["status"] = json!("pass");
+            } else {
+                case["status"] = json!("fail");
+                case["reason"] = json!(reasons.join("; "));
+                failures.push(format!("{name}: {}", reasons.join("; ")));
+            }
+            cases.push(case);
+        }
+        let status = if failures.is_empty() { "pass" } else { "fail" };
+        json!({
+            "status": status,
+            "reason": if failures.is_empty() { "ok".to_owned() } else { failures.join(" | ") },
+            "shape": EMU_GATE_SHAPES.iter().map(|(n, s)| format!("{n}:{s}")).collect::<Vec<_>>(),
+            "instructions": instructions,
+            "workgroups": workgroups,
+            "cand_out_sha256": format!("{:x}", cand_hash.finalize()),
+            "base_out_sha256": format!("{:x}", base_hash.finalize()),
+            "guard_bytes": EMU_GUARD,
+            "strict_lds": true,
+            "inputs": "synthetic, weight scale span narrowed (Problem::tame) so no accumulator reaches emulator-unmeasured SwiGLU divisions",
+            "numeric_model": "gfx1100 executed with the gfx1151 WMMA + transcendental model on both arms (no hardware-qualified gfx1100 model); arms compared emulated-vs-emulated and against the CPU reference",
+            "candidate_sha256": sha256_hex(&cand.bytes),
+            "incumbent_sha256": sha256_hex(&base.bytes),
+            "cases": cases,
+        })
+    }
 }
 
 impl Workload for Moe {
@@ -2301,6 +2530,10 @@ impl Workload for Moe {
             Ok(v) => v,
             Err(reason) => Value::String(format!("refused ({reason})")),
         }
+    }
+
+    fn emu_gate(&self, cand: &Object, base: &Object) -> Option<Value> {
+        Some(self.emu_gate_run(cand, base))
     }
 }
 
@@ -3180,6 +3413,27 @@ mod tests {
                 }
                 other => panic!("{other}"),
             }
+        }
+    }
+
+    /// The pre-card gate on the shipped gfx1100 object (candidate = the in-tree emit, incumbent = the shipped
+    /// bundle): both run the whole grid on the emulator with guard gaps and strict LDS and agree bit-for-bit.
+    #[test]
+    fn emu_gate_passes_the_in_tree_gfx1100_entries() {
+        for epi in ["gate_up", "down"] {
+            let w = on(
+                "E=2,TOP=2,T=20,H=512,I=128",
+                &[("epi", epi)],
+                Arch::Gfx1100,
+            )
+            .unwrap();
+            let g = w
+                .emu_gate(&w.candidate().unwrap(), &w.baseline().unwrap())
+                .unwrap();
+            assert_eq!(g["status"], "pass", "{epi}: {g}");
+            assert!(g["instructions"].as_u64().unwrap() > 0);
+            assert_eq!(g["cand_out_sha256"], g["base_out_sha256"], "{epi}");
+            assert_eq!(g["cases"].as_array().unwrap().len(), EMU_GATE_SHAPES.len());
         }
     }
 

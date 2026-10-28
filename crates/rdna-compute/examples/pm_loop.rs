@@ -45,6 +45,15 @@
 //!    silu) reports `reference: "none"` and `pass` is then
 //!    `identical_to_baseline` (`pass_basis` says which). `--emu` runs the candidate on the peacemaker emulator
 //!    when every instruction is qualified, else `refused (<reason>)`.
+//!    **Pre-card emulator gate** (`--emu`, with or without `--offline`; `--kernel qwen4_moe_sym` today): before any
+//!    device is opened the candidate AND the shipped incumbent object run their whole grid on the emulator at
+//!    tiny shapes (aligned and ragged `T`), each buffer an exact-size region with >= 128 KiB unmapped guard gaps,
+//!    LDS definedness tracked per workgroup. The record's `emu_gate` is `pass` only if there is no access outside a
+//!    mapped buffer, no LDS access out of bounds or read of an LDS byte the workgroup never wrote, no barrier
+//!    deadlock or instruction-limit stop, every opcode is executable (a refusal names it), the candidate output is
+//!    bit-identical to the emulated incumbent's and both pass the CPU reference. A failed gate is stage
+//!    `emu_gate` (exit 3) and the card is never touched. gfx1100 runs use the gfx1151 WMMA/transcendental model
+//!    (`Emulator::gfx1100_as_gfx1151`; recorded in `emu_gate.numeric_model`) with narrowed weight scales.
 //! 4. Timing: ABBA, A = baseline, B = candidate, like `pm_decode_twins time`:
 //!    one checked warm launch per arm, then `--rounds R` (default 6) ABBA
 //!    rounds of `--time N` (default 50) launches per block, per-launch
@@ -1074,6 +1083,32 @@ fn run(o: &mut Opts) -> (Value, Outcome) {
     };
     let cand = emitted.unwrap_or_else(|| base.clone());
 
+    // Pre-card emulator gate (`--emu`, offline or not): no candidate reaches a device unless the candidate and the
+    // shipped incumbent both run their whole grid on the emulator (guarded buffers, definedness-tracked LDS) and
+    // agree bit-for-bit. The record keeps `emu_gate` even when M7 or the gate itself ends the run.
+    let mut emu_gate_failed: Option<String> = None;
+    if o.emu {
+        match w.emu_gate(&cand, &base) {
+            Some(g) => {
+                if g["status"] != "pass" {
+                    emu_gate_failed = Some(
+                        g["reason"]
+                            .as_str()
+                            .unwrap_or("emulator gate failed")
+                            .to_owned(),
+                    );
+                }
+                rec["emu_gate"] = g;
+            }
+            None => {
+                rec["emu_gate"] = json!({
+                    "status": "unavailable",
+                    "reason": format!("no emulator gate for --kernel {}", o.kernel),
+                });
+            }
+        }
+    }
+
     // 2. certify + resources
     if !aa {
         let cand_path = match write_object(&out_dir, "candidate", &cand) {
@@ -1166,6 +1201,9 @@ fn run(o: &mut Opts) -> (Value, Outcome) {
             return fail(rec, "m7", msg);
         }
     }
+    if let Some(reason) = emu_gate_failed {
+        return fail(rec, "emu_gate", reason);
+    }
     if o.offline {
         // Offline legality screen (R4 pruning): emit + link + M7 + baseline
         // resolution only; no device is opened and nothing is timed.
@@ -1226,6 +1264,13 @@ fn run(o: &mut Opts) -> (Value, Outcome) {
         Err(_) if numeric => diff.is_finite(),
         Err(_) => identical,
     };
+    let emu_field = if !o.emu {
+        json!("not requested (--emu)")
+    } else if rec["emu_gate"]["status"] == "pass" {
+        json!("see emu_gate")
+    } else {
+        tidy_emu(w.emu())
+    };
     rec["correctness"] = json!({
         "reference": reference.as_ref().map(|r| r.reference.as_str()).unwrap_or("none"),
         "reference_error": reference.as_ref().err(),
@@ -1239,7 +1284,7 @@ fn run(o: &mut Opts) -> (Value, Outcome) {
         "identical_to_baseline": identical,
         "max_abs_diff_vs_baseline": diff,
         "output_bytes": cand_out.len(),
-        "emu": if o.emu { tidy_emu(w.emu()) } else { json!("not requested (--emu)") },
+        "emu": emu_field,
     });
     if !pass {
         rec["timing"] = json!({"status": "refused: candidate failed correctness"});
