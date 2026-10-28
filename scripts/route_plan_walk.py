@@ -39,6 +39,11 @@ import threading
 import time
 
 BOUNDED_MAX_TOKENS = 8
+# XTX card-drop rule (observed 2026-10-28): the first long-prefill request of a process that decodes past ~4 tokens
+# never drops the card, later long decodes drop it at token 13-24. Every long-prefill request of the bounded walk
+# (>= BOUNDED_LONG_WORDS words, and the depth prompts) therefore decodes at most BOUNDED_LONG_TOKENS tokens.
+BOUNDED_LONG_TOKENS = 4
+BOUNDED_LONG_WORDS = 512
 # Prompt-length sweep of the bounded profile, in FILLER words (the chat template adds ~12 rows): every
 # row count to 8, a coarse stride through the row classes below one 768-row S1 tile, the tile edge,
 # and multi-tile prompts of ~1K..4K words.
@@ -97,7 +102,8 @@ def bounded_plan(prompt_dir):
     of a sub-512-row prompt is 2.6-28 s, 8 decoded tokens ~2 s, load ~105 s): ~37 requests, ~320 s of requests.
     Sampled generates on a short prompt (sampler + MTP verify/accept kernels), thinking-on generates (a
     4-token think budget), a prompt-length sweep (short prefill row classes, the 768-row S1 tile), a session
-    resume, then the 8K / 16.9K / 32K depth prompts (S1 windows, the window tail, deep decode context)."""
+    resume, then the 8K / 16.9K / 32K depth prompts (S1 windows, the window tail, deep decode context). Long
+    prefills (>= BOUNDED_LONG_WORDS words, the depth prompts) decode BOUNDED_LONG_TOKENS tokens, the rest 8."""
     cap = BOUNDED_MAX_TOKENS
     plan = [{"type": "generate", "prompt": "Hi", "max_tokens": cap, "temperature": 0}]
     short = "Name three rivers in Europe."
@@ -109,7 +115,8 @@ def bounded_plan(prompt_dir):
                           "max_tokens": cap, "thinking_enabled": True, "max_think_tokens": 4,
                           "_name": "think-short"}, **s))
     for n in BOUNDED_WORDS:
-        plan.append({"type": "generate", "prompt": filler_words(n), "max_tokens": cap, "temperature": 0,
+        plan.append({"type": "generate", "prompt": filler_words(n),
+                     "max_tokens": BOUNDED_LONG_TOKENS if n >= BOUNDED_LONG_WORDS else cap, "temperature": 0,
                      "_words": n})
     plan.append({"type": "generate", "prompt": filler_words(40), "max_tokens": cap, "temperature": 0.8,
                  "top_k": 40, "seed": 40, "_words": 40})
@@ -119,8 +126,8 @@ def bounded_plan(prompt_dir):
     plan.append({"type": "generate", "chain_user": "Which is longest?", "max_tokens": cap, "temperature": 0.7,
                  "top_p": 0.9})
     for name in BOUNDED_DEPTH_PROMPTS:
-        plan.append({"type": "generate", "prompt": (prompt_dir / name).read_text(), "max_tokens": cap,
-                     "temperature": 0, "_name": name})
+        plan.append({"type": "generate", "prompt": (prompt_dir / name).read_text(),
+                     "max_tokens": BOUNDED_LONG_TOKENS, "temperature": 0, "_name": name})
     assert all(m["max_tokens"] <= cap for m in plan if m["type"] == "generate")
     return plan
 

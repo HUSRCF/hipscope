@@ -72,6 +72,9 @@ class BoundedPlan(unittest.TestCase):
             plan = walk.bounded_plan(prompt_dir(pathlib.Path(tmp)))
         self.assertEqual({m["type"] for m in plan}, {"generate"})
         self.assertTrue(all(m["max_tokens"] <= 8 for m in plan))
+        long_prefills = [m for m in plan if m.get("_name", "").startswith("depth_") or m.get("_words", 0) >= walk.BOUNDED_LONG_WORDS]
+        self.assertEqual(len(long_prefills), 3 + sum(n >= walk.BOUNDED_LONG_WORDS for n in walk.BOUNDED_WORDS))
+        self.assertTrue(all(m["max_tokens"] <= 4 for m in long_prefills), "card-drop rule: long prefills decode <= 4 tokens")
         self.assertEqual([m["_name"] for m in plan[-3:]], list(walk.BOUNDED_DEPTH_PROMPTS))
         self.assertTrue(all("_name" not in m or m["_name"] == "think-short" for m in plan[:-3]))
 
