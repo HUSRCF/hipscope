@@ -109,13 +109,12 @@ fn main() {
     };
     let toolchain = Toolchain::oracle();
     let stem = Cfg::resid_module(ARCH);
-    let (emitted, text, proof) =
-        mq6::emit_resid_module(ARCH).unwrap_or_else(|e| kill("emit", e));
+    let (emitted, text, proof) = mq6::emit_resid_module(ARCH).unwrap_or_else(|e| kill("emit", e));
     // Every stage is a hard stop: wait replay, empty hazard replay, native assembly, M7 on the
     // native object, ROCm oracle build of the same module source with M7, `.text` byte identity.
     ledger_replay::replay_waits(&text, ARCH).unwrap_or_else(|er| kill("wait_replay", er));
-    let hz = ledger_replay::replay_hazards(&text, ARCH)
-        .unwrap_or_else(|er| kill("hazard_replay", er));
+    let hz =
+        ledger_replay::replay_hazards(&text, ARCH).unwrap_or_else(|er| kill("hazard_replay", er));
     if !hz.is_empty() {
         kill("hazard_replay", format!("{} hazards: {hz:?}", hz.len()))
     }
@@ -138,8 +137,13 @@ fn main() {
     let odir = out.join("oracle");
     let os = odir.join(format!("{stem}.s"));
     put("output", &os, &text);
-    let built = build(&toolchain, &os, &odir.join(format!("{stem}.hsaco")), ARCH.name())
-        .unwrap_or_else(|er| kill("oracle_build", er));
+    let built = build(
+        &toolchain,
+        &os,
+        &odir.join(format!("{stem}.hsaco")),
+        ARCH.name(),
+    )
+    .unwrap_or_else(|er| kill("oracle_build", er));
     let (tn, to) = (
         text_section(&elf),
         text_section(&std::fs::read(&built.elf).unwrap()),
@@ -191,6 +195,10 @@ fn main() {
         "text_sha256": sha256(&tn), "text_bytes": tn.len(), "m7_oracle_text_identical": true,
         "entries": rec,
     });
-    put("output", &out.join("emit.json"), serde_json::to_vec_pretty(&rec).unwrap());
+    put(
+        "output",
+        &out.join("emit.json"),
+        serde_json::to_vec_pretty(&rec).unwrap(),
+    );
     println!("{}", json!({"verdict": "pass", "record": rec}));
 }

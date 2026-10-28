@@ -195,7 +195,11 @@ impl Cfg {
     /// loaded in one product process.
     pub fn symbol(&self) -> String {
         if self.kind == Kind::Resid {
-            return format!("gemm_mq6g256v2_residual_pm_{}_w{}", self.arch.name(), self.wr);
+            return format!(
+                "gemm_mq6g256v2_residual_pm_{}_w{}",
+                self.arch.name(),
+                self.wr
+            );
         }
         format!(
             "qwen4_{}_x4_pm_{}_w{}{}",

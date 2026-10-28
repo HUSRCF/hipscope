@@ -11,11 +11,10 @@
 //! identical, so the emulated program is the gfx1100 program. The reference chain is the emulator's
 //! own gfx11 WMMA model (`emu::mma`), bit for bit.
 use peacemaker_ir::emu::{mma, Emulator, Launch, Memory};
-use peacemaker_ir::Arch as IrArch;
 use peacemaker_ir::inst::Frontend;
+use peacemaker_ir::Arch as IrArch;
 use peacemaker_isa::kernels::qwen4_mq6_x4_gfx11::{self as mq6, Cfg, Fmt, Kind};
 use peacemaker_isa::Arch;
-
 
 fn cfg(arch: Arch, wr: u8) -> Cfg {
     Cfg {
@@ -36,7 +35,12 @@ fn residual_entries_emit_on_gfx1100_deterministically() {
         assert_eq!(a.s_text, b.s_text, "w{wr}");
         assert_eq!(a.proof.s_text_sha256, b.proof.s_text_sha256, "w{wr}");
         assert_eq!(a.shape.wmma, 256, "w{wr}");
-        assert!(a.s_text.contains(&format!(".globl gemm_mq6g256v2_residual_pm_gfx1100_w{wr}\n")), "w{wr}");
+        assert!(
+            a.s_text.contains(&format!(
+                ".globl gemm_mq6g256v2_residual_pm_gfx1100_w{wr}\n"
+            )),
+            "w{wr}"
+        );
         // hipcc's incumbent metadata: A X Y pointers, M K N by value, 36-byte block, 40 KiB static LDS.
         assert!(a.s_text.contains(".kernarg_segment_size: 36\n"), "w{wr}");
         let field = |key: &str| -> Vec<u32> {
@@ -48,13 +52,21 @@ fn residual_entries_emit_on_gfx1100_deterministically() {
         };
         assert_eq!(field(".offset:"), [0, 8, 16, 24, 28, 32], "w{wr}");
         assert_eq!(field(".size:"), [8, 8, 8, 4, 4, 4], "w{wr}");
-        assert!(a.s_text.contains(".amdhsa_group_segment_fixed_size 40960"), "w{wr}");
+        assert!(
+            a.s_text.contains(".amdhsa_group_segment_fixed_size 40960"),
+            "w{wr}"
+        );
         assert!(a.s_text.contains("amdgcn-amd-amdhsa--gfx1100") || a.s_text.contains("gfx1100"));
         // The accumulator is added to the loaded Y as is (hipcc: `v_add_f32_e32 acc, acc, y`); the
         // overwrite epilogue's `0 + acc` canonicalisation is absent.
         assert!(a.s_text.contains("v_add_f32_e32 v"), "w{wr}");
         assert!(!a.s_text.contains("v_add_f32_e32 v1, v1,"), "w{wr}");
-        assert!(!a.s_text.lines().any(|l| l.trim().starts_with("v_add_f32_e32") && l.contains(", 0, v")), "w{wr}");
+        assert!(
+            !a.s_text
+                .lines()
+                .any(|l| l.trim().starts_with("v_add_f32_e32") && l.contains(", 0, v")),
+            "w{wr}"
+        );
     }
 }
 
@@ -284,8 +296,16 @@ fn run(p: &Problem, wr: u8) -> Result<Vec<f32>, String> {
         },
     )
     .map_err(|e| format!("lift: {e:?}"))?;
-    let emu = Emulator::new(&lifted.program, &format!("gemm_mq6g256v2_residual_pm_gfx1151_w{wr}"))?;
-    let (kva, ava, xva, yva) = (0x1000_0000u64, 0x2000_0000u64, 0x3000_0000u64, 0x4000_0000u64);
+    let emu = Emulator::new(
+        &lifted.program,
+        &format!("gemm_mq6g256v2_residual_pm_gfx1151_w{wr}"),
+    )?;
+    let (kva, ava, xva, yva) = (
+        0x1000_0000u64,
+        0x2000_0000u64,
+        0x3000_0000u64,
+        0x4000_0000u64,
+    );
     let mut kern = Vec::new();
     for ptr in [ava, xva, yva] {
         kern.extend_from_slice(&ptr.to_le_bytes());
@@ -370,7 +390,11 @@ fn residual_matches_cpu_bitwise_on_aligned_and_ragged_shapes() {
 /// Random f16 scales / zero points / X, bitwise (same chain model, A rounding exercised).
 #[test]
 fn residual_matches_cpu_bitwise_on_random_values() {
-    for (m, n, k, wr, seed) in [(48, 33, 512, 8, 11u64), (48, 33, 512, 4, 12), (29, 19, 256, 8, 13)] {
+    for (m, n, k, wr, seed) in [
+        (48, 33, 512, 8, 11u64),
+        (48, 33, 512, 4, 12),
+        (29, 19, 256, 8, 13),
+    ] {
         let p = Problem::new(m, n, k, seed, false);
         check(&p, wr);
     }
@@ -392,12 +416,17 @@ fn committed_module_bundle_equals_fresh_emission() {
         Arch::Gfx1100,
         peacemaker_isa::native::DEFAULT_HOST_TARGET,
     );
-    assert!(fresh == committed, "{stem}: fresh bundle differs from the committed bundle");
+    assert!(
+        fresh == committed,
+        "{stem}: fresh bundle differs from the committed bundle"
+    );
     let sha = std::fs::read_to_string(format!("{root}/{stem}.hxaco.sha256")).unwrap();
     assert_eq!(sha, format!("{:x}", Sha256::digest(&committed)));
     let s = std::fs::read_to_string(format!("{root}/{stem}.s")).unwrap();
     assert_eq!(s, text);
     for wr in [4, 8] {
-        assert!(text.contains(&format!(".globl gemm_mq6g256v2_residual_pm_gfx1100_w{wr}\n")));
+        assert!(text.contains(&format!(
+            ".globl gemm_mq6g256v2_residual_pm_gfx1100_w{wr}\n"
+        )));
     }
 }

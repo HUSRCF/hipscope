@@ -56737,7 +56737,9 @@ mod mq6_resid_pm_gfx1100_selection {
         for bits in [3u8, 4, 5] {
             assert_eq!(pick("gfx1100", bits, 768, 10240, true), None, "bits={bits}");
         }
-        for arch in ["gfx1151", "gfx1150", "gfx1152", "gfx1201", "gfx942", "gfx1101"] {
+        for arch in [
+            "gfx1151", "gfx1150", "gfx1152", "gfx1201", "gfx942", "gfx1101",
+        ] {
             assert_eq!(pick(arch, 6, 768, 10240, true), None, "{arch}");
         }
     }

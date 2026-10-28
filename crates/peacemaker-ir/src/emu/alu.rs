@@ -3358,7 +3358,10 @@ mod tests {
         i.mods.op_sel = 0b10;
         i.mods.op_sel_hi = 0b10;
         run("v_pk_add_f16", &i, &mut st).unwrap();
-        assert_eq!(st.v[0][0], 0x4700_4700, "a low (2.0) + b high (5.0) in both results");
+        assert_eq!(
+            st.v[0][0], 0x4700_4700,
+            "a low (2.0) + b high (5.0) in both results"
+        );
     }
 
     #[test]
