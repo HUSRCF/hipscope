@@ -1624,6 +1624,68 @@ fn route_id_valid(id: i32, n_experts: usize) -> bool {
     id >= 0 && (id as usize) < n_experts
 }
 
+/// Expert ids kept on the stack by [`ExpertReps`] before it heap-allocates.
+const EXPERT_REP_STACK: usize = 512;
+
+fn expert_spans_differ(o: &CpuMoeExpert<'_>, e: &CpuMoeExpert<'_>) -> bool {
+    o.gate_up_quant != e.gate_up_quant
+        || o.down_quant != e.down_quant
+        || o.gate_up.as_ptr() != e.gate_up.as_ptr()
+        || o.gate_up.len() != e.gate_up.len()
+        || o.down.as_ptr() != e.down.as_ptr()
+        || o.down.len() != e.down.len()
+}
+
+/// Per-expert first-seen representative (index into `host_slots`/`experts`).
+/// Same-span equality is an equivalence relation and every earlier same-id
+/// slot already matched the representative (or the call errored), so comparing
+/// against the first occurrence alone accepts/rejects exactly what the former
+/// pairwise scan did and names the same `other` slot. O(1) per slot.
+struct ExpertReps {
+    stack: [u32; EXPERT_REP_STACK],
+    heap: Vec<u32>,
+    n: usize,
+}
+
+impl ExpertReps {
+    const NONE: u32 = u32::MAX;
+
+    fn new(n_experts: usize) -> Self {
+        let heap = if n_experts > EXPERT_REP_STACK {
+            vec![Self::NONE; n_experts]
+        } else {
+            Vec::new()
+        };
+        Self {
+            stack: [Self::NONE; EXPERT_REP_STACK],
+            heap,
+            n: n_experts,
+        }
+    }
+
+    /// Record slot position `i` for `id`; return the position
+    /// of the first earlier same-id slot whose spans differ, if any. `id` MUST
+    /// be `< n_experts`.
+    fn conflict(&mut self, id: usize, i: usize, experts: &[CpuMoeExpert<'_>]) -> Option<usize> {
+        debug_assert!(id < self.n);
+        let cell = if self.n > EXPERT_REP_STACK {
+            &mut self.heap[id]
+        } else {
+            &mut self.stack[id]
+        };
+        if *cell == Self::NONE {
+            *cell = i as u32;
+            return None;
+        }
+        let r = *cell as usize;
+        if expert_spans_differ(&experts[r], &experts[i]) {
+            Some(r)
+        } else {
+            None
+        }
+    }
+}
+
 /// Slot-ownership bitmask words kept on the stack (1024 slots) before a heap
 /// fallback.
 const HOST_SLOT_MASK_STACK_WORDS: usize = 16;
@@ -1692,6 +1754,7 @@ pub fn validate_moe_cpu_host_slot_outputs(
         heap = vec![0u64; words];
         &mut heap
     };
+    let mut reps = ExpertReps::new(n_experts);
     for (i, (&slot, e)) in host_slots.iter().zip(experts).enumerate() {
         let s = slot as usize;
         if s >= slots {
@@ -1712,19 +1775,11 @@ pub fn validate_moe_cpu_host_slot_outputs(
             )));
         }
         validate_expert_spans(dim, mi, e)?;
-        for (&other, o) in host_slots[..i].iter().zip(experts) {
-            if ids[other as usize] == id
-                && (o.gate_up_quant != e.gate_up_quant
-                    || o.down_quant != e.down_quant
-                    || o.gate_up.as_ptr() != e.gate_up.as_ptr()
-                    || o.gate_up.len() != e.gate_up.len()
-                    || o.down.as_ptr() != e.down.as_ptr()
-                    || o.down.len() != e.down.len())
-            {
-                return Err(cpu_err(&format!(
-                    "moe cpu host slots: expert id {id} resolved to different spans (host slots {other} and {s})"
-                )));
-            }
+        if let Some(other) = reps.conflict(id as usize, i, experts) {
+            let other = host_slots[other];
+            return Err(cpu_err(&format!(
+                "moe cpu host slots: expert id {id} resolved to different spans (host slots {other} and {s})"
+            )));
         }
     }
     if let Some(g) = gpu_ids {
@@ -5418,5 +5473,121 @@ mod moe_splice_tests {
         )
         .unwrap();
         assert_eq!(caps(), before);
+    }
+}
+
+#[cfg(test)]
+mod slot_check_tests {
+    use super::*;
+
+    fn exp<'a>(q: CpuQuant, gu: &'a [u8], dn: &'a [u8]) -> CpuMoeExpert<'a> {
+        CpuMoeExpert {
+            gate_up_quant: q,
+            gate_up: gu,
+            down_quant: q,
+            down: dn,
+        }
+    }
+
+    /// Former O(n^2) predicate: first (id, other-position) conflict.
+    fn reference(ids: &[i32], hs: &[u32], ex: &[CpuMoeExpert<'_>]) -> Option<usize> {
+        for (i, e) in ex.iter().enumerate() {
+            for (&other, o) in hs[..i].iter().zip(ex) {
+                if ids[other as usize] == ids[hs[i] as usize] && expert_spans_differ(o, e) {
+                    return Some(other as usize);
+                }
+            }
+            let _ = i;
+        }
+        None
+    }
+
+    fn fast(ids: &[i32], hs: &[u32], ex: &[CpuMoeExpert<'_>], n_experts: usize) -> Option<usize> {
+        let mut reps = ExpertReps::new(n_experts);
+        for i in 0..ex.len() {
+            if let Some(o) = reps.conflict(ids[hs[i] as usize] as usize, i, ex) {
+                return Some(hs[o] as usize);
+            }
+        }
+        None
+    }
+
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+    }
+
+    #[test]
+    fn linear_matches_pairwise_reference() {
+        let bufs: Vec<Vec<u8>> = (0..6).map(|i| vec![0u8; 64 + i]).collect();
+        let mut rng = Rng(0x9E3779B97F4A7C15);
+        for case in 0..4000 {
+            let n_experts = [4usize, 64, 511, 512, 513, 700][case % 6];
+            let slots = 1 + (rng.next() as usize % 40);
+            let ids: Vec<i32> = (0..slots)
+                .map(|_| (rng.next() as usize % n_experts.min(6)) as i32)
+                .collect();
+            let mut hs: Vec<u32> = (0..slots as u32).collect();
+            for k in (1..hs.len()).rev() {
+                hs.swap(k, rng.next() as usize % (k + 1));
+            }
+            hs.truncate(1 + rng.next() as usize % slots);
+            // Adversarial: mostly consistent per-id spans with sparse corruption.
+            let corrupt = case % 3 == 0;
+            let ex: Vec<CpuMoeExpert<'_>> = hs
+                .iter()
+                .map(|&s| {
+                    let id = ids[s as usize] as usize;
+                    let mut b = id % bufs.len();
+                    if corrupt && rng.next() % 7 == 0 {
+                        b = rng.next() as usize % bufs.len();
+                    }
+                    exp(CpuQuant::Mq4G256V2, &bufs[b], &bufs[b])
+                })
+                .collect();
+            assert_eq!(
+                reference(&ids, &hs, &ex),
+                fast(&ids, &hs, &ex, n_experts),
+                "case {case}"
+            );
+        }
+    }
+
+    #[test]
+    fn linear_all_same_and_all_conflicting() {
+        let a = vec![0u8; 8];
+        let b = vec![0u8; 8];
+        let ids = vec![3i32; 100];
+        let hs: Vec<u32> = (0..100).collect();
+        let same: Vec<_> = (0..100).map(|_| exp(CpuQuant::Mq4G256V2, &a, &a)).collect();
+        assert_eq!(fast(&ids, &hs, &same, 8), None);
+        assert_eq!(reference(&ids, &hs, &same), None);
+        let mut mixed = same.clone();
+        mixed[57] = exp(CpuQuant::Mq4G256V2, &b, &b);
+        assert_eq!(fast(&ids, &hs, &mixed, 8), Some(0));
+        assert_eq!(reference(&ids, &hs, &mixed), Some(0));
+    }
+
+    #[test]
+    fn linear_scaling_smoke() {
+        let a = vec![0u8; 8];
+        let n = 16384usize;
+        let ids: Vec<i32> = (0..n).map(|i| (i % 256) as i32).collect();
+        let hs: Vec<u32> = (0..n as u32).collect();
+        let ex: Vec<_> = (0..n).map(|_| exp(CpuQuant::Mq4G256V2, &a, &a)).collect();
+        let t = std::time::Instant::now();
+        // Same shape as the predicate loop of validate_moe_cpu_host_slot_outputs.
+        let r = fast(&ids, &hs, &ex, 256);
+        let ms = t.elapsed().as_secs_f64() * 1e3;
+        eprintln!("slot-check 16384 slots: {ms:.3} ms");
+        assert_eq!(r, None);
+        if !cfg!(debug_assertions) {
+            assert!(ms < 20.0, "{ms} ms");
+        }
     }
 }
