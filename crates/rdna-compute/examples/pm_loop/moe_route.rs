@@ -95,6 +95,20 @@
 //! activation quantisations; the recipe is exact except SwiGLU roundings the portable twin cannot
 //! decide). The distance between the routes is recorded, never gated. `--null-control aa` runs the
 //! baseline chain as the candidate arm and then DOES require bit identity.
+//!
+//! # Pre-card emulator gate (always runs before a device is opened)
+//!
+//! X1-ROUTE faulted the XTX (`HipError(700)` in the prime chain): the shipped K3 producer stored 4 GiB
+//! past its sidecar once `g * L + slot >= 828,505` (`mad64` aliasing, fixed in `mq_i4_a4_gfx1100.rs`),
+//! which no small-shape gate can reach. GPU mode therefore ALWAYS runs `Bench::emu_gate` first (fail
+//! closed: stage `emu_gate`, exit 3, before `Gpu::init`); `--emu` additionally requests it with
+//! `--offline`. It runs the three PM launches of the IU4 chain (gate_up, K3, down) on the peacemaker
+//! emulator with the chain's literal 64/48-byte kernargs and every buffer an exact-size guarded region
+//! (any access past an end is an error): a small shape in full (every workgroup of every panel) and the
+//! REAL shape's panels at quartiles plus the panels holding the smallest and largest slot ids, at the grid
+//! extremes (first/last/padded tiles and the tiles with the extreme slot ids, all x blocks, all rows of
+//! those tiles for K3). Each live row's down output must equal the exact A4 recipe. Not emulated: the
+//! hipcc window producer `mq_rotate_x_i4` (the sidecar is the host recipe) and the whole F16 arm (hipcc).
 #![allow(dead_code)]
 
 use crate::common::{bf16_bits, bf16_val, dev_err, f16_bits, f16_val, sha256_hex};
@@ -139,6 +153,9 @@ const DEFAULT_A4_RECIPE_BOUND: f64 = 0.05;
 const DEFAULT_A4_BOUND: f64 = 0.5;
 /// `QWEN4_MOE_SYM_NT1_BLOCK` (gate/up, down): the gfx1100 NT1 entries' workgroup sizes.
 const IU4_NT1_BLOCK: [u32; 2] = [64, 128];
+/// Rows of slack past every scratch / route tensor (multiple of `BLOCK_M`); see `setup`.
+const SLACK_ROWS: usize = 64;
+const _: () = assert!(SLACK_ROWS % BLOCK_M == 0);
 
 const GATE_F16: &str = "gemm_mq4g256v2_moe_grouped_wmma_k2_silu_bf16out";
 const DOWN_F16: &str = "gemm_mq4g128v2_moe_grouped_wmma_gfx1151_bf16out";
@@ -863,27 +880,40 @@ pub fn new(shape: &str, knobs: &mut Knobs, aa: bool) -> Result<Bench> {
         a4_recipe_bound: take_f64(knobs, "a4-recipe-bound", DEFAULT_A4_RECIPE_BOUND)?,
         a4_bound: take_f64(knobs, "a4-bound", DEFAULT_A4_BOUND)?,
     };
-    let topk = route_table(&shape);
-    let grouping = Grouping::new(&topk, shape.e)?;
-    let panels = schedule(&grouping, shape.bind, shape.panel_rows);
-    let run = match shape.panels {
-        PanelSel::All => panels.len(),
-        PanelSel::First(n) => n.min(panels.len()),
-    };
-    if run == 0 {
-        return Err("the synthetic route produced no panel".into());
+    Bench::from_parts(shape, aa, tune)
+}
+
+impl Bench {
+    /// The route, grouping and panel schedule of an already validated (or, for the emulator
+    /// gate's small shapes, deliberately unadmitted) `shape`.
+    fn from_parts(shape: Shape, aa: bool, tune: Tune) -> Result<Bench> {
+        if shape.e < TOP || shape.bind == 0 || shape.panel_rows == 0 || shape.panel_rows % BLOCK_M != 0 {
+            // route_table draws TOP distinct experts per token: E < TOP would never terminate.
+            return Err(format!("shape E={} bind={} panel={}: need E >= {TOP}, bind > 0, panel a multiple of {BLOCK_M}",
+                shape.e, shape.bind, shape.panel_rows));
+        }
+        let topk = route_table(&shape);
+        let grouping = Grouping::new(&topk, shape.e)?;
+        let panels = schedule(&grouping, shape.bind, shape.panel_rows);
+        let run = match shape.panels {
+            PanelSel::All => panels.len(),
+            PanelSel::First(n) => n.min(panels.len()),
+        };
+        if run == 0 {
+            return Err("the synthetic route produced no panel".into());
+        }
+        Ok(Bench {
+            shape,
+            aa,
+            tune,
+            topk,
+            grouping,
+            panels,
+            run,
+            dev: None,
+            swapped: false,
+        })
     }
-    Ok(Bench {
-        shape,
-        aa,
-        tune,
-        topk,
-        grouping,
-        panels,
-        run,
-        dev: None,
-        swapped: false,
-    })
 }
 
 impl Bench {
@@ -1103,31 +1133,43 @@ impl Bench {
         self.check_device_grouping(gpu)?;
 
         // Panel route tensors (global slot ids, as the production panel views).
-        let i32_bytes = |v: &[i32]| -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() };
+        let i32_bytes = |v: &[i32], pad: usize| -> Vec<u8> {
+            v.iter()
+                .copied()
+                .chain(std::iter::repeat(-1).take(pad))
+                .flat_map(|x| x.to_le_bytes())
+                .collect()
+        };
         let mut panels = Vec::with_capacity(sel.len());
         for p in &sel {
             let tiles = &self.grouping.tiles[p.row_base / BLOCK_M..(p.row_base + p.rows) / BLOCK_M];
             let sorted = &self.grouping.sorted[p.row_base..p.row_base + p.rows];
+            // Slack of sentinel (-1) entries past the panel: no kernel reads beyond `rows`
+            // (pm-krsi-1100/gpu/route/AUDIT.md), this is margin against an addressing slip.
+            let (tile_pad, sorted_pad) = (SLACK_ROWS / BLOCK_M, SLACK_ROWS);
             panels.push(PanelDev {
                 index: p.index,
                 rows: p.rows,
                 row_base: p.row_base,
                 tiles: hip(
                     "upload panel tiles",
-                    gpu.upload_raw(&i32_bytes(tiles), &[tiles.len(), 4]),
+                    gpu.upload_raw(&i32_bytes(tiles, tile_pad), &[tiles.len() + tile_pad, 4]),
                 )?,
                 sorted: hip(
                     "upload panel sorted",
-                    gpu.upload_raw(&i32_bytes(sorted), &[sorted.len(), 4]),
+                    gpu.upload_raw(&i32_bytes(sorted, sorted_pad), &[sorted.len() + sorted_pad, 4]),
                 )?,
             });
         }
 
-        // Two buffer sets.
-        let rows = self.max_rows();
+        // Two buffer sets, every scratch padded by `SLACK_ROWS` rows past its largest panel
+        // (and the window F16 X by as many rows): the audited max touch is `rows`, the slack
+        // keeps an addressing slip from reaching a neighbouring allocation (the PM Y descriptors
+        // are unbounded).
+        let rows = self.max_rows() + SLACK_ROWS;
         let set = |gpu: &mut Gpu| -> Result<ArmSet> {
             Ok(ArmSet {
-                x_f16: hip("alloc x_f16", gpu.zeros(&[t, H], DType::F16))?,
+                x_f16: hip("alloc x_f16", gpu.zeros(&[t + SLACK_ROWS, H], DType::F16))?,
                 local: hip("alloc local", gpu.zeros(&[rows, 4], DType::Raw))?,
                 y_gu: hip("alloc y_gate_up", gpu.zeros(&[rows, I], DType::BF16))?,
                 y_down: hip("alloc y_down", gpu.zeros(&[rows, H], DType::BF16))?,
@@ -1165,7 +1207,8 @@ impl Bench {
             "upload topk",
             gpu.upload_raw(&i32_bytes(&self.topk), &[sh.t, TOP, 4]),
         )?;
-        let raw = |gpu: &mut Gpu, bytes: usize| hip("alloc", gpu.zeros(&[bytes], DType::Raw));
+        // +4 KiB slack on every output (the kernels write exactly the audited extents).
+        let raw = |gpu: &mut Gpu, bytes: usize| hip("alloc", gpu.zeros(&[bytes + 4096], DType::Raw));
         let counts = raw(gpu, sh.e * 4)?;
         let offsets = raw(gpu, (sh.e + 1) * 4)?;
         let sorted = raw(gpu, g.bound * 4)?;
@@ -2189,18 +2232,485 @@ impl Bench {
 }
 
 // ---------------------------------------------------------------------------
+// Pre-card emulator gate (`--emu`; always run before a device is opened)
+//
+// The three PM launches of the IU4 chain (`qwen4_moe_gate_up_silu_iu4_sym_pm_gfx1100`, the K3 down
+// producer `mq_i4_a4_r128_k640_gfx1100`, `qwen4_moe_down_iu4_sym_pm_gfx1100`) run on the peacemaker
+// emulator (`gfx1100_as_gfx1151`, strict LDS) with the chain's literal kernarg values, every buffer an
+// exact-size region `EMU_GUARD` unmapped bytes from its neighbours (an access past either end is an
+// error), at (1) a small shape, every workgroup of every panel, with the outputs checked against the
+// exact A4 recipe, and (2) the REAL shape's first / middle / last panel at the grid extremes (first,
+// last, padded and middle tiles, all x blocks). The hipcc producers (`mq_rotate_x_i4`) and the whole F16
+// arm are not emulated: the A4 window sidecar is built by the host recipe (`gate_records`) and the F16
+// arm is hipcc code that the A/A run of the same harness exercises on the card.
+
+const EMU_GUARD: u64 = 0x2_0000;
+
+struct EmuProgs {
+    gemm: peacemaker_ir::Program,
+    k3: peacemaker_ir::Program,
+}
+
+fn emu_program(obj: &crate::workload::Object) -> Result<peacemaker_ir::Program> {
+    peacemaker_lift::lift_object(
+        &obj.bytes,
+        peacemaker_lift::Options {
+            frontend: peacemaker_ir::inst::Frontend::Builder,
+        },
+    )
+    .map(|l| l.program)
+    .map_err(|e| format!("lift {}: {e:?}", obj.launch_symbol))
+}
+
+fn emu_progs() -> Result<EmuProgs> {
+    let objs = Iu4Arm::new(ARCH)?.pm_objects()?;
+    if objs.len() != 2 {
+        return Err(format!("expected the GEMM bundle and the K3 producer, got {} objects", objs.len()));
+    }
+    Ok(EmuProgs {
+        gemm: emu_program(&objs[0])?,
+        k3: emu_program(&objs[1])?,
+    })
+}
+
+fn emu_make<'a>(p: &'a peacemaker_ir::Program, symbol: &str) -> Result<peacemaker_ir::emu::Emulator<'a>> {
+    Ok(peacemaker_ir::emu::Emulator::new(p, symbol)?
+        .strict_lds()
+        .gfx1100_as_gfx1151())
+}
+
+/// The 64-byte kernarg of the grouped IU4 GEMMs (`qwen4_moe_sym_gfx1100/mod.rs`:
+/// `ptrs@0 tiles@8 sorted@16 Xq@24 Y@32 M@40 K@44 x_row_div@48 m_total@52 x_src_rows@56 n_experts@60`).
+#[allow(clippy::too_many_arguments)]
+fn gemm_kernarg(
+    ptrs: u64,
+    tiles: u64,
+    sorted: u64,
+    xq: u64,
+    y: u64,
+    dims: [u32; 6],
+) -> Vec<u8> {
+    let mut b = Vec::with_capacity(64);
+    for p in [ptrs, tiles, sorted, xq, y] {
+        b.extend_from_slice(&p.to_le_bytes());
+    }
+    for d in dims {
+        b.extend_from_slice(&d.to_le_bytes());
+    }
+    b
+}
+
+/// The 48-byte kernarg of the K3 producer (`h@0 sorted@8 xq@16 signs1@24 signs2@32 P@40 L@44`).
+fn k3_kernarg(h: u64, sorted: u64, xq: u64, s1: u64, s2: u64, p: u32, l: u32) -> Vec<u8> {
+    let mut b = Vec::with_capacity(48);
+    for v in [h, sorted, xq, s1, s2] {
+        b.extend_from_slice(&v.to_le_bytes());
+    }
+    b.extend_from_slice(&p.to_le_bytes());
+    b.extend_from_slice(&l.to_le_bytes());
+    b
+}
+
+fn f32_le(v: &[f32]) -> Vec<u8> {
+    v.iter().flat_map(|x| x.to_le_bytes()).collect()
+}
+
+/// The A4 window sidecar records (`[H/128]` per token) of one token row: `mq_rotate_x_i4`'s output.
+fn gate_records(x: &[f32], signs: &Signs) -> Vec<[u8; REC]> {
+    let mut out = Vec::with_capacity(H / GROUP);
+    for g in x.chunks_exact(256) {
+        let r = rotate256(g, &signs.s1_256, &signs.s2_256);
+        for half in 0..2 {
+            let mut blk = [0f32; GROUP];
+            blk.copy_from_slice(&r[half * GROUP..(half + 1) * GROUP]);
+            out.push(quantize(&blk));
+        }
+    }
+    out
+}
+
+/// Tiles to run when not running the whole grid: first, second, middle, last two, and the first /
+/// middle / last tile that carries pad rows (`sorted == -1`).
+fn tile_sample(sorted: &[i32], tiles: usize) -> Vec<usize> {
+    let mut s = BTreeSet::new();
+    for t in [0, 1, tiles / 2, tiles.saturating_sub(2), tiles.saturating_sub(1)] {
+        if t < tiles {
+            s.insert(t);
+        }
+    }
+    let padded: Vec<usize> = (0..tiles)
+        .filter(|t| sorted[t * BLOCK_M..(t + 1) * BLOCK_M].contains(&-1))
+        .collect();
+    for i in [0, padded.len() / 2, padded.len().saturating_sub(1)] {
+        if let Some(t) = padded.get(i) {
+            s.insert(*t);
+        }
+    }
+    // The tiles holding the panel's smallest and largest slot ids: the largest slot at the highest
+    // epoch group is where `g * L + slot` (the K3 record index) peaks.
+    let live = |t: usize| sorted[t * BLOCK_M..(t + 1) * BLOCK_M].iter().copied().filter(|v| *v >= 0);
+    if let Some(t) = (0..tiles).max_by_key(|&t| live(t).max().unwrap_or(-1)) {
+        s.insert(t);
+    }
+    if let Some(t) = (0..tiles).min_by_key(|&t| live(t).min().unwrap_or(i32::MAX)) {
+        s.insert(t);
+    }
+    s.into_iter().collect()
+}
+
+struct EmuRun<'a> {
+    emu: peacemaker_ir::emu::Emulator<'a>,
+    block: u32,
+}
+
+impl EmuRun<'_> {
+    /// Run the listed workgroups over `mem` with the kernarg already mapped at `kernarg`.
+    fn exec(&self, mem: &mut peacemaker_ir::emu::Memory, kernarg: u64, wgs: &[[u32; 3]]) -> Result<u64> {
+        let mut n = 0;
+        for wg in wgs {
+            n += self
+                .emu
+                .run_workgroup_counted(
+                    &peacemaker_ir::emu::Launch {
+                        kernarg_ptr: kernarg,
+                        workgroup: *wg,
+                        block: [self.block, 1, 1],
+                        dynamic_lds: 0,
+                    },
+                    mem,
+                )
+                .map_err(|e| format!("workgroup {wg:?}: {e}"))?;
+        }
+        Ok(n)
+    }
+}
+
+fn region<'m>(mem: &'m peacemaker_ir::emu::Memory, name: &str) -> Result<&'m peacemaker_ir::emu::Region> {
+    mem.regions
+        .iter()
+        .find(|r| r.name == name)
+        .ok_or_else(|| format!("emulator memory lost the {name} region"))
+}
+
+/// Expert tables (`gate_up` or `down` bytes) of the experts the sampled tiles address; every other
+/// table entry is the unmapped address 0, so a stray dereference is an error.
+fn map_experts(
+    mem: &mut peacemaker_ir::emu::Memory,
+    e_total: usize,
+    needed: &BTreeMap<usize, Vec<u8>>,
+) -> Result<u64> {
+    let mut bases: BTreeMap<usize, u64> = BTreeMap::new();
+    for (e, bytes) in needed {
+        bases.insert(*e, mem.map_guarded(format!("expert{e}"), bytes.clone(), EMU_GUARD)?);
+    }
+    let mut table = Vec::with_capacity(e_total * 8);
+    for e in 0..e_total {
+        table.extend_from_slice(&bases.get(&e).copied().unwrap_or(0).to_le_bytes());
+    }
+    mem.map_guarded("table".into(), table, EMU_GUARD)
+}
+
+struct PanelEmu {
+    json: Value,
+    stat: RefStat,
+    failures: Vec<String>,
+}
+
+impl Bench {
+    /// One panel through the three PM launches on guarded exact-size buffers. `full`: every
+    /// workgroup; else the sampled tiles (all x blocks of those tiles, all rows of those tiles for the
+    /// producer).
+    fn emu_panel(&self, progs: &EmuProgs, panel: &Panel, full: bool) -> Result<PanelEmu> {
+        let sh = &self.shape;
+        let g = &self.grouping;
+        let (rows, tiles_n) = (panel.rows, panel.rows / BLOCK_M);
+        let tiles = &g.tiles[panel.row_base / BLOCK_M..panel.row_base / BLOCK_M + tiles_n];
+        let sorted = &g.sorted[panel.row_base..panel.row_base + rows];
+        let gys: Vec<usize> = if full {
+            (0..tiles_n).collect()
+        } else {
+            tile_sample(sorted, tiles_n)
+        };
+        let (t, slots) = (sh.t, sh.slots());
+        let signs = Signs::new();
+        let t_panel = std::time::Instant::now();
+        let i32_le = |v: &[i32]| -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() };
+
+        // The rows (and their tokens / experts) of the run tiles.
+        let mut live: Vec<(usize, usize, usize)> = Vec::new(); // (row, slot, expert)
+        let mut experts: BTreeSet<usize> = BTreeSet::new();
+        for &gy in &gys {
+            let e = tiles[gy];
+            if e < 0 || e as usize >= sh.e {
+                return Err(format!("panel {} tile {gy}: expert id {e} outside [0,{})", panel.index, sh.e));
+            }
+            experts.insert(e as usize);
+            for r in gy * BLOCK_M..(gy + 1) * BLOCK_M {
+                if sorted[r] >= 0 {
+                    live.push((r, sorted[r] as usize, e as usize));
+                }
+            }
+        }
+        let mut gu_bytes: BTreeMap<usize, Vec<u8>> = BTreeMap::new();
+        let mut dn_bytes: BTreeMap<usize, Vec<u8>> = BTreeMap::new();
+        let mut weights: BTreeMap<usize, (Vec<u8>, Vec<u8>)> = BTreeMap::new();
+        for &e in &experts {
+            let (mut gu, mut dn) = (vec![0u8; GU_BYTES], vec![0u8; DN_BYTES]);
+            gen_expert(sh.seed, e % sh.distinct, &mut gu, &mut dn);
+            gu_bytes.insert(e, gu.clone());
+            dn_bytes.insert(e, dn.clone());
+            weights.insert(e, (gu, dn));
+        }
+
+        // The A4 window sidecar `[H/128][T]` of 72-byte records; only the run rows' tokens are filled.
+        let mut xq_gate = vec![0u8; (H / GROUP) * t * REC];
+        let mut x_rows: BTreeMap<usize, Vec<f32>> = BTreeMap::new();
+        for &(_, slot, _) in &live {
+            let tok = slot / TOP;
+            if x_rows.contains_key(&tok) {
+                continue;
+            }
+            let mut x = vec![0f32; H];
+            x_row(sh.seed, tok, &mut x);
+            for (e, rec) in gate_records(&x, &signs).iter().enumerate() {
+                let off = (e * t + tok) * REC;
+                xq_gate[off..off + REC].copy_from_slice(rec);
+            }
+            x_rows.insert(tok, x);
+        }
+        let wg2 = |xs: usize| -> Vec<[u32; 3]> {
+            gys.iter()
+                .flat_map(|&gy| (0..xs as u32).map(move |gx| [gx, gy as u32, 0]))
+                .collect()
+        };
+        let mut failures: Vec<String> = Vec::new();
+        let mut json = json!({"panel": panel.index, "rows": rows, "row_base": panel.row_base,
+            "experts": [panel.expert_lo, panel.expert_hi], "tiles_run": gys.len(), "tiles": tiles_n,
+            "live_rows_run": live.len(), "full_grid": full});
+
+        eprintln!("moe_route emu: panel {} start rows={rows} tiles_run={} live_run={} experts={}", panel.index, gys.len(), live.len(), experts.len());
+        // Launch A: gate_up + SwiGLU.
+        let gemm_gate = emu_make(&progs.gemm, GATE_IU4)?;
+        let run_gate = EmuRun { emu: gemm_gate, block: IU4_NT1_BLOCK[0] };
+        let mut mem = peacemaker_ir::emu::Memory::default();
+        let table = map_experts(&mut mem, sh.e, &gu_bytes)?;
+        let tiles_va = mem.map_guarded("tiles".into(), i32_le(tiles), EMU_GUARD)?;
+        let sorted_va = mem.map_guarded("sorted".into(), i32_le(sorted), EMU_GUARD)?;
+        let xq_len = xq_gate.len();
+        let xq_va = mem.map_guarded("xq".into(), xq_gate, EMU_GUARD)?;
+        let y_gu_len = rows * I * 2;
+        let y_va = mem.map_guarded("y".into(), vec![0u8; y_gu_len], EMU_GUARD)?;
+        let karg = gemm_kernarg(
+            table, tiles_va, sorted_va, xq_va, y_va,
+            [(2 * I) as u32, H as u32, TOP as u32, rows as u32, t as u32, sh.e as u32],
+        );
+        let kva = mem.map_guarded("kernarg".into(), karg, EMU_GUARD)?;
+        let wgs_gate = wg2(2 * I / 64);
+        let instr_gate = run_gate
+            .exec(&mut mem, kva, &wgs_gate)
+            .map_err(|e| format!("panel {} gate_up (xq {xq_len} B, y {y_gu_len} B): {e}", panel.index))?;
+        let y_gu = region(&mem, "y")?;
+        let gate_written = y_gu.written.count() as u64;
+        let y_gu = y_gu.bytes.clone();
+        drop(mem);
+
+        eprintln!("moe_route emu: panel {} gate_up done wgs={} instr={instr_gate} t={:.1}s", panel.index, wgs_gate.len(), t_panel.elapsed().as_secs_f64());
+        // Launch B: K3 down producer over the rows of the run tiles.
+        let run_k3 = EmuRun { emu: emu_make(&progs.k3, rdna_compute::slab_moe::MQ_I4_A4_GFX1100_SYMBOL)?, block: 32 };
+        let mut mem = peacemaker_ir::emu::Memory::default();
+        let h_va = mem.map_guarded("h".into(), y_gu, EMU_GUARD)?;
+        let sorted_va = mem.map_guarded("sorted".into(), i32_le(sorted), EMU_GUARD)?;
+        let xd_len = (I / GROUP) * slots * REC;
+        let xd_va = mem.map_guarded("xq".into(), vec![0u8; xd_len], EMU_GUARD)?;
+        let s1 = mem.map_guarded("signs1".into(), f32_le(&signs.s1_128), EMU_GUARD)?;
+        let s2 = mem.map_guarded("signs2".into(), f32_le(&signs.s2_128), EMU_GUARD)?;
+        let kva = mem.map_guarded(
+            "kernarg".into(),
+            k3_kernarg(h_va, sorted_va, xd_va, s1, s2, rows as u32, slots as u32),
+            EMU_GUARD,
+        )?;
+        let wgs_k3: Vec<[u32; 3]> = gys
+            .iter()
+            .flat_map(|&gy| {
+                (gy * BLOCK_M..(gy + 1) * BLOCK_M)
+                    .flat_map(|p| (0..(I / GROUP) as u32).map(move |gg| [p as u32 * (I / GROUP) as u32 + gg, 0, 0]))
+            })
+            .collect();
+        let instr_k3 = run_k3
+            .exec(&mut mem, kva, &wgs_k3)
+            .map_err(|e| format!("panel {} K3 producer (P {rows}, L {slots}, xq {xd_len} B): {e}", panel.index))?;
+        let xd = region(&mem, "xq")?;
+        let k3_written = xd.written.count() as u64;
+        let xd = xd.bytes.clone();
+        drop(mem);
+
+        eprintln!("moe_route emu: panel {} K3 done wgs={} instr={instr_k3} t={:.1}s", panel.index, wgs_k3.len(), t_panel.elapsed().as_secs_f64());
+        // Launch C: down.
+        let run_down = EmuRun { emu: emu_make(&progs.gemm, DOWN_IU4)?, block: IU4_NT1_BLOCK[1] };
+        let mut mem = peacemaker_ir::emu::Memory::default();
+        let table = map_experts(&mut mem, sh.e, &dn_bytes)?;
+        let tiles_va = mem.map_guarded("tiles".into(), i32_le(tiles), EMU_GUARD)?;
+        let sorted_va = mem.map_guarded("sorted".into(), i32_le(sorted), EMU_GUARD)?;
+        let xq_va = mem.map_guarded("xq".into(), xd, EMU_GUARD)?;
+        let y_dn_len = rows * H * 2;
+        let y_va = mem.map_guarded("y".into(), vec![0u8; y_dn_len], EMU_GUARD)?;
+        let karg = gemm_kernarg(
+            table, tiles_va, sorted_va, xq_va, y_va,
+            [H as u32, I as u32, 1, rows as u32, slots as u32, sh.e as u32],
+        );
+        let kva = mem.map_guarded("kernarg".into(), karg, EMU_GUARD)?;
+        let wgs_dn = wg2(H / 64);
+        let instr_dn = run_down
+            .exec(&mut mem, kva, &wgs_dn)
+            .map_err(|e| format!("panel {} down (xq {xd_len} B, y {y_dn_len} B): {e}", panel.index))?;
+        let yd = region(&mem, "y")?;
+        let down_written = yd.written.count() as u64;
+        let y_down = yd.bytes.clone();
+        drop(mem);
+
+        eprintln!("moe_route emu: panel {} down done wgs={} instr={instr_dn} t={:.1}s", panel.index, wgs_dn.len(), t_panel.elapsed().as_secs_f64());
+        // Coverage and the exact-recipe check of every live row of the run tiles.
+        let nl = live.len() as u64;
+        for (what, got, need) in [
+            ("gate_up y", gate_written, nl * (I as u64) * 2),
+            ("K3 xq", k3_written, nl * ((I / GROUP) * REC) as u64),
+            ("down y", down_written, nl * (H as u64) * 2),
+        ] {
+            if got < need {
+                failures.push(format!("panel {}: {what} wrote {got} B, a run of {nl} live rows needs >= {need}", panel.index));
+            }
+        }
+        let refs: Vec<(usize, Vec<f32>)> = live
+            .par_iter()
+            .map(|&(r, slot, e)| {
+                let (gu, dn) = &weights[&e];
+                (r, a4_slot(&x_rows[&(slot / TOP)], gu, dn, &signs))
+            })
+            .collect();
+        let mut stat = RefStat::default();
+        for (r, a) in &refs {
+            let got: Vec<f32> = (0..H).map(|c| bf16_at(&y_down, r * H + c)).collect();
+            let af: Vec<f64> = a.iter().map(|v| f64::from(*v)).collect();
+            stat.add_slot(&got, &af);
+        }
+        let bound = self.tune.a4_recipe_bound;
+        if stat.nonfinite > 0 || !(stat.rel_l2() <= bound) {
+            failures.push(format!(
+                "panel {}: down output vs the exact A4 recipe rel_l2 {} (bound {bound}), {} non-finite",
+                panel.index,
+                stat.rel_l2(),
+                stat.nonfinite
+            ));
+        }
+        json["workgroups"] = json!({"gate_up": wgs_gate.len(), "k3": wgs_k3.len(), "down": wgs_dn.len()});
+        json["instructions"] = json!({"gate_up": instr_gate, "k3": instr_k3, "down": instr_dn});
+        json["bytes_written"] = json!({"gate_up_y": gate_written, "k3_xq": k3_written, "down_y": down_written});
+        json["vs_a4_recipe"] = stat.json(bound);
+        Ok(PanelEmu { json, stat, failures })
+    }
+
+    /// The pre-card emulator gate: the small shape in full, then the real shape's first / middle /
+    /// last panel at the grid extremes. Fails closed: any refusal, access outside a guarded buffer,
+    /// short coverage or recipe mismatch is a `fail`.
+    pub fn emu_gate(&self) -> Value {
+        let t0 = std::time::Instant::now();
+        if self.aa {
+            return json!({"status": "pass", "reason": "--null-control aa launches no PM kernel; the F16 \
+                chain is hipcc code (not emulated)"});
+        }
+        let progs = match emu_progs() {
+            Ok(p) => p,
+            Err(e) => return json!({"status": "fail", "reason": format!("emulator setup: {e}")}),
+        };
+        eprintln!("moe_route emu: objects lifted in {:.1}s", t0.elapsed().as_secs_f64());
+        let small = Shape {
+            t: 24,
+            e: 12,
+            distinct: 12,
+            panel_rows: 64,
+            bind: 2,
+            panels: PanelSel::All,
+            route: RouteKind::Uniform,
+            seed: self.shape.seed,
+        };
+        let mut cases = Vec::new();
+        let mut failures: Vec<String> = Vec::new();
+        let small_bench = Bench::from_parts(small, false, self.tune);
+        let real: Vec<usize> = {
+            let n = self.panels.len();
+            // Quartiles, and the panels that hold the smallest and largest slot ids of the window.
+            let slot_panel = |slot: usize| -> Option<usize> {
+                let row = self.grouping.sorted.iter().position(|s| *s >= 0 && *s as usize == slot)?;
+                self.panels.iter().position(|p| row >= p.row_base && row < p.row_base + p.rows)
+            };
+            let mut v = vec![0, n / 4, n / 2, 3 * n / 4, n.saturating_sub(1)];
+            v.extend(slot_panel(0));
+            v.extend(slot_panel(self.shape.slots() - 1));
+            v.sort_unstable();
+            v.dedup();
+            v
+        };
+        let plan: Vec<(&str, &Bench, Vec<usize>, bool)> = match &small_bench {
+            Ok(b) => vec![
+                ("small_full", b, (0..b.panels.len()).collect(), true),
+                ("real_sampled", self, real, false),
+            ],
+            Err(_) => vec![("real_sampled", self, real, false)],
+        };
+        if let Err(e) = &small_bench {
+            failures.push(format!("small shape: {e}"));
+        }
+        for (name, b, idx, full) in plan {
+            let mut panels = Vec::new();
+            let mut agg = RefStat::default();
+            for i in idx {
+                match b.emu_panel(&progs, &b.panels[i], full) {
+                    Ok(p) => {
+                        failures.extend(p.failures.iter().map(|f| format!("{name}: {f}")));
+                        agg.n += p.stat.n;
+                        agg.sum_d2 += p.stat.sum_d2;
+                        agg.sum_r2 += p.stat.sum_r2;
+                        agg.max_abs = agg.max_abs.max(p.stat.max_abs);
+                        panels.push(p.json);
+                    }
+                    Err(e) => {
+                        let e = e.split(" | ").next().unwrap_or(&e).to_owned();
+                        failures.push(format!("{name}: {e}"));
+                        panels.push(json!({"panel": b.panels[i].index, "error": e}));
+                    }
+                }
+            }
+            cases.push(json!({"name": name, "shape": b.shape_json()["schedule"].clone(),
+                "T": b.shape.t, "E": b.shape.e, "full_grid": full, "panels": panels,
+                "vs_a4_recipe": agg.json(self.tune.a4_recipe_bound)}));
+        }
+        json!({
+            "status": if failures.is_empty() { "pass" } else { "fail" },
+            "reason": if failures.is_empty() { "ok".to_owned() } else { failures.join(" | ") },
+            "emulated": ["qwen4_moe_gate_up_silu_iu4_sym_pm_gfx1100", "mq_i4_a4_r128_k640_gfx1100",
+                         "qwen4_moe_down_iu4_sym_pm_gfx1100"],
+            "not_emulated": ["mq_rotate_x_i4 (hipcc window producer; sidecar from the host recipe)",
+                             "the F16 arm (hipcc kernels)"],
+            "model": "peacemaker emulator, gfx1100 program on the gfx1151 model (gfx1100_as_gfx1151), strict LDS; \
+                      exact-size guarded buffers (every access past an end is an error)",
+            "guard_bytes": EMU_GUARD,
+            "cases": cases,
+            "seconds": t0.elapsed().as_secs_f64(),
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Driver
 
-/// CLI admission (called by `parse_args`): this kernel is gfx1100 only and has no `.rip`, emulator
-/// or candidate-object medium.
-pub fn check_cli(arch: &str, emu: bool) -> Result<()> {
+/// CLI admission (called by `parse_args`): this kernel is gfx1100 only and has no `.rip` or
+/// candidate-object medium. `--emu` is accepted: the emulator gate always runs before a device is
+/// opened (and on request with `--offline`).
+pub fn check_cli(arch: &str, _emu: bool) -> Result<()> {
     if arch != ARCH {
         return Err(format!(
             "--kernel {KERNEL} is gfx1100 only: pass --arch {ARCH} (got --arch {arch})"
         ));
-    }
-    if emu {
-        return Err(format!("--emu is not supported with --kernel {KERNEL}"));
     }
     Ok(())
 }
@@ -2245,6 +2755,17 @@ pub fn run(o: &mut Opts) -> (Value, Outcome) {
     rec["chain"] = bench.plan_json();
     if let Err(r) = objects_record(&bench, o, &mut rec) {
         return r;
+    }
+    // Pre-card gate: GPU mode ALWAYS runs it (fail closed, before `Gpu::init`); `--offline` only
+    // with `--emu`.
+    if o.emu || !o.offline {
+        let gate = bench.emu_gate();
+        let pass = gate["status"] == "pass";
+        let reason = gate["reason"].as_str().unwrap_or("").to_owned();
+        rec["emu_gate"] = gate;
+        if !pass {
+            return crate::fail(rec, "emu_gate", reason);
+        }
     }
     if o.offline {
         rec["offline"] = json!(true);
@@ -2598,7 +3119,6 @@ mod tests {
         for bad in [
             "--kernel qwen4_moe_route",
             "--kernel qwen4_moe_route --arch gfx1151",
-            "--kernel qwen4_moe_route --arch gfx1100 --emu",
             "--kernel qwen4_moe_route --arch gfx1100 --rip x.rip",
         ] {
             assert!(args(bad).is_err(), "{bad}");
@@ -2694,5 +3214,78 @@ mod tests {
         assert!(s.rel_l2() < DEFAULT_A4_BOUND, "{}", s.rel_l2());
         // BF16-valued output.
         assert!(a.iter().all(|v| bf16_bits(*v) == bf16_bits(bf16r(*v))));
+    }
+
+    fn small_shape() -> Shape {
+        Shape {
+            t: 24,
+            e: 12,
+            distinct: 12,
+            panel_rows: 64,
+            bind: 2,
+            panels: PanelSel::All,
+            route: RouteKind::Uniform,
+            seed: DEFAULT_SEED,
+        }
+    }
+
+    #[test]
+    fn from_parts_refuses_shapes_the_route_generator_cannot_serve() {
+        let tune = bench("fn,panels=1").tune;
+        let mut s = small_shape();
+        s.e = TOP - 1; // TOP distinct experts per token cannot be drawn: would loop forever
+        assert!(Bench::from_parts(s, false, tune).is_err());
+        let mut s = small_shape();
+        s.bind = 0;
+        assert!(Bench::from_parts(s, false, tune).is_err());
+        assert!(Bench::from_parts(small_shape(), false, tune).is_ok());
+    }
+
+    #[test]
+    fn tile_sample_includes_the_slot_extremes_and_pad_tiles() {
+        // 8 tiles; tile 5 holds the largest slot, tile 6 the smallest, tile 3 has a pad row.
+        let mut sorted = vec![100i32; 8 * BLOCK_M];
+        for (i, s) in sorted.iter_mut().enumerate() {
+            *s = 100 + i as i32;
+        }
+        sorted[5 * BLOCK_M] = 9_999;
+        sorted[6 * BLOCK_M] = 1;
+        sorted[3 * BLOCK_M + 4] = -1;
+        let t = tile_sample(&sorted, 8);
+        for want in [0, 1, 3, 4, 5, 6, 7] {
+            assert!(t.contains(&want), "{want} in {t:?}");
+        }
+        assert!(t.windows(2).all(|w| w[0] < w[1]), "sorted unique {t:?}");
+    }
+
+    /// The K3 producer's record index peaks where the largest slot meets the highest epoch group:
+    /// the panel holding slot S-1 at the real window must run clean (it faulted before the
+    /// generator fix; `peacemaker-isa/tests/mq_i4_a4_gfx1100_xq_extent.rs` pins the instruction order).
+    #[test]
+    fn emulator_gate_runs_the_real_windows_largest_slot_panel_clean() {
+        let b = bench("fn");
+        let progs = emu_progs().unwrap();
+        let row = b.grouping.sorted.iter().position(|s| *s as usize == b.shape.slots() - 1).unwrap();
+        let panel = *b
+            .panels
+            .iter()
+            .find(|p| row >= p.row_base && row < p.row_base + p.rows)
+            .unwrap();
+        let r = b.emu_panel(&progs, &panel, false).expect("guarded exact-size buffers: no stray access");
+        assert!(r.failures.is_empty(), "{:?}", r.failures);
+        // The device recipe is bit-exact against the CPU A4 recipe here (the fold is exact int32).
+        assert_eq!(r.stat.rel_l2(), 0.0);
+        assert!(r.stat.n > 0);
+    }
+
+    #[test]
+    fn emulator_gate_small_shape_full_grid_is_bit_exact() {
+        let b = Bench::from_parts(small_shape(), false, bench("fn,panels=1").tune).unwrap();
+        let progs = emu_progs().unwrap();
+        for p in b.panels.iter().take(2) {
+            let r = b.emu_panel(&progs, p, true).unwrap();
+            assert!(r.failures.is_empty(), "{:?}", r.failures);
+            assert_eq!(r.stat.rel_l2(), 0.0);
+        }
     }
 }
