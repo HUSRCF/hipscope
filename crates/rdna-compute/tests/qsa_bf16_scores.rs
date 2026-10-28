@@ -455,7 +455,22 @@ fn qsa_bf16_score_kernels_match_fused_scores_bit_for_bit() {
     }
     let mut cells_checked = 0usize;
     let mut cases = 0usize;
+    // `QSA_SCORES_BLOCKS=255,257,...` restricts the block counts (to split this exhaustive gate across bounded card
+    // jobs); unset = every block count. Each block count prints its own elapsed time.
+    let block_filter: Option<Vec<usize>> = std::env::var("QSA_SCORES_BLOCKS").ok().map(|s| {
+        s.split(',')
+            .map(|b| {
+                b.trim()
+                    .parse()
+                    .expect("QSA_SCORES_BLOCKS: comma-separated block counts")
+            })
+            .collect()
+    });
     for blocks in [255usize, 257, 2048, 8192, 32768, 65536] {
+        if block_filter.as_ref().is_some_and(|f| !f.contains(&blocks)) {
+            continue;
+        }
+        let block_t0 = std::time::Instant::now();
         for kind in [Keys::Dense, Keys::Ties, Keys::Wide] {
             let pooled = upload_bf16(&mut gpu, &keys_bf16(kind, blocks, blocks));
             for rows in 1..=WIDE_VERIFY_MAX_ROWS {
@@ -603,6 +618,10 @@ fn qsa_bf16_score_kernels_match_fused_scores_bit_for_bit() {
             );
             gpu.free_tensor(pooled).expect("free pooled");
         }
+        println!(
+            "blocks={blocks}: done in {:.1} s ({cases} launches so far)",
+            block_t0.elapsed().as_secs_f64()
+        );
     }
     println!("{cases} score launches bit-exact over {cells_checked} cells");
 }
