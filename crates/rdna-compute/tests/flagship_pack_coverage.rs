@@ -140,7 +140,7 @@ fn fixture_holds_complete_measured_sets_for_all_six_routes() {
             "27b-mtp" => (92, 10),
             "fn-ar" => (68, 4),
             "fn-mtp" => (69, 4),
-            "a3b-ar" => (37, 10),
+            "a3b-ar" => (38, 10),
             _ => unreachable!(),
         };
         assert_eq!((hip, emb), measured, "{route}: measured set changed");
@@ -200,6 +200,32 @@ fn assert_measured_hip_modules_registered(arch: &str, fixture: &str) {
         "pack coverage regressions:\n{}",
         failures.join("\n")
     );
+}
+
+/// hipcc modules the A3B mq4rs AR decode loads that were added after the v0.4.4
+/// measurement. A release binary on a host without hipcc binds only packed
+/// kernels, so each must be registered for gfx1201 (the set
+/// `hipfire-kernel-pack` compiles) AND listed in the `a3b-ar` route of the
+/// fixture with its exact source SHA-256 (the registry test above then pins
+/// symbol, flags and source). A module missing from either fails here.
+const A3B_AR_POST_MEASUREMENT_HIP_MODULES: [&str; 1] =
+    ["fused_rmsnorm_proj4_mq4g256v2_fold_gfx1201"];
+
+#[test]
+fn a3b_ar_post_measurement_decode_modules_ship_in_the_gfx1201_pack() {
+    let registry = entries("gfx1201", EXTRA_FLAGS).unwrap();
+    let rows = rows();
+    for module in A3B_AR_POST_MEASUREMENT_HIP_MODULES {
+        assert!(
+            registry.iter().any(|e| e.module == module),
+            "{module}: not registered for gfx1201 (a pack-only host cannot bind it)"
+        );
+        assert!(
+            rows.iter()
+                .any(|r| r.route == "a3b-ar" && r.kind == "hip" && r.module == module),
+            "{module}: missing from the a3b-ar route of flagship-pack-gfx1201.tsv"
+        );
+    }
 }
 
 #[test]
