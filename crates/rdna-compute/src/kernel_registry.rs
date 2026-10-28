@@ -7788,12 +7788,12 @@ fn walked_arch_images(arch: &str) -> &'static [&'static [u8]] {
             kernels::E8P_I4_MOE_GEMV_PM_GFX1100,
             kernels::MQ_I4_A4_PM_GFX1100,
             kernels::GEMM_MQ4G256V2_RESIDUAL_IU4_PM_GFX1100,
+            kernels::GEMM_MQ6G256V2_RESIDUAL_PM_GFX1100,
             kernels::EP_TILE_MASK_PM_GFX1100,
             kernels::EP_TILE_PULL_PM_GFX1100,
             kernels::EP_TILE_PULL_N8_PM_GFX1100,
         ],
         "gfx1151" => &[
-            kernels::GEMM_MQ6G256V2_RESIDUAL_PM_GFX1100,
             kernels::NPU_TRUNK_PM_GFX1151,
             kernels::NPU_TRUNK_ARENA_PM_GFX1151,
             kernels::QWEN4_MOE_IU4_SYM_PM_GFX1151,

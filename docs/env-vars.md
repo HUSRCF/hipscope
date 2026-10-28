@@ -1961,8 +1961,8 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_MQ6_FP8_SPLIT` | crates/rdna-compute/src/gemm_mq6_fp8.rs, crates/rdna-compute/src/kernels.rs | developer |
 | `HIPFIRE_MQ6_I8` | crates/rdna-compute/src/feature_flags.rs, crates/rdna-compute/src/gemm_mq6_i8.rs | developer |
 | `HIPFIRE_MQ6_I8_PM` | crates/rdna-compute/examples/mq6_fp8_gemm_bench.rs, crates/rdna-compute/src/feature_flags.rs | developer |
-| `HIPFIRE_MQ6_ROWS_SPLIT` | crates/rdna-compute/examples/mq6_rows_split_oracle.rs, crates/rdna-compute/src/feature_flags.rs | developer |
 | `HIPFIRE_MQ6_RESID_PM_GFX1100` | crates/rdna-compute/src/gemm.rs, crates/rdna-compute/src/kernels.rs | developer |
+| `HIPFIRE_MQ6_ROWS_SPLIT` | crates/rdna-compute/examples/mq6_rows_split_oracle.rs, crates/rdna-compute/src/feature_flags.rs | developer |
 | `HIPFIRE_MQV2_BT_SCREEN_BITS3` | crates/rdna-compute/examples/test_mqv2_bt_gfx11.rs | harness |
 | `HIPFIRE_MQV2_GFX11_SCREEN` | crates/rdna-compute/src/gemm.rs | developer |
 | `HIPFIRE_MQV2_GFX11_WMMA` | crates/hipfire-arch-qwen35/src/qwen35/prefill.rs, crates/hipfire-runtime/src/llama.rs | developer |
