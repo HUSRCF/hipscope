@@ -34,6 +34,7 @@ import os
 import pathlib
 import signal
 import subprocess
+import sys
 import threading
 import time
 
@@ -267,6 +268,8 @@ def main():
                 pass
 
     atexit.register(kill_daemon)
+    # A SIGTERM (fabric max-secs expiry) must unwind through atexit, or the daemon would keep the card.
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
     watchdog = threading.Timer(a.timeout, kill_daemon)
     watchdog.daemon = True
     watchdog.start()

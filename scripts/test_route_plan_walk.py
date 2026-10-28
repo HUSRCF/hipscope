@@ -138,6 +138,36 @@ class FakeDaemonWalk(unittest.TestCase):
                     time.sleep(0.1)
                 os.kill(pid, 0)
 
+    def test_sigterm_of_the_walker_kills_the_daemon(self):
+        import signal
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            prompt_dir(root)
+            daemon = root / "fake-daemon"
+            daemon.write_text(FAKE)
+            daemon.chmod(0o755)
+            pid_file = root / "daemon.pid"
+            walker = subprocess.Popen(
+                [sys.executable, str(HERE / "route_plan_walk.py"), "--run", str(root / "run"), "--daemon", str(daemon),
+                 "--model", "/nonexistent", "--route", "ar", "--profile", "xtx-fn-bounded", "--prompt-dir",
+                 str(root / "prompts"), "--timeout", "120"],
+                env={**os.environ, "FAKE_PID_FILE": str(pid_file), "FAKE_HANG_AFTER": "2"},
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            for _ in range(100):
+                if pid_file.exists() and pid_file.read_text():
+                    break
+                time.sleep(0.1)
+            time.sleep(1.0)
+            pid = int(pid_file.read_text())
+            os.kill(pid, 0)
+            walker.send_signal(signal.SIGTERM)
+            self.assertEqual(walker.wait(timeout=20), 143)
+            with self.assertRaises(ProcessLookupError):
+                for _ in range(50):
+                    os.kill(pid, 0)
+                    time.sleep(0.1)
+                os.kill(pid, 0)
+
 
 if __name__ == "__main__":
     unittest.main()
