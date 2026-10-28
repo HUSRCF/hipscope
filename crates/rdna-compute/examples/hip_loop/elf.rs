@@ -316,12 +316,14 @@ impl KernelInfo {
         })
     }
 
-    /// Waves per SIMD the VGPR budget allows on gfx11 (1536 VGPR per SIMD lane
-    /// in wave32 mode, allocation granule 8, 16 wave slots). LDS and workgroup
-    /// size can only lower it further.
+    /// Waves per SIMD the VGPR budget allows on gfx11/gfx12 (1536 VGPR per SIMD lane in wave32
+    /// mode, allocation granule 8, 16 wave slots; a wave64 holds each VGPR for both halves of
+    /// the SIMD32, so it costs twice the wave32 allocation). LDS and workgroup size can only
+    /// lower it further.
     pub fn occupancy_waves_per_simd(&self) -> u64 {
         let alloc = self.vgprs.max(1).div_ceil(8) * 8;
-        (1536 / alloc).min(16)
+        let per_wave = if self.wavefront_size == 64 { alloc * 2 } else { alloc };
+        (1536 / per_wave).min(16)
     }
 
     pub fn spill(&self) -> u64 {
@@ -342,7 +344,11 @@ impl KernelInfo {
             "sgpr_spill": self.sgpr_spill,
             "code_bytes": self.code_bytes,
             "occupancy_waves_per_simd": self.occupancy_waves_per_simd(),
-            "occupancy_basis": "vgpr (gfx11 wave32: 1536 VGPR/SIMD, granule 8, 16 slots)",
+            "occupancy_basis": if self.wavefront_size == 64 {
+                "vgpr (wave64: 2 x the wave32 allocation; 1536 VGPR/SIMD, granule 8, 16 slots)"
+            } else {
+                "vgpr (gfx11 wave32: 1536 VGPR/SIMD, granule 8, 16 slots)"
+            },
             "wavefront_size": self.wavefront_size,
             "max_flat_workgroup_size": self.max_flat_workgroup_size,
             "kernarg_bytes": self.kernarg_bytes,

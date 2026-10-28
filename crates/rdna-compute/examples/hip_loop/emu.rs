@@ -25,7 +25,7 @@
 #![allow(dead_code)]
 
 use crate::elf::sha256_hex;
-use crate::node::{EmuArg, EmuCase, Geometry, Result, Xs64};
+use crate::node::{EmuArg, EmuCase, Geometry, Result, Xs64, PAD_OWNER};
 use peacemaker_ir::emu::{Emulator, Launch, Memory, WriteSet};
 use peacemaker_ir::inst::{Abi, Frontend};
 use serde_json::{json, Value};
@@ -83,6 +83,7 @@ fn kernarg_bytes(
         let (off, size) = (a.offset as usize, a.size as usize);
         let bytes: Vec<u8> = match v {
             EmuArg::Buf(b) => addrs.get(*b).ok_or("abi: argument names a missing buffer")?.to_le_bytes().to_vec(),
+            EmuArg::BufOff(b, off) => (addrs.get(*b).ok_or("abi: argument names a missing buffer")? + off).to_le_bytes().to_vec(),
             EmuArg::Null => 0u64.to_le_bytes().to_vec(),
             EmuArg::I32(x) => x.to_le_bytes().to_vec(),
             EmuArg::U32(x) => x.to_le_bytes().to_vec(),
@@ -131,6 +132,81 @@ fn lift(image: &[u8]) -> Result<(peacemaker_ir::Program, &'static str)> {
         }
     }
     Err(format!("lift refused the object ({})", errs.join("; ")))
+}
+
+/// The wavefront size (32 or 64) of `symbol`'s kernel in a lifted program.
+fn kernel_wave(program: &peacemaker_ir::Program, symbol: &str) -> Option<u32> {
+    use peacemaker_ir::inst::Wave;
+    program.kernels.iter().find(|k| k.symbol.0 == symbol).map(|k| match k.wave {
+        Wave::Wave32 => 32,
+        Wave::Wave64 => 64,
+    })
+}
+
+/// The receipt's `numerics_model` for an arm (`arch` from the lifted program).
+fn numerics_model(arm: &Value) -> Value {
+    match arm["arch"].as_str() {
+        None | Some("Gfx1100") => json!("gfx1100 program decoded with gfx1100 tables; WMMA/transcendental/NaN rules of the gfx1151 model (both arms identical; no claim about gfx1100 hardware ulps)"),
+        Some(arch) => json!(format!(
+            "{arch} program decoded and executed with its own tables and the emulator's native {arch} model (wave size {} from the kernel descriptor; both arms identical)",
+            arm["wave"]
+        )),
+    }
+}
+
+/// The static hazard checks on one kernel of an object: `peacemaker_lift::hazards_gfx11` (every
+/// non-advisory finding, i.e. Required or Unchecked, fails) and `peacemaker_ir::passes::hazards::analyze`
+/// (an analysis error, or any obligation it reports, fails; the object's own arch and wave size
+/// are used). `pass` is the verdict; the receipt carries every finding and the analysis result.
+pub fn hazards(image: &[u8], symbol: &str) -> (bool, Value) {
+    use peacemaker_ir::passes::hazards as pm;
+    use peacemaker_lift::hazards_gfx11::{check_kernel, Severity};
+    let (program, frontend) = match lift(image) {
+        Ok(l) => l,
+        Err(e) => return (false, json!({"pass": false, "reason": format!("lift: {e}")})),
+    };
+    let arch = program.target.arch;
+    let Some(kernel) = program.kernels.iter().find(|k| k.symbol.0 == symbol) else {
+        return (false, json!({"pass": false, "reason": format!("the object does not define `{symbol}`")}));
+    };
+    let findings = check_kernel(kernel, arch, true);
+    let blocking: Vec<&_> = findings.iter().filter(|f| f.severity != Severity::Advisory).collect();
+    let advisory = findings.len() - blocking.len();
+    let analysis = pm::analyze(&kernel.body, arch, kernel.wave);
+    let mut reasons: Vec<String> = Vec::new();
+    if !blocking.is_empty() {
+        reasons.push(format!("{} required/unchecked hazard finding(s)", blocking.len()));
+    }
+    let replay = match &analysis {
+        Ok(a) => {
+            if !a.obligations.is_empty() {
+                reasons.push(format!("{} hazard obligation(s) from the PM IR replay", a.obligations.len()));
+            }
+            json!({"count": a.obligations.len(), "obligations": a.obligations.iter().map(|o| {
+                let pc = o.insts.first().and_then(|id| kernel.body.insts.get(*id)).and_then(|i| i.prov.pc);
+                json!({"rule_id": o.rule_id, "pc": pc.map(|p| format!("{p:#x}")), "text": o.text})
+            }).collect::<Vec<_>>()})
+        }
+        Err(e) => {
+            reasons.push(format!("hazard analysis error: {e}"));
+            json!({"error": e.to_string()})
+        }
+    };
+    let pass = reasons.is_empty();
+    (
+        pass,
+        json!({
+            "pass": pass,
+            "reason": if pass { Value::Null } else { json!(reasons.join("; ")) },
+            "arch": format!("{arch:?}"),
+            "wave": kernel_wave(&program, symbol),
+            "frontend": frontend,
+            "findings_blocking": blocking.iter().map(|f| f.to_json()).collect::<Vec<_>>(),
+            "findings_advisory_count": advisory,
+            "pm_ir_hazard_replay": replay,
+            "checker": "peacemaker_lift::hazards_gfx11::check_kernel + peacemaker_ir::passes::hazards::analyze",
+        }),
+    )
 }
 
 /// Which workgroups of the launch grid an arm runs.
@@ -211,6 +287,8 @@ fn exec_arm(
     let mut info = json!({"tag": tag, "symbol": symbol, "object_sha256": sha256_hex(image)});
     let (program, frontend) = lift(image).map_err(|e| fail(format!("lift: {e}"), info.clone()))?;
     info["frontend"] = json!(frontend);
+    info["arch"] = json!(format!("{:?}", program.target.arch));
+    info["wave"] = json!(kernel_wave(&program, symbol));
     let kernel = program
         .kernels
         .iter()
@@ -416,7 +494,7 @@ pub fn gate(
         "seed": seed,
         "strict_lds": true,
         "guard_bytes": GUARD_BYTES,
-        "numerics_model": "gfx1100 program decoded with gfx1100 tables; WMMA/transcendental/NaN rules of the gfx1151 model (both arms identical; no claim about gfx1100 hardware ulps)",
+        "numerics_model": numerics_model(&arm_json(&b)),
         "instructions": {"baseline": bn.0, "candidate": cn.0},
         "workgroups": {"baseline": bn.1, "candidate": cn.1},
         "arms": {"baseline": arm_json(&b), "candidate": arm_json(&c)},
@@ -566,6 +644,9 @@ pub fn extent_gate(
     }
     let mut sel_c = vec![false; grid_len(gc)];
     for e in 0..nelem {
+        if (base.2)(e) == PAD_OWNER {
+            continue;
+        }
         let Some(lb) = lin(gb, (base.2)(e)) else {
             return stop(&mut rec, format!("baseline geometry does not cover output element {e}"));
         };
@@ -581,6 +662,9 @@ pub fn extent_gate(
     let mut sel_b2 = vec![false; grid_len(gb)];
     let mut n_e = 0usize;
     for e in 0..nelem {
+        if (base.2)(e) == PAD_OWNER || (cand.2)(e) == PAD_OWNER {
+            continue;
+        }
         let Some(lc) = lin(gc, (cand.2)(e)) else {
             return stop(&mut rec, format!("candidate geometry does not cover output element {e} (owner {:?}, grid {gc:?})", (cand.2)(e)));
         };
@@ -617,6 +701,15 @@ pub fn extent_gate(
     let mut sha_c = sha2::Sha256::default();
     let mut changed = false;
     for e in 0..nelem {
+        if (base.2)(e) == PAD_OWNER || (cand.2)(e) == PAD_OWNER {
+            for (arm, wr) in [("baseline", wrb), ("candidate", wrc)] {
+                if (0..4).any(|k| wr.contains(e * 4 + k)) {
+                    rec["identical_to_baseline"] = json!(false);
+                    return stop(&mut rec, format!("{arm} wrote the pad element {e} between packed output segments (an out-of-segment store)"));
+                }
+            }
+            continue;
+        }
         for (arm, wr, grid, owner, list) in [
             ("baseline", wrb, gb, base.2, &sel_b2),
             ("candidate", wrc, gc, cand.2, &sel_c),

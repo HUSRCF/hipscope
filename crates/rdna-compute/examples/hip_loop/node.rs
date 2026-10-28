@@ -28,7 +28,8 @@ pub fn err<E: std::fmt::Display>(e: E) -> String {
     e.to_string()
 }
 
-/// The only arch `hip_loop` targets and times on.
+/// The arch of the original `hip_loop` nodes (`mq6_res`, `hc_mix`, `qsa_hg4`); a node overrides
+/// [`Node::arch`] (the lane nodes are gfx1201).
 pub const ARCH: &str = "gfx1100";
 
 /// What the production JIT compiles for the incumbent: the module name the
@@ -80,6 +81,9 @@ pub struct Work {
 pub enum EmuArg {
     /// Pointer to `EmuCase::bufs[i]` (resolved to the emulator address of that region).
     Buf(usize),
+    /// Pointer `byte_offset` bytes into `EmuCase::bufs[i]` (a node that packs several output
+    /// segments into one emulator region, separated by [`PAD_WORDS`] unwritten pad words).
+    BufOff(usize, u64),
     /// A pointer argument that is null on the card too.
     Null,
     I32(i32),
@@ -102,6 +106,20 @@ pub struct EmuCase {
     pub bufs: Vec<EmuBuf>,
     pub args: Vec<EmuArg>,
     pub out: usize,
+}
+
+/// Output-owner map value of an element no workgroup may write (the unwritten pad between packed
+/// output segments); an arm that writes it fails the gate.
+pub const PAD_OWNER: [u32; 3] = [u32::MAX; 3];
+/// Pad words (poison, never written by a correct kernel) after every packed output segment.
+pub const PAD_WORDS: usize = 256;
+
+/// One arm's code object plus its candidate header, for a node's own device-side identity matrix.
+pub struct ArmImage<'a> {
+    pub tag: &'a str,
+    pub image: &'a [u8],
+    /// The `// hip_loop:` header (empty for the incumbent: production geometry).
+    pub header: &'a Header,
 }
 
 /// One hipcc incumbent at one shape.
@@ -169,6 +187,46 @@ pub trait Node {
     /// The output bytes the identity gate compares (after a `reset` + `dispatch`
     /// + device sync).
     fn read_output(&self, gpu: &Gpu) -> Result<Vec<u8>>;
+    /// The arch this node's incumbent is built for and judged on (`hipcc --offload-arch`, the
+    /// device the GPU mode demands). Default gfx1100.
+    fn arch(&self) -> &'static str {
+        ARCH
+    }
+    /// Called by the driver before every timed dispatch number `i` (0-based, across both arms):
+    /// the node may re-point `karg` at another weight set of its pool.
+    fn select_set(&self, _karg: &mut [u8], _i: usize) {}
+    /// The shape asked for a cache flush between timed dispatches (`flush=1`).
+    fn flush_requested(&self) -> bool {
+        false
+    }
+    /// `--emu` also runs the static hazard checks (`peacemaker_lift::hazards_gfx11` +
+    /// `peacemaker_ir::passes::hazards::analyze`) on the arms' objects and fails the gate on the
+    /// candidate's findings. Default off (the gfx1100 nodes' gate is unchanged).
+    fn static_hazards(&self) -> bool {
+        false
+    }
+    /// Shapes (`--shape` strings of this node) whose adversarial matrix `--identity-only` runs; empty: the
+    /// node's own shape only.
+    fn identity_shapes(&self) -> Vec<String> {
+        Vec::new()
+    }
+    /// The extent cases run EVERY workgroup of the production grids and compare the whole output
+    /// (`--emu-extent` overrides); default: sampled workgroups with the output-owner closure.
+    fn extent_full_default(&self) -> bool {
+        false
+    }
+    /// Extra device-side identity of a node (an adversarial input matrix run through both arms
+    /// and a CPU reference), run after the basic identity passed and before timing. `Ok(None)`:
+    /// the node has none. The returned JSON carries `pass` (bool).
+    fn adversarial(
+        &mut self,
+        _gpu: &Gpu,
+        _base: &ArmImage,
+        _cand: &ArmImage,
+        _seed: u64,
+    ) -> Result<Option<Value>> {
+        Ok(None)
+    }
     /// Free device buffers (DeviceBuffer has no Drop).
     fn teardown(&mut self, gpu: &Gpu);
 }

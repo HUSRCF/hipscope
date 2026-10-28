@@ -62,14 +62,19 @@ pub fn isolate_caches(workdir: &Path) -> Result<()> {
 }
 
 /// Compile `source` as the incumbent's module (same module name, so the same
-/// module flags, same `extra_flags`) into `workdir/<tag>/`.
+/// module flags, same `extra_flags`) into `workdir/<tag>/`, for gfx1100.
 pub fn compile(workdir: &Path, tag: &str, inc: &Incumbent, source: &str) -> Result<Built> {
+    compile_for(ARCH, workdir, tag, inc, source)
+}
+
+/// [`compile`] for `arch` (the node's own arch).
+pub fn compile_for(arch: &str, workdir: &Path, tag: &str, inc: &Incumbent, source: &str) -> Result<Built> {
     let dir = workdir.join(tag);
     std::fs::create_dir_all(&dir).map_err(err)?;
     let src = dir.join(format!("{}.hip", inc.module));
     let obj = dir.join(format!("{}.hsaco", inc.module));
     let _ = std::fs::remove_file(&obj);
-    let kc = KernelCompiler::new(ARCH, inc.extra_flags.clone()).map_err(err)?;
+    let kc = KernelCompiler::new(arch, inc.extra_flags.clone()).map_err(err)?;
     kc.compile_to_paths(&inc.module, source, &src, &obj)
         .map_err(|e| format!("{tag}: {e}"))?;
     let argv = kc.jit_argv(&inc.module, source, &src, &obj);
@@ -77,7 +82,7 @@ pub fn compile(workdir: &Path, tag: &str, inc: &Incumbent, source: &str) -> Resu
     if image.is_empty() {
         return Err(format!("{tag}: the compiler wrote an empty object"));
     }
-    let kernels = elf::kernels(&image, ARCH).map_err(|e| format!("{tag}: {e}"))?;
+    let kernels = elf::kernels(&image, arch).map_err(|e| format!("{tag}: {e}"))?;
     Ok(Built {
         tag: tag.to_owned(),
         image_sha256: elf::sha256_hex(&image),
@@ -112,11 +117,16 @@ pub fn hipcc_available() -> bool {
 /// A prebuilt candidate code object (ELF `.co` or offload bundle): inspected,
 /// not compiled. `argv` is empty and `source_path` is the object itself.
 pub fn from_object(tag: &str, path: &Path) -> Result<Built> {
+    from_object_for(ARCH, tag, path)
+}
+
+/// [`from_object`] for `arch` (the node's own arch).
+pub fn from_object_for(arch: &str, tag: &str, path: &Path) -> Result<Built> {
     let image = std::fs::read(path).map_err(|e| format!("{tag}: read {}: {e}", path.display()))?;
     if image.is_empty() {
         return Err(format!("{tag}: {} is empty", path.display()));
     }
-    let kernels = elf::kernels(&image, ARCH).map_err(|e| format!("{tag}: {}: {e}", path.display()))?;
+    let kernels = elf::kernels(&image, arch).map_err(|e| format!("{tag}: {}: {e}", path.display()))?;
     Ok(Built {
         tag: tag.to_owned(),
         image_sha256: elf::sha256_hex(&image),
@@ -146,6 +156,18 @@ pub fn sidecar_json(
     source: &str,
     header: &BTreeMap<String, String>,
 ) -> serde_json::Value {
+    sidecar_json_for(ARCH, node, inc, b, source, header)
+}
+
+/// [`sidecar_json`] for `arch` (the node's own arch).
+pub fn sidecar_json_for(
+    arch: &str,
+    node: &str,
+    inc: &Incumbent,
+    b: &Built,
+    source: &str,
+    header: &BTreeMap<String, String>,
+) -> serde_json::Value {
     let kernels: serde_json::Map<String, serde_json::Value> = b
         .kernels
         .iter()
@@ -166,7 +188,7 @@ pub fn sidecar_json(
         "node": node,
         "module": inc.module,
         "symbol": inc.symbol,
-        "arch": ARCH,
+        "arch": arch,
         "source_sha256": elf::sha256_hex(source.as_bytes()),
         "toolchain_id": KernelCompiler::local_toolchain_id(),
         "object_sha256": b.image_sha256,

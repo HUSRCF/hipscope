@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Kaden Schutt
 
-//! hip_loop: the PM-KRSI judge for hipcc incumbents on gfx1100 (7900 XTX). A
+//! hip_loop: the PM-KRSI judge for hipcc incumbents on gfx1100 (7900 XTX; the two lane nodes on gfx1201, R9700). A
 //! candidate is a complete HIP source file that defines the incumbent's kernel
 //! symbol with the identical signature and launch contract. Prints ONE JSON
 //! object (schema 1) on stdout.
 //!
 //! ```text
-//! hip_loop --node mq6_res|hc_mix|qsa_hg4 [--shape k=v,...] --cand FILE.hip
+//! hip_loop --node mq6_res|hc_mix|qsa_hg4|lane_proj|lane_wo [--shape k=v,...] --cand FILE.hip
 //!          [--offline] [--null-control aa] [--time N] [--rounds R] [--seed S] [--out DIR]
 //! ```
 //!
@@ -45,7 +45,7 @@
 //!   `baseline`/`candidate` = `{code_sha256 (the kernel symbol's .text), vgprs,
 //!   sgprs, lds_bytes, scratch_bytes, spill, code_bytes, occupancy_waves_per_simd,
 //!   geometry, ...}`.
-//! * GPU mode (a gfx1100 device; anything else is refused before any timing):
+//! * GPU mode (a device of the node's arch, gfx1100; the lane nodes gfx1201; anything else is refused before any timing):
 //!   seeded valid inputs, an identity run (outputs reset from a pristine copy
 //!   before every dispatch; bit-identical bytes required, `identical_to_baseline`),
 //!   then `--rounds R` ABBA rounds of `--time N` launches per block, hipEvent
@@ -89,12 +89,42 @@
 //!   appears at production extents is an unmapped access (or a diff) here. Receipt per case: label, shape, grids,
 //!   sampled workgroup counts, elements compared, instructions, output sha256 of the compared elements.
 //!
+//! * LANE NODES (`lane_proj`, `lane_wo`: the A3B exact batch-route lane kernels of the R9700, gfx1201; see
+//!   `hip_loop/{lane_proj,lane_wo,lane_common,lane_ref}.rs` and `hip_loop/incumbents/`). The node, not the tool,
+//!   names the arch: these two are gfx1201 (offline compile for gfx1201, GPU mode refuses any other device),
+//!   the three nodes above stay gfx1100 and unchanged. The incumbents are the shipped sources exactly as the
+//!   runtime compiles them (`hip_loop/incumbents/{lane_proj,res_lanes}.hip`, `-DIU4_A4_CANDIDATES=2`, plus the
+//!   source's own `// HIPFIRE_COMPILER_FLAGS:`); their objects reproduce the runtime's byte for byte (object
+//!   sha256 68db168d... / 16f5f16d..., asserted by the tests). `lane_proj`: shape `group=dn|fa|moe,lanes=1..8`,
+//!   header keys `block rows_per_wg wgs_per_wgp lds_per_lane grid_fixed`; `lane_wo`: shape `lanes=1..8,m=2048`,
+//!   header keys `block rows_per_wg lds_dynamic`. Both take `flush=1` in the shape (or `--flush`): a 2 x 96 MiB
+//!   device-to-device copy after every timed dispatch (outside the hipEvent interval), recorded in
+//!   `shape_dims.flush` and `timing.flush`.
+//!   TIMING cycles a pool of distinct seeded weight sets whose total exceeds 192 MiB (`shape_dims.timing_pool`;
+//!   dispatch `i` uses set `i % sets`), the output reset outside the interval. IDENTITY runs, after the basic
+//!   dispatch identity, the product gates' adversarial matrix through BOTH arms at the node's lane count and
+//!   lanes 1,2,3,5,8 (`lane_wo`: 1..8) with outputs pre-poisoned (rows/lanes beyond `lanes` must stay
+//!   untouched): `identity_matrix` = `{pass, cases, mismatches, nan_payload_diffs, guard_violations,
+//!   cpu_ref_identical{baseline,candidate}, cpu_ref, failures}`. `lane_proj` uses the lab NaN policy (non-NaN
+//!   words bit-equal, NaN meets NaN, payload diffs tallied); `lane_wo` requires RAW bits (the product gate does).
+//!   `cpu_ref_identical` compares each arm with `lane_ref.rs` and is informational (loudly reported).
+//!   `--emu`: small ragged shape over the FULL grid, then every production extent (lane_proj: every group x
+//!   lanes {1,3,8}; lane_wo: lanes {1,5,8}, M = 2048) over the FULL grid of both arms (`--emu-extent
+//!   full|sampled` overrides; `sampled` assumes the incumbent's contiguous row partition per workgroup).
+//!   lane_proj packs its four y segments into one emulator region with unwritten poison pads between them, so
+//!   a store past a segment fails. The candidate's static hazard checks (`peacemaker_lift::hazards_gfx11` +
+//!   `peacemaker_ir::passes::hazards::analyze`) are part of the gate: any Required/Unchecked finding, any
+//!   PM-IR obligation or an analysis error fails it (`emu_gate.hazards`).
+//!
 //! Exit status: 0 ok; 1 identity failure (record still printed); 2 usage; 3 the
 //! candidate (or the device) could not compile/launch (record printed with `error`).
 //!
 //! ```text
 //! cargo build --release -p rdna-compute --example hip_loop
 //! hip_loop --node mq6_res --shape qkv --cand copy_of_shipped.hip --offline
+//! hip_loop --node lane_proj --shape group=dn,lanes=8 --cand copy_of_shipped.hip --offline
+//! hip_loop --node lane_wo --emu --cand candidate.hip
+//! hip_loop --node lane_proj --shape group=fa,lanes=8 --cand candidate.hip --flush --time 100 --rounds 15
 //! ```
 //! GPU-free tests: `cargo test --release -p rdna-compute --example hip_loop`.
 
@@ -108,6 +138,14 @@ mod emu;
 mod hc;
 #[path = "hip_loop/jit.rs"]
 mod jit;
+#[path = "hip_loop/lane_common.rs"]
+mod lane_common;
+#[path = "hip_loop/lane_proj.rs"]
+mod lane_proj;
+#[path = "hip_loop/lane_ref.rs"]
+mod lane_ref;
+#[path = "hip_loop/lane_wo.rs"]
+mod lane_wo;
 #[path = "hip_loop/mq6.rs"]
 mod mq6;
 #[path = "hip_loop/node.rs"]
@@ -122,15 +160,16 @@ use std::path::{Path, PathBuf};
 const SCHEMA: u32 = 1;
 const DEFAULT_TIME: usize = 50;
 const DEFAULT_ROUNDS: usize = 12;
-const NODES: [&str; 3] = ["mq6_res", "hc_mix", "qsa_hg4"];
-const USAGE: &str = "--node mq6_res|hc_mix|qsa_hg4 [--shape k=v,...] \
+const NODES: [&str; 5] = ["mq6_res", "hc_mix", "qsa_hg4", "lane_proj", "lane_wo"];
+const USAGE: &str = "--node mq6_res|hc_mix|qsa_hg4|lane_proj|lane_wo [--shape k=v,...] \
 (--cand FILE.hip | --cand-object FILE.co [--cand-geometry \"tile_m=.. tile_n=.. block=.. lds_dynamic=..\"] | --null-control aa) \
-[--base-object FILE.co] [--offline] [--emu [--no-extent]] [--time N] [--rounds R] [--seed S] [--out DIR]";
+[--base-object FILE.co] [--offline] [--emu [--no-extent] [--emu-extent full|sampled]] [--flush] \
+[--identity full|smoke|skip | --identity-only] [--time N] [--rounds R] [--seed S] [--out DIR]";
 
 // ---------------------------------------------------------------------------
 // CLI
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 struct Opts {
     node: String,
     shape: Option<String>,
@@ -138,6 +177,14 @@ struct Opts {
     offline: bool,
     emu: bool,
     no_extent: bool,
+    /// `--flush` (lane nodes): a 2 x 96 MiB device copy between timed dispatches.
+    flush: bool,
+    /// `--emu-extent full|sampled`: how the extent cases run (default: the node's choice).
+    emu_extent: Option<String>,
+    /// `--identity full|smoke|skip` (default full): the device identity depth (see `gpu_run`).
+    identity: Option<String>,
+    /// `--identity-only`: run the node's adversarial matrix over all its shapes, no timing.
+    identity_only: bool,
     null_control: bool,
     cand_object: Option<PathBuf>,
     base_object: Option<PathBuf>,
@@ -158,6 +205,10 @@ fn parse_args(args: &[String]) -> Result<Opts> {
         no_extent: false,
         null_control: false,
         cand_object: None,
+        flush: false,
+        emu_extent: None,
+        identity: None,
+        identity_only: false,
         cand_geometry: None,
         base_object: None,
         time: DEFAULT_TIME,
@@ -185,6 +236,22 @@ fn parse_args(args: &[String]) -> Result<Opts> {
                 o.offline = true;
             }
             "--no-extent" => o.no_extent = true,
+            "--flush" => o.flush = true,
+            "--identity" => {
+                let v = value("identity")?;
+                if !["full", "smoke", "skip"].contains(&v.as_str()) {
+                    return Err(format!("--identity {v}: expected `full`, `smoke` or `skip`"));
+                }
+                o.identity = Some(v);
+            }
+            "--identity-only" => o.identity_only = true,
+            "--emu-extent" => {
+                let v = value("emu-extent")?;
+                if v != "full" && v != "sampled" {
+                    return Err(format!("--emu-extent {v}: expected `full` or `sampled`"));
+                }
+                o.emu_extent = Some(v);
+            }
             "--null-control" => {
                 let v = value("null-control")?;
                 if v != "aa" {
@@ -208,6 +275,12 @@ fn parse_args(args: &[String]) -> Result<Opts> {
     if sources != 1 {
         return Err("exactly one of --cand FILE.hip, --cand-object FILE.co, --null-control aa is required".into());
     }
+    if o.identity_only && (o.offline || o.emu) {
+        return Err("--identity-only runs on the device (not with --offline/--emu)".into());
+    }
+    if o.identity_only && o.identity.as_deref().is_some_and(|m| m != "full") {
+        return Err("--identity-only runs the full matrix: it cannot be combined with --identity smoke|skip".into());
+    }
     if o.cand_geometry.is_some() && o.cand_object.is_none() {
         return Err("--cand-geometry needs --cand-object (a source candidate carries a `// hip_loop:` header)".into());
     }
@@ -221,6 +294,8 @@ fn build_node(name: &str, shape: Option<&str>) -> Result<Box<dyn Node>> {
         "mq6_res" => Ok(Box::new(mq6::Mq6Res::new(&spec)?)),
         "hc_mix" => Ok(Box::new(hc::HcMix::new(&spec)?)),
         "qsa_hg4" => Ok(Box::new(qsa::QsaHg4::new(&spec)?)),
+        "lane_proj" => Ok(Box::new(lane_proj::LaneProj::new(&spec)?)),
+        "lane_wo" => Ok(Box::new(lane_wo::LaneWo::new(&spec)?)),
         other => Err(format!("unknown node `{other}`")),
     }
 }
@@ -296,6 +371,7 @@ fn prepare(o: &Opts, node: &dyn Node, workdir: &Path, rec: &mut Value) -> std::r
         move |e: String| (s.clone(), e)
     };
     let inc = node.incumbent().map_err(stage("incumbent"))?;
+    let arch = node.arch();
     rec["symbol"] = json!(inc.symbol);
     rec["module"] = json!(inc.module);
     rec["selection"] = json!(inc.selection);
@@ -332,9 +408,9 @@ fn prepare(o: &Opts, node: &dyn Node, workdir: &Path, rec: &mut Value) -> std::r
     let want_base = o.base_object.is_none() || (o.offline && !o.emu);
     let want_cand = cand_source.is_some() && !aa_from_object;
     let (compiled_base, compiled_cand) = std::thread::scope(|s| {
-        let b = want_base.then(|| s.spawn(|| jit::compile(workdir, "baseline", &inc, &inc.source)));
+        let b = want_base.then(|| s.spawn(|| jit::compile_for(arch, workdir, "baseline", &inc, &inc.source)));
         let c = want_cand.then(|| {
-            s.spawn(|| jit::compile(workdir, "candidate", &inc, cand_source.as_deref().unwrap_or_default()))
+            s.spawn(|| jit::compile_for(arch, workdir, "candidate", &inc, cand_source.as_deref().unwrap_or_default()))
         });
         let join = |h: Option<std::thread::ScopedJoinHandle<'_, Result<jit::Built>>>| -> Result<Option<jit::Built>> {
             match h {
@@ -348,19 +424,19 @@ fn prepare(o: &Opts, node: &dyn Node, workdir: &Path, rec: &mut Value) -> std::r
     .map_err(stage("compile"))?;
     let base = match &o.base_object {
         Some(p) => {
-            let b = jit::from_object("baseline", p).map_err(stage("base_object"))?;
-            rec["base_object"] = verify_base_object(p, &inc, &b, compiled_base.as_ref()).map_err(stage("base_object"))?;
+            let b = jit::from_object_for(arch, "baseline", p).map_err(stage("base_object"))?;
+            rec["base_object"] = verify_base_object_for(arch, p, &inc, &b, compiled_base.as_ref()).map_err(stage("base_object"))?;
             b
         }
         None => compiled_base.ok_or(("compile".to_owned(), "internal: no baseline".to_owned()))?,
     };
     let cand = if let Some(p) = &o.cand_object {
-        jit::from_object("candidate", p).map_err(stage("object"))?
+        jit::from_object_for(arch, "candidate", p).map_err(stage("object"))?
     } else if let Some(c) = compiled_cand {
         c
     } else {
         let p = o.base_object.as_ref().expect("an A/A without a candidate build has --base-object");
-        jit::from_object("candidate", p).map_err(stage("base_object"))?
+        jit::from_object_for(arch, "candidate", p).map_err(stage("base_object"))?
     };
     if o.cand_object.is_some() {
         // The object must be launchable with the incumbent's kernargs and fit the LDS.
@@ -386,7 +462,7 @@ fn prepare(o: &Opts, node: &dyn Node, workdir: &Path, rec: &mut Value) -> std::r
     // DIR/baseline.co`, `--cand-object DIR/candidate.co --cand-geometry <candidate_geometry_arg>`.
     let publish = |name: &str, b: &jit::Built, source: &str, kv: &std::collections::BTreeMap<String, String>| {
         let co = workdir.join(name);
-        let side = jit::sidecar_json(&o.node, &inc, b, source, kv);
+        let side = jit::sidecar_json_for(arch, &o.node, &inc, b, source, kv);
         jit::publish(&co, b, &side)
             .map(|()| json!({"path": co.display().to_string(), "sha256": b.image_sha256,
                 "sidecar": jit::sidecar_path(&co).display().to_string()}))
@@ -433,7 +509,19 @@ fn prepare(o: &Opts, node: &dyn Node, workdir: &Path, rec: &mut Value) -> std::r
 /// earlier `--offline --out DIR`) must certify the object, the shipped source it was
 /// compiled from and the `.text` sha256 of the launched kernel. Offline, `recompiled` (the
 /// production-source compile just made) must also agree; on the device the sidecar is trusted.
+#[allow(dead_code)]
 fn verify_base_object(
+    path: &Path,
+    inc: &Incumbent,
+    b: &jit::Built,
+    recompiled: Option<&jit::Built>,
+) -> Result<Value> {
+    verify_base_object_for(ARCH, path, inc, b, recompiled)
+}
+
+/// [`verify_base_object`] for the node's own `arch`.
+fn verify_base_object_for(
+    arch: &str,
     path: &Path,
     inc: &Incumbent,
     b: &jit::Built,
@@ -450,9 +538,9 @@ fn verify_base_object(
     if sc["tool"] != "hip_loop" || sc["schema"] != SCHEMA {
         return Err(format!("{}: not a hip_loop schema {SCHEMA} sidecar", side.display()));
     }
-    if sc["module"] != inc.module.as_str() || sc["arch"] != ARCH {
+    if sc["module"] != inc.module.as_str() || sc["arch"] != arch {
         return Err(format!(
-            "{}: sidecar is for module {} on {}, the incumbent is {} on {ARCH}",
+            "{}: sidecar is for module {} on {}, the incumbent is {} on {arch}",
             side.display(), sc["module"], sc["arch"], inc.module
         ));
     }
@@ -502,11 +590,21 @@ fn run(o: &Opts) -> (Value, Outcome) {
         "shape": Value::Null, "symbol": Value::Null, "error": Value::Null,
         "offline": o.offline,
     });
-    let shape = o.shape.clone().or_else(|| o.emu.then(|| "emu".to_owned()));
+    let mut shape = o.shape.clone().or_else(|| o.emu.then(|| "emu".to_owned()));
+    if o.flush {
+        if !o.node.starts_with("lane_") {
+            return fail(rec, "args", "--flush is supported by the lane_proj / lane_wo nodes only");
+        }
+        shape = Some(match shape {
+            Some(s) => format!("{s},flush=1"),
+            None => "flush=1".to_owned(),
+        });
+    }
     let mut node = match build_node(&o.node, shape.as_deref()) {
         Ok(n) => n,
         Err(e) => return fail(rec, "args", e),
     };
+    rec["arch"] = json!(node.arch());
     rec["shape"] = json!(node.shape_label());
     rec["shape_dims"] = node.shape_json();
     let w = node.work();
@@ -584,6 +682,17 @@ fn emu_stage(o: &Opts, node: &dyn Node, prep: &Prep, mut rec: Value) -> (Value, 
         }
         receipt["extent_cases"] = json!(cases);
     }
+    // Static hazard checks on the arms' objects (nodes that opt in): any Required/Unchecked finding,
+    // any PM-IR hazard obligation or an analysis error on the CANDIDATE fails the gate.
+    if node.static_hazards() {
+        let (_, hb) = emu::hazards(&prep.base.image, &prep.inc.symbol);
+        let (hc_ok, hc) = emu::hazards(&prep.cand.image, &prep.inc.symbol);
+        receipt["hazards"] = json!({"pass": hc_ok, "candidate": hc, "baseline": hb});
+        if !hc_ok {
+            pass = false;
+            why.push(format!("hazards: {}", hc["reason"].as_str().unwrap_or("?")));
+        }
+    }
     receipt["pass"] = json!(pass);
     receipt["reason"] = if pass { Value::Null } else { json!(why.join(" | ")) };
     rec["emu_gate"] = receipt;
@@ -608,6 +717,34 @@ fn extent_case(o: &Opts, like: &dyn Node, prep: &Prep, shape: &str) -> (bool, Va
         Ok(g) => g,
         Err(e) => return bad(format!("candidate geometry at this shape: {e}")),
     };
+    let full = match o.emu_extent.as_deref() {
+        Some("full") => true,
+        Some(_) => false,
+        None => n.extent_full_default(),
+    };
+    if full {
+        // EVERY workgroup of both arms' production grids, the whole output compared bitwise: no
+        // dependence on a workgroup-to-output ownership assumption about the candidate's tiling.
+        let mut case = match n.emu_case(o.seed) {
+            Ok(c) => c,
+            Err(e) => return bad(format!("inputs: {e}")),
+        };
+        let built = t.elapsed().as_millis() as u64;
+        let (ok, mut r) = emu::gate(
+            &prep.inc.symbol,
+            &mut case,
+            (&prep.base.image, &base_geo),
+            (&prep.cand.image, &cand_geo),
+            n.shape_json(),
+            o.seed,
+        );
+        r["label"] = json!(shape);
+        r["mode"] = json!("full_grid");
+        r["grid"] = json!({"baseline": base_geo.grid, "candidate": cand_geo.grid});
+        r["inputs_ms"] = json!(built);
+        r["total_ms"] = json!(t.elapsed().as_millis() as u64);
+        return (ok, r);
+    }
     let (ob, oc) = match (n.out_owner(&Header::default()), n.out_owner(&prep.cand_header)) {
         (Ok(b), Ok(c)) => (b, c),
         (Err(e), _) | (_, Err(e)) => return bad(format!("output owner map: {e}")),
@@ -626,6 +763,9 @@ fn extent_case(o: &Opts, like: &dyn Node, prep: &Prep, shape: &str) -> (bool, Va
         n.shape_json(),
         o.seed,
     );
+    if n.extent_full_default() || o.emu_extent.is_some() {
+        r["mode"] = json!("sampled");
+    }
     r["inputs_ms"] = json!(built);
     r["total_ms"] = json!(t.elapsed().as_millis() as u64);
     (ok, r)
@@ -765,6 +905,7 @@ fn sample(
     cand: &mut Arm,
     n: usize,
     rounds: usize,
+    flush: Option<&(node::Buf, node::Buf)>,
 ) -> Result<(Vec<f64>, Vec<f64>)> {
     let (per_arm, _) = abba::timing_counts(n, rounds)?;
     let (mut b, mut c) = (Vec::with_capacity(per_arm), Vec::with_capacity(per_arm));
@@ -776,12 +917,23 @@ fn sample(
             return Err(err(e));
         }
     };
+    // `--flush`: evict L2 / the last-level cache / TLBs / instruction caches between dispatches
+    // the way the other kernels of a decode step do; always outside the timed interval.
+    let evict = |gpu: &rdna_compute::Gpu| -> Result<()> {
+        match flush {
+            Some((a, f)) => gpu.hip.memcpy_dtod(&f.buf, &a.buf, lane_common::FLUSH_BYTES).map_err(err),
+            None => Ok(()),
+        }
+    };
     let measured = (|| -> Result<()> {
-        for which in abba::timing_schedule(n, rounds)? {
+        evict(gpu)?;
+        for (i, which) in abba::timing_schedule(n, rounds)?.into_iter().enumerate() {
             let (arm, sink) = match which {
                 abba::TimingArm::Incumbent => (&mut *base, &mut b),
                 abba::TimingArm::Candidate => (&mut *cand, &mut c),
             };
+            // A node with a pool of weight sets points dispatch `i` at set `i % sets`.
+            node.select_set(&mut arm.karg, i);
             node.reset(gpu)?;
             sync(gpu)?;
             gpu.hip.event_record(&start, None).map_err(err)?;
@@ -789,6 +941,7 @@ fn sample(
             gpu.hip.event_record(&stop, None).map_err(err)?;
             gpu.hip.event_synchronize(&stop).map_err(err)?;
             sink.push(f64::from(gpu.hip.event_elapsed_ms(&start, &stop).map_err(err)?) * 1e6);
+            evict(gpu)?;
         }
         Ok(())
     })();
@@ -811,8 +964,12 @@ fn gpu_stage(o: &Opts, node: &mut dyn Node, prep: &Prep, mut rec: Value) -> (Val
         "uuid": std::env::var("ROCR_VISIBLE_DEVICES").ok().or_else(|| std::env::var("HIPFIRE_DEVICES").ok()),
         "fabric_job": std::env::var("FABRIC_JOB").ok(),
     });
-    if arch != ARCH {
-        return fail(rec, "device", format!("device is {arch}, hip_loop requires {ARCH}"));
+    if arch != node.arch() {
+        return fail(rec, "device", format!("device is {arch}, hip_loop requires {}", node.arch()));
+    }
+    if o.identity_only {
+        // No timing and no pool: the node's adversarial matrix over every shape it names.
+        return identity_only(o, node, prep, &gpu, rec);
     }
     if let Err(e) = node.setup(&gpu, o.seed) {
         return fail(rec, "setup", e);
@@ -822,6 +979,72 @@ fn gpu_stage(o: &Opts, node: &mut dyn Node, prep: &Prep, mut rec: Value) -> (Val
     match res {
         Ok(outcome) => (rec, outcome),
         Err((stage, e)) => fail(rec, &stage, e),
+    }
+}
+
+/// `--identity-only`: the adversarial identity matrix of the node over ALL its identity shapes (lane_proj: every
+/// group; the node's own lane set per group), both arms, no timing. Exit 0 = every matrix passed.
+fn identity_only(o: &Opts, node: &mut dyn Node, prep: &Prep, gpu: &rdna_compute::Gpu, mut rec: Value) -> (Value, Outcome) {
+    let empty = Header::default();
+    let mut shapes = node.identity_shapes();
+    if shapes.is_empty() {
+        shapes.push(String::new());
+    }
+    let mut results = Vec::new();
+    let (mut pass, mut cases, mut mism, mut nanp) = (true, 0u64, 0u64, 0u64);
+    let (mut cpu_b, mut cpu_c) = (true, true);
+    let mut failures: Vec<Value> = Vec::new();
+    for shape in shapes {
+        let mut other = if shape.is_empty() {
+            None
+        } else {
+            match build_node(node.name(), Some(&shape)) {
+                Ok(n) => Some(n),
+                Err(e) => return fail(rec, "identity_matrix", format!("identity shape {shape}: {e}")),
+            }
+        };
+        let target: &mut dyn Node = match other.as_mut() {
+            Some(n) => n.as_mut(),
+            None => &mut *node,
+        };
+        let label = target.shape_label();
+        let m = target.adversarial(
+            gpu,
+            &node::ArmImage { tag: "baseline", image: &prep.base.image, header: &empty },
+            &node::ArmImage { tag: "candidate", image: &prep.cand.image, header: &prep.cand_header },
+            o.seed,
+        );
+        match m {
+            Ok(Some(m)) => {
+                pass &= m["pass"] == json!(true);
+                cases += m["cases"].as_u64().unwrap_or(0);
+                mism += m["mismatches"].as_u64().unwrap_or(0);
+                nanp += m["nan_payload_diffs"].as_u64().unwrap_or(0);
+                cpu_b &= m["cpu_ref_identical"]["baseline"] == json!(true);
+                cpu_c &= m["cpu_ref_identical"]["candidate"] == json!(true);
+                if let Some(f) = m["failures"].as_array() {
+                    failures.extend(f.iter().take(8).cloned());
+                }
+                results.push(json!({"shape": label, "matrix": m}));
+            }
+            Ok(None) => {}
+            Err(e) => return fail(rec, "identity_matrix", e),
+        }
+    }
+    if results.is_empty() {
+        return fail(rec, "identity", format!("node {} has no adversarial identity matrix", node.name()));
+    }
+    rec["identity_mode"] = json!("only");
+    rec["identity_matrix"] = json!({
+        "pass": pass, "cases": cases, "mismatches": mism, "nan_payload_diffs": nanp,
+        "cpu_ref_identical": {"baseline": cpu_b, "candidate": cpu_c},
+        "failures": failures, "shapes": results,
+    });
+    rec["identical_to_baseline"] = json!(pass);
+    if pass {
+        (rec, Outcome::Ok)
+    } else {
+        (rec, Outcome::IdentityFailed)
     }
 }
 
@@ -841,46 +1064,98 @@ fn gpu_run(
     let mut base = load(gpu, &prep.base, sym, prep.base_geo, karg.clone()).map_err(stage("load"))?;
     let mut cand = load(gpu, &prep.cand, sym, prep.cand_geo, karg).map_err(stage("load"))?;
 
-    // Identity: every dispatch starts from the pristine output.
-    node.reset(gpu).map_err(stage("identity"))?;
-    sync(gpu).map_err(stage("identity"))?;
-    let pristine = node.read_output(gpu).map_err(stage("identity"))?;
-    let b1 = run_arm(gpu, node, &mut base).map_err(stage("identity"))?;
-    let b2 = run_arm(gpu, node, &mut base).map_err(stage("identity"))?;
-    let c1 = run_arm(gpu, node, &mut cand).map_err(stage("identity"))?;
-    let c2 = run_arm(gpu, node, &mut cand).map_err(stage("identity"))?;
-    let changed = diff(&pristine, &b1).is_some();
-    let base_repeat = b1 == b2;
-    let cand_repeat = c1 == c2;
-    let d = diff(&b1, &c1);
-    let identical = d.is_none();
-    rec["identical_to_baseline"] = json!(identical);
-    rec["identity"] = json!({
-        "output_bytes": b1.len(),
-        "dispatch_changed_output": changed,
-        "baseline_repeatable": base_repeat,
-        "candidate_repeatable": cand_repeat,
-        "first_diff_byte": d.map(|x| x.0),
-        "differing_bytes": d.map(|x| x.1),
-    });
-    if !changed {
-        return Err(("identity".into(), "the baseline dispatch did not change the output: the launch is not exercised".into()));
-    }
-    if !base_repeat {
-        return Err(("identity".into(), "the baseline output is not repeatable from a pristine state".into()));
-    }
-    if !identical || !cand_repeat {
-        return Ok(Outcome::IdentityFailed);
+    // `--identity full|smoke|skip` (default full). `smoke`: only the basic dispatch identity below (the
+    // timed shape's pristine-reset launches of both arms, byte-compared); `skip`: no identity at all (A/A and
+    // control runs, profiler traces of the timing launches only); `full`: smoke plus the node's own
+    // adversarial matrix.
+    let mode = o.identity.as_deref().unwrap_or("full");
+    rec["identity_mode"] = json!(mode);
+    if mode == "skip" {
+        rec["identical_to_baseline"] = Value::Null;
+    } else {
+        // Identity: every dispatch starts from the pristine output.
+        node.reset(gpu).map_err(stage("identity"))?;
+        sync(gpu).map_err(stage("identity"))?;
+        let pristine = node.read_output(gpu).map_err(stage("identity"))?;
+        let b1 = run_arm(gpu, node, &mut base).map_err(stage("identity"))?;
+        let b2 = run_arm(gpu, node, &mut base).map_err(stage("identity"))?;
+        let c1 = run_arm(gpu, node, &mut cand).map_err(stage("identity"))?;
+        let c2 = run_arm(gpu, node, &mut cand).map_err(stage("identity"))?;
+        let changed = diff(&pristine, &b1).is_some();
+        let base_repeat = b1 == b2;
+        let cand_repeat = c1 == c2;
+        let d = diff(&b1, &c1);
+        let identical = d.is_none();
+        rec["identical_to_baseline"] = json!(identical);
+        rec["identity"] = json!({
+            "output_bytes": b1.len(),
+            "dispatch_changed_output": changed,
+            "baseline_repeatable": base_repeat,
+            "candidate_repeatable": cand_repeat,
+            "first_diff_byte": d.map(|x| x.0),
+            "differing_bytes": d.map(|x| x.1),
+        });
+        if !changed {
+            return Err(("identity".into(), "the baseline dispatch did not change the output: the launch is not exercised".into()));
+        }
+        if !base_repeat {
+            return Err(("identity".into(), "the baseline output is not repeatable from a pristine state".into()));
+        }
+        if !identical || !cand_repeat {
+            return Ok(Outcome::IdentityFailed);
+        }
+
+        // The node's own adversarial identity matrix (both arms through every input kind, the CPU
+        // reference); a failure is an identity failure like a diff in the basic run.
+        if mode == "full" {
+            let empty = Header::default();
+            let matrix = node
+                .adversarial(
+                    gpu,
+                    &node::ArmImage { tag: "baseline", image: &prep.base.image, header: &empty },
+                    &node::ArmImage { tag: "candidate", image: &prep.cand.image, header: &prep.cand_header },
+                    o.seed,
+                )
+                .map_err(stage("identity_matrix"))?;
+            if let Some(m) = matrix {
+                let pass = m["pass"] == json!(true);
+                rec["identity_matrix"] = m;
+                if !pass {
+                    rec["identical_to_baseline"] = json!(false);
+                    return Ok(Outcome::IdentityFailed);
+                }
+            }
+        }
     }
 
+    let flush = if node.flush_requested() {
+        Some((
+            node::Buf::alloc(gpu, lane_common::FLUSH_BYTES).map_err(stage("setup"))?,
+            node::Buf::alloc(gpu, lane_common::FLUSH_BYTES).map_err(stage("setup"))?,
+        ))
+    } else {
+        None
+    };
     let before = clock_note(gpu);
-    let (b_ns, c_ns) = sample(gpu, node, &mut base, &mut cand, o.time, o.rounds).map_err(stage("timing"))?;
+    let sampled = sample(gpu, node, &mut base, &mut cand, o.time, o.rounds, flush.as_ref());
+    if let Some((a, b)) = flush {
+        a.free(gpu);
+        b.free(gpu);
+    }
+    let (b_ns, c_ns) = sampled.map_err(stage("timing"))?;
     let after = clock_note(gpu);
     let t = timing_record(&b_ns, &c_ns, o.time, node.work()).map_err(stage("timing"))?;
     if let Value::Object(m) = t {
         for (k, v) in m {
             rec[k] = v;
         }
+    }
+    rec["timing"]["flush"] = json!(node.flush_requested());
+    if node.flush_requested() {
+        rec["timing"]["flush_method"] = json!(format!(
+            "2 x {} MiB device-to-device copy after every timed dispatch, outside the per-dispatch hipEvent interval",
+            lane_common::FLUSH_BYTES >> 20
+        ));
     }
     rec["clock_note"] = json!({
         "clocks_pinned": false,
@@ -1014,6 +1289,10 @@ mod tests {
             offline: true,
             emu: false,
             no_extent: false,
+            flush: false,
+            emu_extent: None,
+            identity: None,
+            identity_only: false,
             null_control: false,
             cand_object: None,
             cand_geometry: None,
@@ -1117,6 +1396,10 @@ mod tests {
             offline: true,
             emu: false,
             no_extent: false,
+            flush: false,
+            emu_extent: None,
+            identity: None,
+            identity_only: false,
             null_control: false,
             cand_object: None,
             cand_geometry: None,
@@ -1151,6 +1434,10 @@ mod tests {
             offline: true,
             emu: false,
             no_extent: false,
+            flush: false,
+            emu_extent: None,
+            identity: None,
+            identity_only: false,
             null_control: true,
             cand_object: None,
             cand_geometry: None,
@@ -1195,6 +1482,10 @@ mod object_tests {
             offline: true,
             emu: false,
             no_extent: false,
+            flush: false,
+            emu_extent: None,
+            identity: None,
+            identity_only: false,
             null_control: false,
             cand_object: Some(object),
             cand_geometry: geometry.map(str::to_owned),
@@ -1310,6 +1601,10 @@ mod base_object_tests {
             offline: true,
             emu: false,
             no_extent: false,
+            flush: false,
+            emu_extent: None,
+            identity: None,
+            identity_only: false,
             null_control: aa,
             cand_object: None,
             cand_geometry: None,
@@ -1660,5 +1955,205 @@ mod race_gate_tests {
         assert!(sched.len() >= 7, "{sched:?}");
         let e = arm(emu::Model::StrictStoreSources).err().expect("the strict reading names the stub WAR");
         assert!(e.reason.contains("[in-flight]") && e.reason.contains("ds_store_b128"), "{}", e.reason);
+    }
+}
+
+/// The gfx1201 lane nodes (`lane_proj`, `lane_wo`): incumbents are the runtime's objects, offline records,
+/// the options only they take, and the emulator gate on the wave32 `wo` kernel.
+#[cfg(test)]
+mod lane_tests {
+    use super::*;
+
+    /// sha256 of the runtime-compiled incumbent OBJECTS (`hipcc --genco --offload-arch=gfx1201 -O3
+    /// --no-offload-compress -fuse-cuid=none -mcode-object-version=6 -DIU4_A4_CANDIDATES=2` + the
+    /// source's `HIPFIRE_COMPILER_FLAGS`): `KernelCompiler` reproduces them byte for byte, the whole file, not
+    /// only the kernel `.text`.
+    const LANE_PROJ_OBJECT_SHA: &str = "68db168d722305c1be594f2d16a8b76558a447353f04a15c19ddf53b29028d7b";
+    const RES_LANES_OBJECT_SHA: &str = "16f5f16d35083682c6d12b0d5a813c6056006785d0a2d8188fdf8845873ad31c";
+    const LANE_PROJ_SOURCE_SHA: &str = "32bec4741cd72e4e279ea09403c3e63f0e5ff8e401287e809be3f879594079d9";
+    const RES_LANES_SOURCE_SHA: &str = "036fdd2cf77014d8ac70deaeee37d73a08fc3313318c5717fa122b65e6d70b71";
+
+    fn tmp(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("hip_loop-lane-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn offline(node: &str, shape: &str, source: &str, tag: &str) -> Value {
+        let dir = tmp(tag);
+        let cand = dir.join("cand.hip");
+        std::fs::write(&cand, source).unwrap();
+        let o = Opts {
+            node: node.into(),
+            shape: Some(shape.into()),
+            cand: Some(cand),
+            offline: true,
+            out: Some(dir.join("out")),
+            ..Opts::default()
+        };
+        let (rec, outcome) = run(&o);
+        assert_eq!(outcome, Outcome::Ok, "{rec}");
+        rec
+    }
+
+    #[test]
+    fn incumbent_sources_are_the_shipped_bytes_the_runtime_compiles() {
+        let p = build_node("lane_proj", None).unwrap().incumbent().unwrap();
+        let w = build_node("lane_wo", None).unwrap().incumbent().unwrap();
+        assert_eq!(elf::sha256_hex(p.source.as_bytes()), LANE_PROJ_SOURCE_SHA);
+        assert_eq!(elf::sha256_hex(w.source.as_bytes()), RES_LANES_SOURCE_SHA);
+        assert!(p.source.starts_with("// HIPFIRE_COMPILER_FLAGS: -mwavefrontsize64\n"));
+        assert!(w.source.starts_with("#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n"));
+        assert_eq!((p.extra_flags.as_str(), w.extra_flags.as_str()), ("-DIU4_A4_CANDIDATES=2", "-DIU4_A4_CANDIDATES=2"));
+        for n in ["lane_proj", "lane_wo"] {
+            assert_eq!(build_node(n, None).unwrap().arch(), "gfx1201");
+        }
+        for n in ["mq6_res", "hc_mix", "qsa_hg4"] {
+            assert_eq!(build_node(n, Some("emu")).unwrap().arch(), ARCH);
+        }
+    }
+
+    #[test]
+    fn incumbent_objects_are_the_runtime_objects() {
+        if !jit::hipcc_available() {
+            eprintln!("skip: no hipcc");
+            return;
+        }
+        let dir = tmp("objects");
+        for (node, want, wave) in [("lane_proj", LANE_PROJ_OBJECT_SHA, 64), ("lane_wo", RES_LANES_OBJECT_SHA, 32)] {
+            let n = build_node(node, None).unwrap();
+            let inc = n.incumbent().unwrap();
+            let b = jit::compile_for(n.arch(), &dir, node, &inc, &inc.source).unwrap();
+            assert_eq!(b.image_sha256, want, "{node}: not the runtime's object");
+            assert_eq!(b.kernel(&inc.symbol).unwrap().wavefront_size, wave);
+        }
+    }
+
+    #[test]
+    fn offline_records_copy_equals_incumbent_and_a_different_candidate_differs() {
+        if !jit::hipcc_available() {
+            eprintln!("skip: no hipcc");
+            return;
+        }
+        let p = build_node("lane_proj", None).unwrap().incumbent().unwrap().source;
+        let w = build_node("lane_wo", None).unwrap().incumbent().unwrap().source;
+        let r = offline("lane_proj", "group=dn,lanes=8", &p, "p-copy");
+        assert_eq!(r["identical_code"], true, "{r}");
+        assert_eq!(r["candidate"]["code_sha256"], r["baseline"]["code_sha256"]);
+        assert_eq!(r["candidate_co"]["sha256"], LANE_PROJ_OBJECT_SHA);
+        assert_eq!(r["arch"], "gfx1201");
+        assert_eq!(r["baseline"]["geometry"]["grid_workgroups"], json!([96, 1, 1]));
+        let mutated = p.replace("#define HIPFIRE_LANE_PROJ_COLGROUP 2", "#define HIPFIRE_LANE_PROJ_COLGROUP 4");
+        assert_ne!(mutated, p);
+        let r = offline("lane_proj", "group=dn,lanes=8", &mutated, "p-mut");
+        assert_eq!(r["identical_code"], false);
+        assert_ne!(r["candidate"]["code_sha256"], r["baseline"]["code_sha256"]);
+        let r = offline("lane_wo", "lanes=8,m=2048", &w, "w-copy");
+        assert_eq!(r["identical_code"], true, "{r}");
+        assert_eq!(r["candidate_co"]["sha256"], RES_LANES_OBJECT_SHA);
+        assert_eq!(r["baseline"]["geometry"]["grid_workgroups"], json!([256, 1, 1]));
+        let mutated = w.replace("row_base + r < M) y[", "row_base + r <= M) y[");
+        assert_ne!(mutated, w);
+        let r = offline("lane_wo", "lanes=8,m=2048", &mutated, "w-mut");
+        assert_eq!(r["identical_code"], false);
+    }
+
+    #[test]
+    fn header_geometry_reaches_the_record_and_null_control_runs() {
+        if !jit::hipcc_available() {
+            eprintln!("skip: no hipcc");
+            return;
+        }
+        let w = build_node("lane_wo", None).unwrap().incumbent().unwrap().source;
+        let r = offline("lane_wo", "lanes=4,m=2048", &format!("// hip_loop: rows_per_wg=16 block=256\n{w}"), "w-hdr");
+        assert_eq!(r["candidate"]["geometry"]["grid_workgroups"], json!([128, 1, 1]));
+        assert_eq!(r["candidate"]["geometry"]["block"], json!([256, 1, 1]));
+        assert_eq!(r["same_geometry"], false);
+        let dir = tmp("aa");
+        let o = Opts {
+            node: "lane_proj".into(),
+            shape: Some("group=moe,lanes=3".into()),
+            null_control: true,
+            offline: true,
+            out: Some(dir.join("out")),
+            ..Opts::default()
+        };
+        let (rec, outcome) = run(&o);
+        assert_eq!(outcome, Outcome::Ok, "{rec}");
+        assert_eq!(rec["null_control"]["identical_objects"], true, "{rec}");
+        assert_eq!(rec["symbol"], "gemv_mq4g256v2_lane_proj_k2048_gfx1201_n3");
+    }
+
+    #[test]
+    fn cli_takes_flush_and_emu_extent_and_refuses_them_elsewhere() {
+        let o = parse_args(&["--node", "lane_proj", "--cand", "x.hip", "--flush", "--emu-extent", "sampled"].map(String::from)).unwrap();
+        assert!(o.flush);
+        assert_eq!(o.emu_extent.as_deref(), Some("sampled"));
+        assert!(parse_args(&["--node", "lane_wo", "--cand", "x.hip", "--emu-extent", "some"].map(String::from)).is_err());
+        let (rec, outcome) = run(&Opts {
+            node: "mq6_res".into(),
+            flush: true,
+            null_control: true,
+            offline: true,
+            ..Opts::default()
+        });
+        assert_eq!(outcome, Outcome::Unusable);
+        assert_eq!(rec["error"]["stage"], "args");
+        // The flush shape key reaches the node and the record.
+        let n = build_node("lane_wo", Some("lanes=2,flush=1")).unwrap();
+        assert!(n.flush_requested());
+        assert_eq!(n.shape_json()["flush"], true);
+    }
+
+    #[test]
+    fn cli_takes_identity_depth_and_identity_only() {
+        let p = |a: &[&str]| parse_args(&a.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        assert_eq!(p(&["--node", "lane_wo", "--cand", "x.hip"]).unwrap().identity, None);
+        for m in ["full", "smoke", "skip"] {
+            let o = p(&["--node", "lane_wo", "--cand", "x.hip", "--identity", m]).unwrap();
+            assert_eq!(o.identity.as_deref(), Some(m));
+        }
+        assert!(p(&["--node", "lane_wo", "--cand", "x.hip", "--identity", "some"]).is_err());
+        let o = p(&["--node", "lane_proj", "--cand-object", "x.co", "--identity-only", "--seed", "3"]).unwrap();
+        assert!(o.identity_only);
+        // The matrix needs the device and the full depth.
+        assert!(p(&["--node", "lane_proj", "--cand", "x.hip", "--identity-only", "--offline"]).is_err());
+        assert!(p(&["--node", "lane_proj", "--cand", "x.hip", "--identity-only", "--identity", "skip"]).is_err());
+        // lane_proj's matrix runs over every group, lane_wo's over its own shape.
+        assert_eq!(
+            build_node("lane_proj", Some("lanes=8")).unwrap().identity_shapes(),
+            ["group=dn,lanes=8", "group=fa,lanes=8", "group=moe,lanes=8"]
+        );
+        assert!(build_node("lane_wo", None).unwrap().identity_shapes().is_empty());
+    }
+
+    /// The wave32 `wo` kernel through the pre-card gate at its small shape: the incumbent passes, a
+    /// candidate that stores one row past `M` (the last lane's row `M` is past the end of `y`) fails with an
+    /// unmapped access. The static hazard receipt is clean on the incumbent.
+    #[test]
+    fn lane_wo_emu_gate_passes_the_incumbent_and_fails_an_out_of_bounds_store() {
+        if !jit::hipcc_available() {
+            eprintln!("skip: no hipcc");
+            return;
+        }
+        let dir = tmp("wo-gate");
+        let n = build_node("lane_wo", Some("emu")).unwrap();
+        let inc = n.incumbent().unwrap();
+        let good = jit::compile_for(n.arch(), &dir, "good", &inc, &inc.source).unwrap();
+        let bad_src = inc.source.replace("row_base + r < M) y[", "row_base + r <= M) y[");
+        assert_ne!(bad_src, inc.source);
+        let bad = jit::compile_for(n.arch(), &dir, "bad", &inc, &bad_src).unwrap();
+        let geo = n.geometry();
+        let mut case = n.emu_case(1).unwrap();
+        let (pass, rec) = emu::gate(&inc.symbol, &mut case, (&good.image, &geo), (&good.image, &geo), n.shape_json(), 1);
+        assert!(pass, "{}", rec["reason"]);
+        assert_eq!(rec["arms"]["baseline"]["arch"], "Gfx1201");
+        let (pass, rec) = emu::gate(&inc.symbol, &mut case, (&good.image, &geo), (&bad.image, &geo), n.shape_json(), 1);
+        assert!(!pass);
+        assert!(rec["reason"].as_str().unwrap().contains("unmapped"), "{}", rec["reason"]);
+        let (ok, hz) = emu::hazards(&good.image, &inc.symbol);
+        assert!(ok, "{hz}");
+        assert_eq!(hz["wave"], 32);
     }
 }
