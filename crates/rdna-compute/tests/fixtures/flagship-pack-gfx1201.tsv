@@ -321,7 +321,7 @@ fn-ar	gfx1201	hip	zero_f32	zero_f32	--genco --offload-arch=gfx1201 -O3 --no-offl
 fn-ar	gfx1201	embedded	gemm_mq6g256v2_mmq_i8_pm_gfx1201	gemm_mq6g256v2_mmq_i8_pm_set_gfx1201			c1458584a1b8ab53e613c982c9a3e87c530c80e83e76223ed4f677d594bad300
 fn-ar	gfx1201	embedded	qsa_gather_pm_gfx1201	indexed_attention_gathered_wmma_f16_pm_gfx1201			e3b1c677b9b71c6d7a4c7693d8442afb53dd9581137644f158134aba2d740e02
 fn-ar	gfx1201	embedded	qwen4_moe_down_gp_pm_gfx1201	moe_rotate_i4_gp_pm_gfx1201			e136e40e9df122b938a7942f28d1c55be7af9359ce7a800b317aadb2e733b972
-fn-ar	gfx1201	embedded	qwen4_moe_iu4_sym_pm_gfx1201	qwen4_moe_gate_up_silu_iu4_sym_pm_gfx1201_nt4			0eea1673a530880586dc0cd179b7a3ef3dfd491660dff439f7b54e921792791e
+fn-ar	gfx1201	embedded	qwen4_moe_iu4_sym_pm_gfx1201	qwen4_moe_gate_up_silu_iu4_sym_pm_gfx1201_nt4			44177c21de25bec8502f63f318e682dc4fa1948420723c75dec14fa63cfed723
 #route fn-mtp	model=qwen3.8:flash-next-mq4-xts	--spec mtp	arch=gfx1201	modules_loaded=73	hip=69	embedded=4
 fn-mtp	gfx1201	hip	add	add_f32	--genco --offload-arch=gfx1201 -O3 --no-offload-compress -fuse-cuid=none -mcode-object-version=6 -DIU4_A4_CANDIDATES=2	default	b0561ebf265bfbf523e63f43f4d1544d1ceaf593f476438009635f15662121dd
 fn-mtp	gfx1201	hip	bf16_round_trip	bf16_round_trip_f32	--genco --offload-arch=gfx1201 -O3 --no-offload-compress -fuse-cuid=none -mcode-object-version=6 -DIU4_A4_CANDIDATES=2	default	b1d52caa7160b7c07e65b8141e6ab1b7eaf808526f4d557437c504f766311964
@@ -395,7 +395,7 @@ fn-mtp	gfx1201	hip	zero_f32	zero_f32	--genco --offload-arch=gfx1201 -O3 --no-off
 fn-mtp	gfx1201	embedded	gemm_mq6g256v2_mmq_i8_pm_gfx1201	gemm_mq6g256v2_mmq_i8_pm_set_gfx1201			c1458584a1b8ab53e613c982c9a3e87c530c80e83e76223ed4f677d594bad300
 fn-mtp	gfx1201	embedded	qsa_gather_pm_gfx1201	indexed_attention_gathered_wmma_f16_pm_gfx1201			e3b1c677b9b71c6d7a4c7693d8442afb53dd9581137644f158134aba2d740e02
 fn-mtp	gfx1201	embedded	qwen4_moe_down_gp_pm_gfx1201	moe_rotate_i4_gp_pm_gfx1201			e136e40e9df122b938a7942f28d1c55be7af9359ce7a800b317aadb2e733b972
-fn-mtp	gfx1201	embedded	qwen4_moe_iu4_sym_pm_gfx1201	qwen4_moe_gate_up_silu_iu4_sym_pm_gfx1201_nt4			0eea1673a530880586dc0cd179b7a3ef3dfd491660dff439f7b54e921792791e
+fn-mtp	gfx1201	embedded	qwen4_moe_iu4_sym_pm_gfx1201	qwen4_moe_gate_up_silu_iu4_sym_pm_gfx1201_nt4			44177c21de25bec8502f63f318e682dc4fa1948420723c75dec14fa63cfed723
 #route a3b-ar	model=qwen3.6:35b-a3b-mq4rs	--spec off	arch=gfx1201	modules_loaded=47	hip=37	embedded=10
 a3b-ar	gfx1201	hip	attention_flash_fp8_e4m3_tile_gqa_gfx1201	attention_flash_fp8_e4m3_tile_gqa8_gfx1201	--genco --offload-arch=gfx1201 -O3 --no-offload-compress -fuse-cuid=none -mcode-object-version=6 -DIU4_A4_CANDIDATES=2	default	9f85fe9377f81d2d7f158364898da70e4a5cee9c4f8c66a23cb1f123cf98c9f5
 a3b-ar	gfx1201	hip	attention_flash_q8_0_reduce_gated_mq_rotate_gfx1201	attention_flash_q8_0_reduce_gated_mq_rotate_gfx1201	--genco --offload-arch=gfx1201 -O3 --no-offload-compress -fuse-cuid=none -mcode-object-version=6 -DIU4_A4_CANDIDATES=2	default	ed6d3345a757cd522a28fd73a242c7feda529acca6642e0cebacfcc69415658f
@@ -443,4 +443,4 @@ a3b-ar	gfx1201	embedded	gemv_hfq4g256_residual_mq4v2	gemv_mq4g256v2_residual			7
 a3b-ar	gfx1201	embedded	iu4_c8_producer_pm_gfx1201	iu4_c8_rmsnorm_rotate_pm_gfx1201			722cd78ce9389c4fe86f0497d39f4ac8413d1ee10c3c836d6e81037e576b2061
 a3b-ar	gfx1201	embedded	moe_down_combine_grouped_bf16in_v2_pm_gfx1201	moe_down_combine_grouped_bf16in_v2_pm_gfx1201			f4176ca5c3855d728786e325d23206b2e2329449653bcef83783cb7b76a264b7
 a3b-ar	gfx1201	embedded	qwen4_moe_down_gp_pm_gfx1201	moe_rotate_i4_gp_pm_gfx1201			e136e40e9df122b938a7942f28d1c55be7af9359ce7a800b317aadb2e733b972
-a3b-ar	gfx1201	embedded	qwen4_moe_iu4_sym_pm_gfx1201	qwen4_moe_gate_up_silu_iu4_sym_pm_gfx1201_nt4			0eea1673a530880586dc0cd179b7a3ef3dfd491660dff439f7b54e921792791e
+a3b-ar	gfx1201	embedded	qwen4_moe_iu4_sym_pm_gfx1201	qwen4_moe_gate_up_silu_iu4_sym_pm_gfx1201_nt4			44177c21de25bec8502f63f318e682dc4fa1948420723c75dec14fa63cfed723

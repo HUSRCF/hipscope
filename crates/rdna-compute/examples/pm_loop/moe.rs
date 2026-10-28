@@ -3063,8 +3063,8 @@ mod tests {
     #[test]
     fn rip_reordered_kloop_keeps_the_abi_and_never_claims_identity() {
         let edited = TWIN.replace(
-            "            moent::advance(wg)?;\n            moent::load_w(wg, g, 0)?;\n",
-            "            moent::load_w(wg, g, 0)?;\n            moent::advance(wg)?;\n",
+            "            moent::advance(wg)?;\n            if g.gate_up() && g.nt() == 8 {\n                wg.barrier(())?;\n            }\n            moent::load_w(wg, g, 0)?;\n",
+            "            if g.gate_up() && g.nt() == 8 {\n                wg.barrier(())?;\n            }\n            moent::load_w(wg, g, 0)?;\n            moent::advance(wg)?;\n",
         );
         assert_ne!(edited, TWIN);
         for epi in ["down_gp_nt4", "gate_up_nt8"] {

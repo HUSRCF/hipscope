@@ -73,10 +73,12 @@ mod app {
     /// Immutable baselines (lead): the gfx1201 objects and the shared sources. Re-pinned on land-rc5 over beta 12daf4fe9:
     /// the objects are the exact beta 12daf4fe9 blobs (n_experts@60 guard; rc3/rc4 pins were
     /// fea044d00e2989172fb440aef1af2304c70ccbf5c663508c0c0ec912afb15481 / 83822312b26a2f90fa688e39f610f1b95528e035c5118946b7060df3cc254833).
+    /// The gfx1201 pin was then moved by the gfx1201 NT8 `gate_up` epoch-lock bake (was
+    /// 0eea1673a530880586dc0cd179b7a3ef3dfd491660dff439f7b54e921792791e).
     const PINNED_OBJECTS: [(&str, &str); 2] = [
         (
             "qwen4_moe_iu4_sym_pm_gfx1201.hxaco",
-            "0eea1673a530880586dc0cd179b7a3ef3dfd491660dff439f7b54e921792791e",
+            "44177c21de25bec8502f63f318e682dc4fa1948420723c75dec14fa63cfed723",
         ),
         (
             "qwen4_moe_iu4_sym_w3_pm_gfx1201.hxaco",

@@ -666,6 +666,14 @@ macro_rules! transitions_tuple {
         }
     };
 }
+/// A barrier that moves no LDS ownership: a pure workgroup rendezvous.
+impl Transitions for () {
+    type After = ();
+    fn lower(&self, _: &mut Lowering) -> Result<(), String> {
+        Ok(())
+    }
+    fn after(self) -> Self::After {}
+}
 transitions_tuple!(A);
 transitions_tuple!(A, B);
 transitions_tuple!(A, B, C);

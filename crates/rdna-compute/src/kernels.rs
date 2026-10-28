@@ -4455,8 +4455,12 @@ pub const QWEN4_MOE_IU4_SYM_GFX1151_SRC: &str = concat!(
 /// obligation-free). Same ABI, grid and bytes as the gfx1151 hipcc entries.
 /// SHA-256 (contracts under `crates/peacemaker-isa/kernels/qwen4_moe_sym.*.contract.json`):
 /// gfx1151 20d6a98d700d2eb47dc5c5f8b74ee65835912c317898ce42c345cf0cddb78c0a (was c0f826ba…, ede9af50…, 2540a22b…),
-/// gfx1201 0eea1673a530880586dc0cd179b7a3ef3dfd491660dff439f7b54e921792791e (was fea044d0…, 792b207a…, 7179393f…);
-/// the latest step widens the kernarg ABI from 60 to 64 bytes (trailing `n_experts` at offset 60) and replaces the
+/// gfx1201 44177c21de25bec8502f63f318e682dc4fa1948420723c75dec14fa63cfed723 (was 0eea1673…, fea044d0…, 792b207a…, 7179393f…);
+/// the newest step bakes the GPU-confirmed, bit-identical NT8 `gate_up` epoch lock into
+/// `qwen4_moe_gate_up_silu_iu4_sym_pm_gfx1201_nt8` only (two workgroup barriers per K-loop trip, one rendezvous per
+/// K128 epoch); every other export's code is byte-identical to 0eea1673…, and the module is emitted with
+/// `--bundle FILE --host-target host-x86_64-unknown-linux-gnu-` (the committed bundle's host entry);
+/// the previous step widens the kernarg ABI from 60 to 64 bytes (trailing `n_experts` at offset 60) and replaces the
 /// `expert id < 0` sentinel exit with one unsigned `expert id >= n_experts` exit, so an out-of-range id (non-finite
 /// router row) returns before any `expert_weight_ptrs[id]` load; finite-id outputs are unchanged;
 /// the earlier steps differ from their predecessors only by the `.comment` stamp

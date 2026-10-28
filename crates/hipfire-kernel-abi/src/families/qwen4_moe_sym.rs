@@ -616,7 +616,7 @@ const OBJ_PM_GFX1151: ObjectRefV1 = ObjectRefV1::Embedded {
 const OBJ_PM_GFX1201: ObjectRefV1 = ObjectRefV1::Embedded {
     module: "qwen4_moe_iu4_sym_pm_gfx1201",
     artifact: "kernels/qwen4_moe_iu4_sym_pm_gfx1201.hxaco",
-    sha256: "0eea1673a530880586dc0cd179b7a3ef3dfd491660dff439f7b54e921792791e",
+    sha256: "44177c21de25bec8502f63f318e682dc4fa1948420723c75dec14fa63cfed723",
 };
 const OBJ_PM_GFX1100: ObjectRefV1 = ObjectRefV1::Embedded {
     module: "qwen4_moe_iu4_sym_pm_gfx1100",
