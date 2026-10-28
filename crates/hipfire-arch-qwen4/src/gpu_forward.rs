@@ -10682,7 +10682,7 @@ impl Qwen4GpuForward {
             host_token_bytes,
             uploaded_id_rows: 0,
             host_ple: PleHostStage::new(
-                host_ple_bytes,
+                host_ple_bytes.len(),
                 ple_async_upload_enabled(
                     hipfire_config::developer_var(PLE_ASYNC_UPLOAD_ENV)
                         .ok()
@@ -10724,7 +10724,7 @@ impl Qwen4GpuForward {
             mesh_route_rows: None,
             mesh_segment: None,
             mesh_next_op: None,
-            mesh_tokens: PleHostStage::new(vec![0u8; max_chunk * std::mem::size_of::<i32>()], true),
+            mesh_tokens: PleHostStage::new(max_chunk * std::mem::size_of::<i32>(), true),
             lane_tokens: crate::lane_token_ring::LaneTokenRing::new(
                 max_chunk * std::mem::size_of::<i32>(),
             ),

@@ -3612,6 +3612,22 @@ impl HipRuntime {
         self.check(code, "hipMemcpyAsync H2D")
     }
 
+    /// Host-asynchronous H→D copy ordered on `stream` (`None` = the legacy
+    /// stream, only when the caller has no stream). `src` must stay unchanged
+    /// until the stream reaches the copy; a pinned `src` makes this a plain
+    /// stream-ordered DMA.
+    pub fn memcpy_htod_async_on(
+        &self,
+        dst: &DeviceBuffer,
+        src: &[u8],
+        stream: Option<&Stream>,
+    ) -> HipResult<()> {
+        match stream {
+            Some(stream) => self.memcpy_htod_async(dst, src, stream),
+            None => self.memcpy_htod_async_default(dst, src),
+        }
+    }
+
     /// Host-asynchronous H→D copy on the legacy/default stream: `src` must
     /// stay unchanged until the stream reaches the copy.
     pub fn memcpy_htod_async_default(&self, dst: &DeviceBuffer, src: &[u8]) -> HipResult<()> {
