@@ -1067,6 +1067,10 @@ name = "draft_lane_rows_oracle"
 required-features = ["lab"]
 
 [[example]]
+name = "head_batch_oracle"
+required-features = ["lab"]
+
+[[example]]
 name = "lane_gdn_oracle"
 required-features = ["lab", "deltanet"]
 
