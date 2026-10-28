@@ -42,8 +42,7 @@ BOUNDED_MAX_TOKENS = 8
 # Prompt-length sweep of the bounded profile, in FILLER words (the chat template adds ~12 rows): every
 # row count to 8, a coarse stride through the row classes below one 768-row S1 tile, the tile edge,
 # and multi-tile prompts of ~1K..4K words.
-BOUNDED_WORDS = (1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 16, 20, 24, 32, 48, 64, 96, 128, 192, 256, 384, 512, 640, 768,
-                 1100, 1600, 2400, 4100)
+BOUNDED_WORDS = (1, 2, 3, 4, 5, 6, 8, 12, 16, 24, 32, 48, 64, 128, 256, 384, 512, 768, 1600, 4100)
 # Depth prompts of the XtxGap PF screens (8,204 / 16,896 / 32,780 framed rows): one partial S1 window, exactly
 # one 16,896-row window, one full window plus a 15,884-row second window and tail.
 BOUNDED_DEPTH_PROMPTS = ("depth_8192.txt", "depth_16884.txt", "depth_32768.txt")
@@ -94,32 +93,31 @@ def filler_words(n):
 
 def bounded_plan(prompt_dir):
     """The gfx1100 Flash-Next walk (`--profile xtx-fn-bounded`): the same plan for the AR and the MTP route,
-    every generate decoding at most BOUNDED_MAX_TOKENS tokens. Greedy and sampled generates on a short
-    prompt (sampler + MTP verify/accept kernels), a prompt-length sweep (short prefill row classes, the
-    768-row S1 tile and its tails), a session resume, thinking-on generates, then the 8K / 16.9K / 32K depth
-    prompts (S1 windows, the window tail, deep decode context) last, so a card fault there leaves every
-    cheaper request recorded."""
+    every generate decoding at most BOUNDED_MAX_TOKENS tokens. Sized to the XTX's measured speeds (rw1: prefill
+    of a sub-512-row prompt is 2.6-28 s, 8 decoded tokens ~2 s, load ~105 s): ~37 requests, ~320 s of requests.
+    Sampled generates on a short prompt (sampler + MTP verify/accept kernels), thinking-on generates (a
+    4-token think budget), a prompt-length sweep (short prefill row classes, the 768-row S1 tile), a session
+    resume, then the 8K / 16.9K / 32K depth prompts (S1 windows, the window tail, deep decode context)."""
     cap = BOUNDED_MAX_TOKENS
     plan = [{"type": "generate", "prompt": "Hi", "max_tokens": cap, "temperature": 0}]
     short = "Name three rivers in Europe."
-    for s in SAMPLING:
+    for s in SAMPLING[1:]:     # SAMPLING[0] is plain greedy: the warmup and the sweep already are
         plan.append(dict({"type": "generate", "prompt": short, "max_tokens": cap}, **s))
-    for n in BOUNDED_WORDS:
-        plan.append({"type": "generate", "prompt": filler_words(n), "max_tokens": cap, "temperature": 0,
-                     "_words": n})
-    for n in (40, 300):
-        plan.append({"type": "generate", "prompt": filler_words(n), "max_tokens": cap, "temperature": 0.8,
-                     "top_k": 40, "seed": n, "_words": n})
-    # Session resumes (append prefill onto a cached prefix), greedy then sampled.
-    plan.append({"type": "generate", "prompt": short, "max_tokens": cap, "temperature": 0})
-    plan.append({"type": "generate", "chain_user": "Now name two more.", "max_tokens": cap, "temperature": 0})
-    plan.append({"type": "generate", "chain_user": "Which is longest?", "max_tokens": cap, "temperature": 0.7,
-                 "top_p": 0.9})
     # Thinking-on generates (the typed flag the daemon treats as authoritative), tiny think budget.
     for s in ({"temperature": 0}, {"temperature": 0.6, "top_p": 0.95, "top_k": 20}):
         plan.append(dict({"type": "generate", "prompt": "Is 391 prime? Reason step by step, then answer.",
                           "max_tokens": cap, "thinking_enabled": True, "max_think_tokens": 4,
                           "_name": "think-short"}, **s))
+    for n in BOUNDED_WORDS:
+        plan.append({"type": "generate", "prompt": filler_words(n), "max_tokens": cap, "temperature": 0,
+                     "_words": n})
+    plan.append({"type": "generate", "prompt": filler_words(40), "max_tokens": cap, "temperature": 0.8,
+                 "top_k": 40, "seed": 40, "_words": 40})
+    # Session resumes (append prefill onto a cached prefix), greedy then sampled.
+    plan.append({"type": "generate", "prompt": short, "max_tokens": cap, "temperature": 0})
+    plan.append({"type": "generate", "chain_user": "Now name two more.", "max_tokens": cap, "temperature": 0})
+    plan.append({"type": "generate", "chain_user": "Which is longest?", "max_tokens": cap, "temperature": 0.7,
+                 "top_p": 0.9})
     for name in BOUNDED_DEPTH_PROMPTS:
         plan.append({"type": "generate", "prompt": (prompt_dir / name).read_text(), "max_tokens": cap,
                      "temperature": 0, "_name": name})
@@ -215,6 +213,9 @@ def main():
     ap.add_argument("--load-param", action="append", default=[], metavar="K=JSON",
                     help="extra key of the load request's params, value as JSON (e.g. kv_mode='\"q8\"')")
     ap.add_argument("--timeout", type=float, default=3000)
+    ap.add_argument("--request-timeout", type=float, default=0,
+                    help="seconds one request may take before the daemon is killed and the partial walk is "
+                         "recorded (0: only --timeout applies)")
     ap.add_argument("--sealed", action="store_true",
                     help="validate a checked-in plan: keep route plans on, so any kernel the sealed "
                          "route did not plan fails its request")
@@ -276,30 +277,54 @@ def main():
     deadline = time.monotonic() + a.timeout
     last_text = ""
 
+    def abort(reason):
+        """The walk ended early (daemon exit, request or walk timeout): keep what it recorded. The audit stream
+        of the completed requests stays a valid, smaller walk; `route_plan_build.py --accept-partial` takes it."""
+        kill_daemon()
+        (run / "result.json").write_text(json.dumps({"rc": None, "ok": False, "partial": True, "reason": reason,
+                                                     "errors": errors, "results": results}, indent=1))
+        print(json.dumps({"partial": True, "reason": reason, "requests": len(results) - 1}), flush=True)
+        raise SystemExit(f"walk ended early: {reason}")
+
     def send(msg, done_types):
         nonlocal last_text
         proc.stdin.write(json.dumps(msg) + "\n")
         proc.stdin.flush()
         t = time.monotonic()
         last_text = ""
-        while time.monotonic() < deadline:
-            line = proc.stdout.readline()
-            if not line:
-                raise SystemExit(f"daemon exited during {msg.get('type')}")
-            out.write(line)
-            try:
-                obj = json.loads(line)
-            except ValueError:
-                continue
-            if obj.get("type") == "token":
-                last_text += obj.get("text", "")
-            if obj.get("type") == "commit_ready":
-                proc.stdin.write(json.dumps({"type": "commit", "id": obj["id"],
-                                             "attempt_id": obj["attempt_id"]}) + "\n")
-                proc.stdin.flush()
-            if obj.get("type") in done_types:
-                return obj, time.monotonic() - t
-        raise SystemExit("walk timeout")
+        timed_out = []
+
+        def request_expired():
+            timed_out.append(True)
+            kill_daemon()
+
+        timer = threading.Timer(a.request_timeout, request_expired) if a.request_timeout > 0 else None
+        if timer:
+            timer.daemon = True
+            timer.start()
+        try:
+            while time.monotonic() < deadline:
+                line = proc.stdout.readline()
+                if not line:
+                    abort(f"request timeout {a.request_timeout}s during {msg.get('type')} {msg.get('id', '')}"
+                          if timed_out else f"daemon exited during {msg.get('type')} {msg.get('id', '')}")
+                out.write(line)
+                try:
+                    obj = json.loads(line)
+                except ValueError:
+                    continue
+                if obj.get("type") == "token":
+                    last_text += obj.get("text", "")
+                if obj.get("type") == "commit_ready":
+                    proc.stdin.write(json.dumps({"type": "commit", "id": obj["id"],
+                                                 "attempt_id": obj["attempt_id"]}) + "\n")
+                    proc.stdin.flush()
+                if obj.get("type") in done_types:
+                    return obj, time.monotonic() - t
+        finally:
+            if timer:
+                timer.cancel()
+        abort("walk timeout")
 
     def prompt_tokens_of(done_obj):
         """Prompt length the daemon reports on `done` (prompt_tokens, else prefill + cached)."""

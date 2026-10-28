@@ -79,12 +79,12 @@ class BoundedPlan(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             plan = walk.bounded_plan(prompt_dir(pathlib.Path(tmp)))
         sampled = [m for m in plan if m.get("prompt") == "Name three rivers in Europe." and "chain_user" not in m]
-        self.assertGreaterEqual(len(sampled), len(walk.SAMPLING))
+        self.assertEqual(len(sampled), len(walk.SAMPLING) - 1 + 1)   # + the resume's first turn
         self.assertEqual([m["_words"] for m in plan if m.get("temperature") == 0 and "_words" in m],
                          list(walk.BOUNDED_WORDS))
         self.assertEqual(sum("chain_user" in m for m in plan), 2)
         self.assertEqual(sum(bool(m.get("thinking_enabled")) for m in plan), 2)
-        self.assertEqual(len(plan), 1 + len(walk.SAMPLING) + len(walk.BOUNDED_WORDS) + 2 + 3 + 2 + 3)
+        self.assertEqual(len(plan), 1 + (len(walk.SAMPLING) - 1) + 2 + len(walk.BOUNDED_WORDS) + 1 + 3 + 3)
 
     def test_filler_words_has_exactly_n_words(self):
         for n in (1, 8, 33, 4100):
@@ -137,6 +137,34 @@ class FakeDaemonWalk(unittest.TestCase):
                     os.kill(pid, 0)
                     time.sleep(0.1)
                 os.kill(pid, 0)
+
+    def test_request_timeout_records_a_partial_walk_and_kills_the_daemon(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            prompt_dir(root)
+            pid_file = root / "daemon.pid"
+            r = run_walker(root, "ar", ["--request-timeout", "3"], {"FAKE_PID_FILE": str(pid_file), "FAKE_HANG_AFTER": "5"})
+            self.assertNotEqual(r.returncode, 0)
+            result = json.loads((root / "run-ar" / "result.json").read_text())
+            self.assertTrue(result["partial"])
+            self.assertFalse(result["ok"])
+            self.assertEqual(result["errors"], 0)
+            self.assertEqual(len(result["results"]), 1 + 4)       # load + the four requests that finished
+            self.assertIn("request timeout", result["reason"])
+            with self.assertRaises(ProcessLookupError):
+                for _ in range(50):
+                    os.kill(int(pid_file.read_text()), 0)
+                    time.sleep(0.1)
+                os.kill(int(pid_file.read_text()), 0)
+
+    def test_whole_walk_timeout_also_records_a_partial_walk(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            prompt_dir(root)
+            run_walker(root, "ar", ["--timeout", "3"], {"FAKE_HANG_AFTER": "3"})
+            result = json.loads((root / "run-ar" / "result.json").read_text())
+            self.assertTrue(result["partial"])
+            self.assertEqual(len(result["results"]), 1 + 2)
 
     def test_sigterm_of_the_walker_kills_the_daemon(self):
         import signal

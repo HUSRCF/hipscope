@@ -259,6 +259,23 @@ class Gfx1100FlashNext(unittest.TestCase):
 
     STATE = "  qwen4 state: QSA q8 (Q8_0 blocks of 32) K/V (legacy context storage), GDN q8 recurrent"
 
+    def test_partial_walk_is_refused_unless_accepted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            model = root / "fn.hfq"
+            write_hfqm(model, 16, TRUNK)
+            walk = make_walk(root, "ar", "ar", model, [self.STATE, *audit("gfx1100", [("add", "add_f32")], [])], max_seq=262144)
+            (walk / "result.json").write_text(json.dumps({"rc": None, "ok": False, "partial": True, "reason": "walk timeout",
+                                                          "errors": 0, "results": []}))
+            with self.assertRaises(SystemExit):
+                run_build(root / "p.tsv", "--model", str(model), "--walk", f"ar={walk}")
+            text = run_build(root / "p.tsv", "--model", str(model), "--walk", f"ar={walk}", "--accept-partial")
+            self.assertIn("ar\thip\tadd\tadd_f32\t" + HIP_SHA, text.splitlines())
+            (walk / "result.json").write_text(json.dumps({"rc": None, "ok": False, "partial": True, "reason": "x",
+                                                          "errors": 1, "results": []}))
+            with self.assertRaises(SystemExit):
+                run_build(root / "p.tsv", "--model", str(model), "--walk", f"ar={walk}", "--accept-partial")
+
     def test_plan_axes_open_seal_and_trace_rows(self):
         spec = importlib.util.spec_from_file_location("route_plan_trace_rows",
                                                       pathlib.Path(__file__).with_name("route_plan_trace_rows.py"))
