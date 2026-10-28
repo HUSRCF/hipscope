@@ -854,6 +854,18 @@ charged: its snapshots yield to context growth (see
 `memory.session_cache_bytes`). On a discrete GPU an omitted Qwen4 `max_seq`
 stays 32768 and an explicit one is not checked at load.
 
+**Capping `max_seq` for 8K-class work on a slow-link 7900 XTX.** On a 7900 XTX
+(gfx1100, 24 GB, PCIe x4) running Flash-Next, a smaller `max_seq` frees KV and
+gather-workspace memory that expert placement turns into resident expert
+layers. A load capped at `max_seq` 8448 admits 10 resident expert layers
+instead of 6 at 262,144, and measured +5.4 to +5.7% 8K prefill (1,035 / 1,002
+tok/s against 982 / 948, same-index cells, n=2). A 33,792 cap admitted 9
+resident layers but no clean 32K gain (+0.7% prefill, 1,720 against 1,708
+tok/s, noise-level). Each resident-layer count is its own numerical identity:
+greedy token IDs diverge between counts (first at token 53 at 32K, 6 against 9
+layers), so this is a placement choice, not an exact equivalence. Cap
+`max_seq` for 8K-class workloads; leave it at the default for long context.
+
 **Free device memory on unified memory.** Every free-memory sizing site
 (this admission, expert placement, the dense Qwen card bound below, VMM KV
 provisioning, prefill rungs, the session cache) reads `Gpu::device_mem_info`
