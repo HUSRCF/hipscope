@@ -3004,6 +3004,15 @@ fn mq3v25_route_requires_marker_flag_multirow_and_exact_arch() {
             assert!(!mq3v25_route(&flags, true, 8192, 4100));
             assert!(!mq3v25_route(&flags, true, 64, 4096));
         }
+        if arch == "gfx1201" {
+            // Speculative-verify widths stay on the fp16 WMMA route; A4 from 17 rows.
+            for n in [2, 3, 4, 8, 16] {
+                assert!(!mq3v25_route(&flags, true, n, 4096), "n={n}");
+            }
+            for n in [17, 24, 64, 8192] {
+                assert!(mq3v25_route(&flags, true, n, 4096), "n={n}");
+            }
+        }
 
         flags.mq3v25_a4 = Some(false);
         assert!(!mq3v25_route(&flags, true, 8192, 4096), "{arch}");

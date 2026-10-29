@@ -16,8 +16,17 @@ use crate::tables::KernelRegistry;
 use crate::traits::KernelFamily;
 use crate::types::*;
 
+/// First gfx1201 row count at which the qt49 A4 consumer (128x128 MMQ tile,
+/// width-independent cost) beats the fp16 WMMA tiles. Up to 16 rows the WMMA
+/// kernel runs a single 16-row batch tile and is 1.3-1.7x faster than A4 on
+/// every 27B projection shape (measured on R9700, n=2..16); from 24 rows its
+/// second batch tile makes A4 faster or equal. Speculative verify (MTP, a few rows;
+/// DFlash block 16) therefore stays on the WMMA incumbent.
+const MQ3V25_A4_GFX1201_MIN_ROWS: usize = 17;
+
 /// Symmetric-MQ3V2 (qt49) A4 fast path. Multirow only: singleton decode
-/// (`batch_size == 1`) keeps the incumbent GEMV regardless of the flag.
+/// (`batch_size == 1`) keeps the incumbent GEMV regardless of the flag, and
+/// gfx1201 keeps narrow batches (speculative verify widths) on the WMMA route.
 pub(crate) fn mq3v25_route(
     flags: &rdna_compute::FeatureFlags,
     symmetric: bool,
@@ -28,7 +37,7 @@ pub(crate) fn mq3v25_route(
         && flags.mq3v25_a4_enabled(symmetric)
         && match flags.arch.as_str() {
             "gfx1100" => m % 128 == 0 && batch_size >= 128,
-            "gfx1201" => true,
+            "gfx1201" => batch_size >= MQ3V25_A4_GFX1201_MIN_ROWS,
             _ => false,
         }
 }
