@@ -772,6 +772,13 @@ pub(crate) fn decode_raw_codec(
             ),
         ));
     }
+    if codec.dtype == DType::HFQ4G128 {
+        // Same per-row extent the weight_store manifest paths enforce: a
+        // pre-`b4846285e` file packs groups across rows and decodes to NaN.
+        crate::weight_store::validate_payload_extent(&[m, k], codec.dtype, data.len()).map_err(
+            |reason| hip_bridge::HipError::new(0, &format!("tensor {name}: {reason}{BLOB_FIX}")),
+        )?;
+    }
     if codec.dtype == DType::MQ4G256V2 {
         let gpr = k / 256;
         let expected = m * gpr * 136;
