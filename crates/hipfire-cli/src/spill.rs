@@ -9,7 +9,7 @@
 //!
 //! Linux (amdgpu sysfs) only. Anywhere the counters are unreadable (no
 //! amdgpu, no permission, non-Linux) the monitor is simply absent.
-//! [INFERENCE] A Windows signal would need the DXGI budget query matched to
+//! A Windows signal would need the DXGI budget query matched to
 //! the daemon's adapter, which the CLI cannot do without a device resolver
 //! of its own, so Windows is a no-op.
 

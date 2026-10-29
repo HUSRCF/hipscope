@@ -927,9 +927,13 @@ A -> B` line, and lowers the published context (and `card_cap`) to it; below 512
 the load is refused. An explicit `max_seq` that does not fit is refused at load,
 naming the largest fitting value; with `memory.oom_guard` off it loads and only
 warns.
-Larger prefill PBS allocations are lazy: each request chooses the widest rung
-that fits currently free VRAM after mapped (not virtually reserved) KV. When
-future KV growth needs the memory, widened PBS reuse is released between
+Larger prefill PBS allocations are lazy: each request chooses, once per prompt,
+the widest rung that fits currently free VRAM after mapped (not virtually
+reserved) KV minus the KV the same prompt will still map (the AR, vision,
+native-MTP and DFlash prompt paths deduct it; with no remaining growth the
+choice is unchanged). A long prompt on a tight card therefore runs narrower
+chunks instead of letting an early wide PBS take memory its own later KV needs.
+When future KV growth needs the memory, widened PBS reuse is released between
 requests, allowing later chunks to narrow rather than making growth OOM.
 The loaded diagnostic reports `max_seq`, its `model`/`card`/`user` bound,
 `model_ctx`, `card_cap` and KV mode. Qwen MoE uses the same automatic sizing on
@@ -1240,7 +1244,8 @@ Three checks exist; only two are gated:
   deployment target is refused regardless of this box's RAM.
 - **VRAM fit of an explicit single-card Qwen VMM `max_seq`** — after the whole
   load (weights, drafts, scratch) the loader measures the largest context that
-  fits free VRAM with the minimum prefill reserve; an explicit `max_seq` above
+  fits free VRAM with the per-request reserve (see the dense Qwen automatic
+  context above); an explicit `max_seq` above
   it is refused at load naming that value. Gated only by an explicit `off`
   (`false`/`0`), which prints the same message as a warning
   (`memory.oom_guard off: loading anyway`) and keeps the requested context;
