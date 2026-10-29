@@ -1417,6 +1417,8 @@ pub fn plain_gemm_key_for(dt: DType) -> crate::types::KernelKey {
     match dt {
         DType::TQ2G128 => K::GemmTQ2G128Prefill,
         DType::BQ1G128 => K::GemmBQ1G128Prefill,
+        // Float weights kept F32 (the GDN beta/alpha matrices of a GGUF file).
+        DType::F32 => K::GemmF32RegisterTiled,
         _ => K::GemmQ8_0BatchedChunked,
     }
 }

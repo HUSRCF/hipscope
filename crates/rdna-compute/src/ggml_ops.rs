@@ -46,6 +46,10 @@ pub struct GgmlScratch {
     /// Activation copy for the A8 emulation (`n * k` F32), grown on demand.
     pub a8: Option<GpuTensor>,
     pub a8_bytes: usize,
+    /// Codec-only activation split (`hi`, `lo` F32 `n * k` each, then the
+    /// second GEMM's `n * m` F32 output), grown on demand.
+    pub split: Option<GpuTensor>,
+    pub split_bytes: usize,
     /// Prefill numeric mode, set by the loader from the environment.
     pub prefill: GgmlPrefill,
 }
@@ -53,8 +57,10 @@ pub struct GgmlScratch {
 /// How prefill treats a ggml weight (see the module docs).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct GgmlPrefill {
-    /// Codec-only quality tier: weights dequantised to BF16-rounded F32 and
-    /// multiplied by the engine's F32 GEMM against F32 activations.
+    /// Codec-only quality tier: weights dequantised to BF16-rounded values,
+    /// multiplied on the engine's F16 WMMA GEMM against F32 activations
+    /// carried as an exact hi (BF16-rounded) + lo (residual) pair, so the
+    /// activation keeps about 20 mantissa bits and the accumulation is F32.
     pub codec_only: bool,
     /// Emulate the `ggml.a8q81` activation quantisation in prefill: the GEMM
     /// input is rounded through q8_1 (per 32, f16 scale) before the multiply.
@@ -219,7 +225,8 @@ impl Gpu {
         n: usize,
     ) -> HipResult<()> {
         let mode = self.scratch.ggml.prefill;
-        let elem = if mode.codec_only { 4 } else { 2 };
+        // Codec-only holds the F32 dequantisation (4 B) and its F16 copy (2 B).
+        let elem = if mode.codec_only { 6 } else { 2 };
         let need = m
             .checked_mul(k)
             .and_then(|v| v.checked_mul(elem))
@@ -260,9 +267,39 @@ impl Gpu {
             x.shallow_clone()
         };
         if mode.codec_only {
-            let wv = GpuTensor { buf: mat.buf.byte_view(0, need), shape: vec![m * k], dtype: DType::F32 };
-            self.ggml_dequant_weight(dtype, w, m, k, &wv, Some(true))?;
-            self.gemm_f32_batched(&wv, &input, y, m, k, n)
+            // Weights: dequantise to BF16-rounded F32, then copy into F16 (a
+            // BF16-rounded value is exact in F16 over the weights' range).
+            let wf = GpuTensor { buf: mat.buf.byte_view(0, m * k * 4), shape: vec![m * k], dtype: DType::F32 };
+            let wh = GpuTensor { buf: mat.buf.byte_view(m * k * 4, m * k * 2), shape: vec![m, k], dtype: DType::F16 };
+            self.ggml_dequant_weight(dtype, w, m, k, &wf, Some(true))?;
+            self.cast_f32_to_f16(&wf, &wh)?;
+            // Activations: x = hi + lo, hi = bf16(x), lo = x - hi (exact in
+            // F32). Both parts go through the F16 WMMA GEMM (F32 accumulate)
+            // and the two products are summed in F32.
+            let (nk, nm) = (n * k, n * m);
+            let bytes = (2 * nk + nm) * 4;
+            if self.scratch.ggml.split_bytes < bytes {
+                self.invalidate_for_scratch_growth();
+                if let Some(old) = self.scratch.ggml.split.take() {
+                    self.hip.device_synchronize()?;
+                    let _ = self.hip.free(old.buf);
+                }
+                let buf = self.hip.malloc(bytes)?;
+                self.scratch.ggml.split = Some(GpuTensor { buf, shape: vec![bytes / 4], dtype: DType::F32 });
+                self.scratch.ggml.split_bytes = bytes;
+            }
+            let sp = self.scratch.ggml.split.as_ref().expect("allocated").shallow_clone();
+            let hi = GpuTensor { buf: sp.buf.byte_view(0, nk * 4), shape: vec![nk], dtype: DType::F32 };
+            let lo = GpuTensor { buf: sp.buf.byte_view(nk * 4, nk * 4), shape: vec![nk], dtype: DType::F32 };
+            let y2 = GpuTensor { buf: sp.buf.byte_view(2 * nk * 4, nm * 4), shape: vec![nm], dtype: DType::F32 };
+            self.copy_d2d(&input, &hi, nk * 4)?;
+            self.bf16_round_trip_f32(&hi)?;
+            self.copy_d2d(&hi, &lo, nk * 4)?;
+            self.scale_f32(&lo, -1.0)?;
+            self.add_inplace_f32_raw(lo.buf.as_ptr(), input.buf.as_ptr(), nk)?;
+            self.gemm_f16_wmma_mb8(&wh, &hi, y, m, k, n)?;
+            self.gemm_f16_wmma_mb8(&wh, &lo, &y2, m, k, n)?;
+            self.add_inplace_f32_raw(y.buf.as_ptr(), y2.buf.as_ptr(), nm)
         } else {
             let wv = GpuTensor { buf: mat.buf.byte_view(0, need), shape: vec![m, k], dtype: DType::F16 };
             self.ggml_dequant_weight(dtype, w, m, k, &wv, None)?;
@@ -276,6 +313,7 @@ impl Gpu {
             self.scratch.ggml.q81.take(),
             self.scratch.ggml.mat.take(),
             self.scratch.ggml.a8.take(),
+            self.scratch.ggml.split.take(),
         ]
             .into_iter()
             .flatten()
@@ -285,6 +323,7 @@ impl Gpu {
         }
         self.scratch.ggml.mat_bytes = 0;
         self.scratch.ggml.a8_bytes = 0;
+        self.scratch.ggml.split_bytes = 0;
     }
 
     /// Non-owning view of the q8_1 scratch.

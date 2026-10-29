@@ -60,8 +60,9 @@ pub fn ggml_type_dtype(ty: GgmlType) -> Option<DType> {
 }
 
 /// `HIPFIRE_GGUF_CODEC_ONLY=1`: prefill dequantises each layer to BF16-rounded
-/// F32 (the codec-only quality tier: host-equivalent dequant, BF16 weights,
-/// F32 activations, no q8_1 activation quantisation) instead of F16. Prefill
+/// weights (the codec-only quality tier: host-equivalent dequant, BF16 weights,
+/// F32-class activations carried as an exact hi + lo F16 pair, F32 accumulate,
+/// no q8_1 activation quantisation) instead of plain F16. Prefill
 /// and scoring only; the decode GEMV always runs the shipped A8 route.
 pub const CODEC_ONLY_ENV: &str = "HIPFIRE_GGUF_CODEC_ONLY";
 
@@ -78,7 +79,8 @@ pub const A8_EMU_ENV: &str = "HIPFIRE_GGUF_A8_EMU";
 pub enum PrefillDequant {
     /// F16 weights, the engine's F16 WMMA GEMM (shipped route, A16 prefill).
     F16,
-    /// BF16-rounded F32 weights, F32 GEMM (codec-only tier).
+    /// BF16-rounded weights (F32 dequantisation plus its F16 copy), hi + lo
+    /// activation split on the F16 WMMA GEMM (codec-only tier).
     Bf16RoundedF32,
 }
 
@@ -94,7 +96,7 @@ impl PrefillDequant {
     pub fn elem_bytes(self) -> usize {
         match self {
             PrefillDequant::F16 => 2,
-            PrefillDequant::Bf16RoundedF32 => 4,
+            PrefillDequant::Bf16RoundedF32 => 6,
         }
     }
 }
@@ -486,7 +488,7 @@ impl WeightSource for GgufSource<'_> {
             match self.prefill {
                 PrefillDequant::F16 => "dequant->F16 GEMM (A16 activations)",
                 PrefillDequant::Bf16RoundedF32 =>
-                    "codec-only tier: dequant->BF16-rounded F32 GEMM (no activation quantisation)",
+                    "codec-only tier: dequant->BF16-rounded weights, hi+lo F16 WMMA GEMM (no activation quantisation)",
             },
             if a8_emulation { ", q8_1 activation emulation ON" } else { "" }
         );

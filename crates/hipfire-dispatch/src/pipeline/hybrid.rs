@@ -423,18 +423,16 @@ pub fn normed_projection<const N: usize>(
 ) -> Result<(), DispatchError> {
     const { assert!(N >= 1 && N <= 4) };
     let first = &projections[0].0;
-    if first.dtype.is_ggml() {
+    if projections.iter().any(|(w, _)| w.dtype.is_ggml()) {
         // GGUF-native: plain RMSNorm into `normed`, ONE q8_1 producer launch
-        // shared by every projection of this window, one mmvq per projection
-        // (numeric contract `ggml.a8q81.<type>`). No fusion table row exists
-        // for the ggml dtypes.
-        if projections
-            .iter()
-            .any(|(w, _)| !w.dtype.is_ggml() || w.k != first.k)
-        {
+        // shared by every ggml projection of this window, one mmvq per
+        // projection (numeric contract `ggml.a8q81.<type>`). Float
+        // projections of the same window (the GDN beta/alpha matrices are
+        // stored F32 in GGUF files) read the same normed row through the
+        // plain GEMV. No fusion table row exists for the ggml dtypes.
+        if projections.iter().any(|(w, _)| w.k != first.k) {
             return Err(DispatchError::Hip(
-                "normed projection: ggml weights cannot share a window with other formats or widths"
-                    .into(),
+                "normed projection: ggml window projections must share one input width".into(),
             ));
         }
         gpu.rmsnorm_f32(x, norm, normed, eps).map_err(hip)?;
@@ -442,8 +440,26 @@ pub fn normed_projection<const N: usize>(
             .ggml_quantize_activation(normed, first.k, None)
             .map_err(hip)?;
         for (w, out) in &projections {
-            gpu.ggml_gemv_quantized(w.dtype, w.buf, w.m, w.k, &q81, out, false)
-                .map_err(hip)?;
+            if w.dtype.is_ggml() {
+                gpu.ggml_gemv_quantized(w.dtype, w.buf, w.m, w.k, &q81, out, false)
+                    .map_err(hip)?;
+            } else {
+                let plain_w = WeightRef {
+                    row_stride: 0,
+                    rotation: None,
+                    awq_scale: None,
+                    ..*w
+                };
+                execute_steps(
+                    gpu,
+                    ctx,
+                    &[Step::Gemv {
+                        w: &plain_w,
+                        input: GemvInput::Prerotated(normed),
+                        out,
+                    }],
+                )?;
+            }
         }
         return Ok(());
     }
