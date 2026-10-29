@@ -2861,6 +2861,9 @@ pub enum RequestBypass {
     },
     /// The profile's tile is not a valid chunk for this request.
     NoRows,
+    /// SP is armed, the request is a single window of 5..=tile rows, and that
+    /// window is not SP-qualified: the incumbent runs.
+    Sp(crate::slowlink_sp::SpBypass),
 }
 
 /// Judge a request against the frozen profile, before any mutation or S1
@@ -2899,6 +2902,46 @@ pub fn qualify_request(
     Ok(RequestVerdict {
         rows: request.rows,
         windows: profile.windows_for(request.rows),
+    })
+}
+
+/// [`qualify_request`] with SP armed (HOOK-DESIGN §5.1, per request).
+///
+/// A request of `SP_MIN_ROWS ..= profile.tile_rows` rows is one window of one
+/// tile, below S1's own multi-chunk floor: S1 admits it **only if that window
+/// is SP-qualified** ([`crate::slowlink_sp::qualify_sp_shape`]); otherwise the
+/// incumbent runs, with the named reason. Every other request (off, shorter,
+/// or longer than one tile) is exactly [`qualify_request`], with SP decided per
+/// window by the runtime.
+pub(crate) fn qualify_request_sp(
+    mode: SlowlinkMode,
+    profile: &SlowlinkProfile,
+    sp: &crate::slowlink_sp::SpProfile,
+    request: &RequestShape,
+) -> Result<RequestVerdict, RequestBypass> {
+    let single_tile = (crate::slowlink_sp::SP_MIN_ROWS..=profile.tile_rows).contains(&request.rows);
+    if mode == SlowlinkMode::Off || !single_tile {
+        return qualify_request(mode, profile, request);
+    }
+    match request.capture {
+        CaptureKind::None | CaptureKind::Bounded => {}
+        CaptureKind::AllRows => return Err(RequestBypass::AllRowCapture),
+        CaptureKind::External => return Err(RequestBypass::ExternalCapture),
+    }
+    // One window of one tile of `rows` routing rows (rows >= 5: never a one-row
+    // tile); K1 rows are the one-row decode tiles, none here.
+    crate::slowlink_sp::qualify_sp_shape(
+        sp,
+        request.rows,
+        request.session_cuts,
+        None,
+        0,
+        request.capture,
+    )
+    .map_err(RequestBypass::Sp)?;
+    Ok(RequestVerdict {
+        rows: request.rows,
+        windows: 1,
     })
 }
 
@@ -7982,5 +8025,174 @@ mod tests {
             assert_eq!(admit(&resolved).unwrap(), admit(&incumbent).unwrap());
             assert_eq!(census_of(&resolved).unwrap().2.a4_sidecars, 0);
         }
+    }
+
+    fn sp_facts_of(
+        profile: &SlowlinkProfile,
+        knob: bool,
+    ) -> crate::slowlink_sp::SpLoadFacts<'static> {
+        crate::slowlink_sp::SpLoadFacts {
+            knob,
+            s1_route: Some(profile.geometry.route),
+            arch: "gfx1100",
+            n_exp: 512,
+            cpu_gate_up_quant: true,
+            cpu_down_quant: true,
+            splice_workers: Some(16),
+            region_fit_rows: 5_593,
+            hidden: 2560,
+            pinned_budget_bytes: 1 << 30,
+            prefix_cache: false,
+        }
+    }
+
+    /// SP adds no VRAM and moves no layer: on the real j1778 fixtures, both
+    /// routes and purposes, the admitted profile (resident layers, every census
+    /// term, the placement quote) is identical before and after SP is armed
+    /// and admitted, and SP's own admission reads nothing the profile charges.
+    #[test]
+    fn slowlink_sp_armed_leaves_the_j1778_profiles_identical() {
+        use crate::slowlink_sp::{admit_sp, SpDecline};
+        for (route, purpose) in [
+            (WindowRoute::Aggregate, AdmissionPurpose::Product),
+            (WindowRoute::Aggregate, AdmissionPurpose::PrimitiveSelftest),
+            (WindowRoute::SlabIu4, AdmissionPurpose::Product),
+            (WindowRoute::SlabIu4, AdmissionPurpose::PrimitiveSelftest),
+        ] {
+            let label = format!("{route:?} {purpose:?}");
+            let inputs = j1778_inputs(route, purpose, J1778_PRELOAD_FREE);
+            let before = admit(&inputs).unwrap();
+            assert_eq!(before.resident_layers, 10, "{label}");
+            let total = before.census.total().unwrap();
+            let census = census_of(&inputs).unwrap().2;
+
+            let armed = admit_sp(&sp_facts_of(&before, true));
+            match route {
+                WindowRoute::Aggregate => {
+                    let sp = armed.unwrap_or_else(|d| panic!("{label}: {d}"));
+                    assert_eq!(sp.sp_max_rows, 5_376, "{label}");
+                }
+                _ => assert_eq!(armed.unwrap_err(), SpDecline::Route { route }, "{label}"),
+            }
+            let unarmed = admit_sp(&sp_facts_of(&before, false));
+            assert_eq!(unarmed.unwrap_err(), SpDecline::KnobOff, "{label}");
+
+            // The S1 admission after SP armed: bit-for-bit the same profile.
+            let after = admit(&inputs).unwrap();
+            assert_eq!(after, before, "{label}");
+            assert_eq!(after.resident_layers, before.resident_layers, "{label}");
+            assert_eq!(after.census.total().unwrap(), total, "{label}");
+            assert_eq!(census_of(&inputs).unwrap().2, census, "{label}");
+        }
+    }
+
+    #[test]
+    fn slowlink_sp_request_truth_table() {
+        use crate::slowlink_sp::{admit_sp, SpBypass};
+        let profile = profile_at_ten();
+        let sp = admit_sp(&crate::slowlink_sp::SpLoadFacts {
+            s1_route: Some(WindowRoute::Aggregate),
+            ..sp_facts_of(&profile, true)
+        })
+        .unwrap();
+        let tile = profile.tile_rows;
+        assert_eq!(tile, S1_PRODUCT_TILE_ROWS);
+        let req = |rows, cuts, capture| RequestShape {
+            rows,
+            entry_pos: 0,
+            session_cuts: cuts,
+            capture,
+        };
+        let sp_req =
+            |mode, rows| qualify_request_sp(mode, &profile, &sp, &req(rows, 0, CaptureKind::None));
+        for mode in [SlowlinkMode::Auto, SlowlinkMode::Force] {
+            // 5..=tile rows: S1 admits one SP window below its own floor.
+            for rows in [5, 100, 512, tile] {
+                assert_eq!(
+                    sp_req(mode, rows),
+                    Ok(RequestVerdict { rows, windows: 1 }),
+                    "{mode:?} {rows}"
+                );
+            }
+            // Below SP's minimum, and above the tile, the request is exactly
+            // `qualify_request`.
+            for rows in [
+                0,
+                1,
+                4,
+                tile + 1,
+                1536,
+                1537,
+                3072,
+                S1_WINDOW_ROWS,
+                S1_WINDOW_ROWS + 1,
+            ] {
+                assert_eq!(
+                    sp_req(mode, rows),
+                    qualify_request(mode, &profile, &req(rows, 0, CaptureKind::None)),
+                    "{mode:?} {rows}"
+                );
+            }
+        }
+        // The kill switch wins everywhere.
+        assert_eq!(
+            sp_req(SlowlinkMode::Off, 512),
+            Err(RequestBypass::KillSwitch)
+        );
+        // A bounded capture qualifies; all-rows / external stay incumbent.
+        assert_eq!(
+            qualify_request_sp(
+                SlowlinkMode::Auto,
+                &profile,
+                &sp,
+                &req(512, 0, CaptureKind::Bounded)
+            ),
+            Ok(RequestVerdict {
+                rows: 512,
+                windows: 1
+            })
+        );
+        assert_eq!(
+            qualify_request_sp(
+                SlowlinkMode::Auto,
+                &profile,
+                &sp,
+                &req(512, 0, CaptureKind::AllRows)
+            ),
+            Err(RequestBypass::AllRowCapture)
+        );
+        assert_eq!(
+            qualify_request_sp(
+                SlowlinkMode::Auto,
+                &profile,
+                &sp,
+                &req(512, 0, CaptureKind::External)
+            ),
+            Err(RequestBypass::ExternalCapture)
+        );
+        // An interior session cut makes the one window non-SP: the incumbent runs.
+        assert_eq!(
+            qualify_request_sp(
+                SlowlinkMode::Auto,
+                &profile,
+                &sp,
+                &req(512, 1, CaptureKind::None)
+            ),
+            Err(RequestBypass::Sp(SpBypass::InteriorCuts { cuts: 1 }))
+        );
+        // Requests above one tile keep today's cut rule.
+        assert_eq!(
+            qualify_request_sp(
+                SlowlinkMode::Force,
+                &profile,
+                &sp,
+                &req(3072, 5, CaptureKind::None)
+            ),
+            qualify_request(
+                SlowlinkMode::Force,
+                &profile,
+                &req(3072, 5, CaptureKind::None)
+            )
+        );
     }
 }

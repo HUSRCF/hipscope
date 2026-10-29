@@ -48,6 +48,7 @@ use std::time::Duration;
 
 #[path = "session_pair.rs"]
 mod session_pair;
+pub(crate) use session_pair::with_sp_identity;
 #[cfg(any(test, feature = "lab", feature = "reference-parity"))]
 pub(crate) use session_pair::SlowlinkFailPoint;
 #[cfg(any(test, feature = "lab", feature = "reference-parity"))]

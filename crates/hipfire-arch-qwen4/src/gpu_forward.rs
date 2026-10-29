@@ -1673,6 +1673,17 @@ impl Qwen4MoeLayerRuntime {
         ))
     }
 
+    /// `(gate/up, down)` dtypes of expert `id`, `None` for an expert the layer
+    /// does not hold: what the SP admission reads to prove the CPU engine can
+    /// execute the host layers' experts.
+    pub(crate) fn s1_expert_dtypes(&self, id: usize) -> Option<(DType, DType)> {
+        let expert = self.experts.get(id)?;
+        if expert.gate_up.tensor.buf.size() == 0 || expert.down.tensor.buf.size() == 0 {
+            return None;
+        }
+        Some((expert.gate_up.dtype, expert.down.dtype))
+    }
+
     /// The transport sources of this host layer's experts: pinned CPU
     /// addresses of the immutable weight payload, translated from the device
     /// alias addresses of the layer's pointer entries. A slab arena layer has
@@ -9590,7 +9601,7 @@ impl Qwen4GpuForward {
     /// The frozen split identity ([`Self::host_exec_identity`]) when any layer
     /// is armed for D2.
     pub(crate) fn split_digest(&self) -> Option<String> {
-        (self.cpu_split_layers > 0).then(|| self.host_exec_identity())
+        (self.cpu_split_layers > 0).then(|| self.d2_exec_identity())
     }
     /// Numerical identity of the armed host arithmetic, for cache/session
     /// scoping. Empty when no CPU arithmetic is armed (default, `pcie`, or a
@@ -9605,7 +9616,19 @@ impl Qwen4GpuForward {
     /// with bit `i` = layer label `i` over the layers that actually armed.
     /// Thread count and scheduling are not part of it: they change timing,
     /// never arithmetic order.
+    ///
+    /// A load that admitted the SP short-prompt prefill hook (default off,
+    /// `developer.qwen4_sp`) appends the part `sp-e1v1`: SP computes the CPU
+    /// experts' rows with the E1 F32/BF16-boundary arithmetic, a different
+    /// prefix-state domain, so an SP-on process never shares a snapshot (disk
+    /// tier included) with an SP-off lineage.
     pub(crate) fn host_exec_identity(&self) -> String {
+        crate::bundle::with_sp_identity(self.d2_exec_identity(), self.slowlink.sp_armed())
+    }
+
+    /// The D1/D2 part of [`Self::host_exec_identity`]: the frozen split
+    /// identity ([`Self::split_digest`]) never carries the SP token.
+    fn d2_exec_identity(&self) -> String {
         use cpu_splice::SplitOwnerKind::{Slab, Tier, WholeLayer};
         let cpu_all: Vec<usize> = self
             .moe

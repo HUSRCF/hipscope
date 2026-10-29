@@ -55,7 +55,7 @@ use crate::bundle::{PromptTxn, Qwen4Bundle};
 use crate::config::Qwen4Config;
 use crate::gpu_forward::panel_stage::{
     ExpertGroupPlan, ExpertPanelRing, OverlapSummary, PanelBindingParts, PanelSchedule, PanelStats,
-    PanelTicket,
+    PanelTicket, RingSchedule,
 };
 use crate::gpu_forward::{
     f32_view, invalid, layer_desc, layer_scratch, matrix_view, program_dims, router_columns,
@@ -82,6 +82,13 @@ use rdna_compute::{DType, Gpu, GpuTensor};
 use serde_json::{json, Value};
 use std::ops::Range;
 use std::time::Instant;
+
+mod sp;
+use crate::slowlink_sp::{SpBypass, SpDecline, SpProfile};
+use sp::{
+    sp_floor_verdict, sp_load_decision, sp_receipt_json, sp_request_verdict, sp_window_verdicts,
+    SpBindPlan, SpRuntime, SpSummary, SpWindowEntry, SpWindowReport,
+};
 
 type R<T> = Result<T, Qwen4GpuForwardError>;
 
@@ -1179,6 +1186,9 @@ pub(crate) struct SlowlinkSlot {
     /// Sticky: why S1 was declined at load (a mode or native-kernel capability
     /// this forward cannot run); set once by [`bind_at_load`], never by a request.
     unavailable: Option<String>,
+    /// What the load decided about SP ([`bind_at_load`]); the default (knob
+    /// off) on every other load.
+    sp: SpLoad,
 }
 
 impl SlowlinkSlot {
@@ -1189,6 +1199,55 @@ impl SlowlinkSlot {
             None => Ok(()),
         }
     }
+
+    /// SP is admitted on this load: every session snapshot scope carries the
+    /// `sp-e1v1` identity token ([`crate::bundle::with_sp_identity`]).
+    pub(crate) fn sp_armed(&self) -> bool {
+        self.sp.admitted.is_some()
+    }
+
+    /// `developer.qwen4_sp` was on at this load (the receipt carries an `sp`
+    /// object); `false` on every other load.
+    fn sp_knob(&self) -> bool {
+        self.sp.knob
+    }
+
+    /// The SP profile a request may select with: admitted, bound, and not
+    /// disabled by a failed window.
+    fn sp_profile(&self) -> Option<SpProfile> {
+        let admitted = self.sp.admitted?;
+        let runtime = self.runtime.as_ref()?.sp.as_ref()?;
+        runtime.unavailable().is_none().then_some(admitted)
+    }
+
+    fn sp_summary(&self) -> SpSummary {
+        SpSummary {
+            knob: self.sp.knob,
+            admitted: self.sp.admitted,
+            decline: self.sp.decline.clone(),
+            unavailable: self
+                .runtime
+                .as_ref()
+                .and_then(|runtime| runtime.sp.as_ref())
+                .and_then(SpRuntime::unavailable)
+                .map(str::to_owned),
+        }
+    }
+
+    /// The receipt's `sp` object (`None` while the knob is off: the receipt is
+    /// then unchanged).
+    pub(crate) fn sp_receipt(&self, windows: &[SpWindowEntry]) -> Option<Value> {
+        sp_receipt_json(&self.sp_summary(), windows)
+    }
+}
+
+/// The load-time SP verdict: whether the knob was on, the admitted profile, or
+/// the sticky named decline.
+#[derive(Default)]
+struct SpLoad {
+    knob: bool,
+    admitted: Option<SpProfile>,
+    decline: Option<SpDecline>,
 }
 
 /// The S1 device resources of one forward, allocated once from the profile:
@@ -1206,6 +1265,9 @@ struct SlowlinkRuntime {
     host_layers: usize,
     resident_layers: usize,
     tile_scratch_bytes: u64,
+    /// The SP host owner ([`LoadOwner::SpHost`]); bound only when SP was
+    /// admitted at load.
+    sp: Option<SpRuntime>,
 }
 
 impl SlowlinkRuntime {
@@ -1215,9 +1277,21 @@ impl SlowlinkRuntime {
             schedule,
             route_region,
             streams,
+            sp,
             ..
         } = self;
-        free_runtime_parts(gpu, Some(ring), Some(schedule), vec![route_region, streams])
+        // SP's xfer stream reads the route region (the x16 rows) and writes it
+        // (the hybrid rows): it drains first, and a failed drain quarantines
+        // the route region and the HC arena along with the SP owners.
+        let sp_drained = sp.map_or(Ok(()), |sp| sp.free_gpu(gpu));
+        let tensors = if sp_drained.is_ok() {
+            vec![route_region, streams]
+        } else {
+            std::mem::forget((route_region, streams));
+            Vec::new()
+        };
+        let rest = free_runtime_parts(gpu, Some(ring), Some(schedule), tensors);
+        sp_drained.and(rest)
     }
 }
 
@@ -1271,6 +1345,10 @@ pub(crate) enum LoadOwner {
     WindowScratch,
     /// The retained boundary stages (the target's session fixed parts).
     BoundaryStages,
+    /// The SP host owner: pinned host buffers, the xfer stream, the four
+    /// protocol events and the CPU scratch. Bound only when SP is admitted;
+    /// charges no device bytes.
+    SpHost,
 }
 
 /// The binding order. The big transport allocation goes first so an
@@ -1281,6 +1359,17 @@ pub(crate) const LOAD_OWNERS: [LoadOwner; 5] = [
     LoadOwner::HcArena,
     LoadOwner::WindowScratch,
     LoadOwner::BoundaryStages,
+];
+
+/// The binding order of a load that admitted SP: [`LOAD_OWNERS`] plus the SP
+/// host owner last, so an SP failure unwinds the S1 owners already bound.
+pub(crate) const LOAD_OWNERS_SP: [LoadOwner; 6] = [
+    LoadOwner::PagePool,
+    LoadOwner::RouteRegion,
+    LoadOwner::HcArena,
+    LoadOwner::WindowScratch,
+    LoadOwner::BoundaryStages,
+    LoadOwner::SpHost,
 ];
 
 /// Census bytes `owner` holds ([`crate::slowlink_admission::SlowlinkCensus::owned_terms`]).
@@ -1295,6 +1384,8 @@ pub(crate) fn load_owner_charge(profile: &SlowlinkProfile, owner: LoadOwner) -> 
         LoadOwner::HcArena => census.arena,
         LoadOwner::WindowScratch => census.a4_sidecars + census.group_scatter,
         LoadOwner::BoundaryStages => census.boundary_state,
+        // Pinned host bytes, charged by the SP admission's own budget.
+        LoadOwner::SpHost => 0,
     }
 }
 
@@ -1313,8 +1404,18 @@ pub(crate) trait LoadBinder {
 /// Bind every owner or none: the first failure unwinds the owners already
 /// bound and names the owner, the reason and the cleanup disposition.
 pub(crate) fn bind_load_owners(binder: &mut impl LoadBinder) -> Result<(), String> {
-    let mut bound: Vec<LoadOwner> = Vec::with_capacity(LOAD_OWNERS.len());
-    for owner in LOAD_OWNERS {
+    bind_owner_list(binder, &LOAD_OWNERS)
+}
+
+/// [`bind_load_owners`] for a load that admitted SP: the SP host owner binds
+/// last ([`LOAD_OWNERS_SP`]).
+pub(crate) fn bind_load_owners_with_sp(binder: &mut impl LoadBinder) -> Result<(), String> {
+    bind_owner_list(binder, &LOAD_OWNERS_SP)
+}
+
+fn bind_owner_list(binder: &mut impl LoadBinder, owners: &[LoadOwner]) -> Result<(), String> {
+    let mut bound: Vec<LoadOwner> = Vec::with_capacity(owners.len());
+    for &owner in owners {
         if let Err(reason) = binder.bind(owner) {
             let cleanup = binder.unwind(&bound);
             return Err(format!(
@@ -1509,6 +1610,8 @@ struct HipLoadBinder<'a> {
     ring: Option<ExpertPanelRing>,
     route_region: Option<GpuTensor>,
     streams: Option<GpuTensor>,
+    sp_plan: Option<SpBindPlan>,
+    sp: Option<SpRuntime>,
 }
 
 impl LoadBinder for HipLoadBinder<'_> {
@@ -1547,6 +1650,12 @@ impl LoadBinder for HipLoadBinder<'_> {
                     .slowlink_bind_boundary_stages(&mut *self.gpu)
                     .map_err(|error| format!("boundary stage allocation failed: {error}"))?;
             }
+            LoadOwner::SpHost => {
+                let plan = self
+                    .sp_plan
+                    .ok_or_else(|| "the SP bind plan is missing".to_string())?;
+                self.sp = Some(SpRuntime::bind(&mut *self.gpu, &plan)?);
+            }
         }
         Ok(())
     }
@@ -1575,10 +1684,32 @@ impl LoadBinder for HipLoadBinder<'_> {
                     .to_string(),
             );
         }
-        let tensors: Vec<GpuTensor> = [self.streams.take(), self.route_region.take()]
+        let mut sp_quarantined = false;
+        if let Some(sp) = self.sp.take() {
+            notes.push(match sp.free_gpu(&mut *self.gpu) {
+                Ok(()) => "the SP owners (pinned host buffers, xfer stream, events) were \
+                           drained and released"
+                    .to_string(),
+                Err(error) => {
+                    sp_quarantined = true;
+                    format!("SP cleanup reported {error}; the SP owners are QUARANTINED")
+                }
+            });
+        }
+        let mut tensors: Vec<GpuTensor> = [self.streams.take(), self.route_region.take()]
             .into_iter()
             .flatten()
             .collect();
+        if sp_quarantined {
+            // The xfer stream may still read or write the route region: it is
+            // quarantined with the SP owners, never returned to the pool.
+            std::mem::forget(std::mem::take(&mut tensors));
+            notes.push(
+                "the route region and HC arena are QUARANTINED with them (leaked until process \
+                 exit)"
+                    .to_string(),
+            );
+        }
         let held = self.ring.is_some() || !tensors.is_empty();
         let result = free_runtime_parts(
             &mut *self.gpu,
@@ -1615,8 +1746,13 @@ impl HipLoadBinder<'_> {
             ring,
             route_region,
             streams,
+            sp,
+            sp_plan,
             ..
         } = self;
+        if sp_plan.is_some() != sp.is_some() {
+            return Err("the SP owner binding disagrees with its plan".to_string());
+        }
         match (ring, plan.schedule, route_region, streams) {
             (Some(ring), Some(schedule), Some(route_region), Some(streams)) => {
                 Ok(SlowlinkRuntime {
@@ -1628,6 +1764,7 @@ impl HipLoadBinder<'_> {
                     host_layers: plan.host_layers,
                     resident_layers: plan.resident_layers,
                     tile_scratch_bytes: forward.slowlink_tile_scratch_bytes(),
+                    sp,
                 })
             }
             _ => Err("a bound slow-link owner is missing".to_string()),
@@ -1703,6 +1840,11 @@ pub(crate) fn bind_at_load(
     if forward.slowlink.runtime.is_some() || forward.slowlink.unavailable.is_some() {
         return Ok(());
     }
+    let sp_knob = hipfire_config::memory::qwen4_sp();
+    if sp_knob {
+        forward.slowlink.sp.knob = true;
+        forward.slowlink.sp.decline = Some(SpDecline::NoS1Profile);
+    }
     if let Some(reason) = load_decline(forward, &*bundle, gpu, &profile) {
         forward.slowlink.unavailable = Some(reason);
         return Ok(());
@@ -1714,6 +1856,21 @@ pub(crate) fn bind_at_load(
             return Ok(());
         }
     };
+    let sp_plan = if sp_knob {
+        let pages = plan.spec.as_ref().map_or(0, |spec| spec.pages());
+        match sp_load_decision(&*forward, &*gpu, &profile, pages)? {
+            Ok(bind) => {
+                forward.slowlink.sp.decline = None;
+                Some(bind)
+            }
+            Err(decline) => {
+                forward.slowlink.sp.decline = Some(decline);
+                None
+            }
+        }
+    } else {
+        None
+    };
     let runtime = {
         let mut binder = HipLoadBinder {
             forward: &*forward,
@@ -1724,11 +1881,18 @@ pub(crate) fn bind_at_load(
             ring: None,
             route_region: None,
             streams: None,
+            sp_plan,
+            sp: None,
         };
-        bind_load_owners(&mut binder)?;
+        if sp_plan.is_some() {
+            bind_load_owners_with_sp(&mut binder)?;
+        } else {
+            bind_load_owners(&mut binder)?;
+        }
         binder.into_runtime()?
     };
     forward.slowlink.runtime = Some(runtime);
+    forward.slowlink.sp.admitted = sp_plan.map(|bind| bind.profile);
     Ok(())
 }
 
@@ -1903,13 +2067,14 @@ pub(crate) trait GroupRing {
     fn pump(&mut self, ctx: &Self::Ctx) -> R<usize>;
 }
 
-/// The production ring and the window's schedule.
-struct HipRing<'a> {
+/// The production ring and the window's schedule: S1's page-order sweep
+/// ([`PanelSchedule`], the default) or SP's selective per-layer schedule.
+struct HipRing<'a, S: RingSchedule = PanelSchedule> {
     ring: &'a mut ExpertPanelRing,
-    schedule: &'a mut PanelSchedule,
+    schedule: &'a mut S,
 }
 
-impl GroupRing for HipRing<'_> {
+impl<S: RingSchedule> GroupRing for HipRing<'_, S> {
     type Ctx = Gpu;
 
     fn require(&mut self, gpu: &Gpu, layer: usize, group: u32) -> R<PanelTicket> {
@@ -2065,6 +2230,8 @@ pub(crate) struct Progress {
     pub(crate) txn_open: bool,
     /// The ring started a window and may have copies or readers in flight.
     pub(crate) ring_primed: bool,
+    /// The window runs SP: the xfer stream may have copies in flight.
+    pub(crate) sp_armed: bool,
 }
 
 /// The cleanup of a failed window, in order.
@@ -2073,6 +2240,9 @@ pub(crate) struct AbortSteps {
     /// Drain both streams first: an in-flight copy or reader must finish before
     /// anything it reads or writes is restored or released.
     pub(crate) drain_ring: bool,
+    /// Then join SP's xfer stream (quarantining the SP owners when that
+    /// fails) and disable SP for the process.
+    pub(crate) sync_xfer: bool,
     /// Then restore the entry state and drop the transaction.
     pub(crate) abort_txn: bool,
 }
@@ -2081,6 +2251,7 @@ impl Progress {
     pub(crate) fn abort_steps(self) -> AbortSteps {
         AbortSteps {
             drain_ring: self.ring_primed,
+            sync_xfer: self.sp_armed,
             abort_txn: self.txn_open,
         }
     }
@@ -2092,6 +2263,8 @@ struct Selection {
     plan: Qwen4PromptPlan,
     profile: SlowlinkProfile,
     geo: RunGeo,
+    /// One pre-mutation SP verdict per window; empty when SP is not armed.
+    sp_verdicts: Vec<Result<(), SpBypass>>,
 }
 
 /// The full-hidden and final-row head of the request against the forward's
@@ -2354,19 +2527,16 @@ fn select(
         )
         .into());
     }
-    qualify_request(
-        mode,
-        &profile,
-        &RequestShape {
-            rows,
-            entry_pos: entry,
-            session_cuts: 0,
-            capture: output.capture_kind(),
-        },
-    )
-    .map_err(|bypass: RequestBypass| format!("{bypass:?}"))?;
-
     let cuts = bundle.prompt_txn_cuts(entry, end);
+    let sp = forward.slowlink.sp_profile();
+    let shape = RequestShape {
+        rows,
+        entry_pos: entry,
+        session_cuts: 0,
+        capture: output.capture_kind(),
+    };
+    sp_request_verdict(mode, &profile, sp.as_ref(), shape, cuts.len())
+        .map_err(|bypass: RequestBypass| format!("{bypass:?}"))?;
     let few_row_limit = few_row_limit_of(forward, gpu, profile.tile_rows);
     let verdict = {
         let cell = std::cell::RefCell::new(&mut *gpu);
@@ -2384,6 +2554,11 @@ fn select(
         .map_err(|error| error.to_string())?
     };
     let plan = verdict.map_err(|bypass| bypass.to_string())?;
+    let sp_verdicts = sp_window_verdicts(sp.as_ref(), &plan, output.capture_kind());
+    // Below S1's own multi-chunk floor the request is SP's or the incumbent's:
+    // a window SP does not take never runs a stream-all sweep.
+    sp_floor_verdict(profile.tile_rows, rows, &sp_verdicts)
+        .map_err(|bypass| format!("{bypass:?}"))?;
     prompt_bytes(&plan).map_err(|error| error.to_string())?;
     validate_window_layouts(&profile, &plan).map_err(|error| error.to_string())?;
     // One line per request: every window is one full expert sweep, so this is
@@ -2434,7 +2609,12 @@ fn select(
         forward.slowlink.runtime.is_some(),
         forward.slowlink.unavailable.as_deref(),
     )?;
-    Ok(Selection { plan, profile, geo })
+    Ok(Selection {
+        plan,
+        profile,
+        geo,
+        sp_verdicts,
+    })
 }
 
 /// The S1 runtime is bound ONCE at the selected load ([`bind_at_load`]); a
@@ -2647,6 +2827,8 @@ struct Run<'a, 'o> {
     tokens: &'a [u32],
     output: &'a mut PromptOutput<'o>,
     ple: PleCursor,
+    /// One pre-mutation SP verdict per window of the plan (empty: SP not armed).
+    sp_verdicts: &'a [Result<(), SpBypass>],
 }
 
 impl Run<'_, '_> {
@@ -2681,6 +2863,7 @@ impl Run<'_, '_> {
         let mut progress = Progress {
             txn_open: true,
             ring_primed: false,
+            sp_armed: false,
         };
         match self.window_body(&w, &mut txn, &mut progress) {
             Ok(report) => self
@@ -2706,6 +2889,9 @@ impl Run<'_, '_> {
             if let Err(drain) = self.rt.ring.drain(&*self.gpu) {
                 extra.push(format!("ring drain failed: {drain}"));
             }
+        }
+        if steps.sync_xfer {
+            self.sp_abort(&error.to_string(), &mut extra);
         }
         if steps.abort_txn {
             if let Err(abort) = self.bundle.prompt_txn_abort(&mut *self.gpu, txn) {
@@ -2759,12 +2945,8 @@ impl Run<'_, '_> {
             ));
         }
         let wall = Instant::now();
-        let layout = window_route_layout(
-            &self.profile,
-            w.window.rows,
-            w.window.k1_rows,
-            w.window.tail_rows,
-        )?;
+        let sp_on = self.sp_window_on(w);
+        let layout = self.window_layout(w, sp_on)?;
         let mut routes = dsp::PromptRouteStorage::from_region(&self.rt.route_region, &layout)
             .map_err(dsp_err("route storage"))?;
         let mut report = WindowReport::default();
@@ -2774,15 +2956,18 @@ impl Run<'_, '_> {
         // those small uploads behind the prime's page copies on the shared copy engine, so the
         // prime waits until the last of them has enqueued its tiles; the remaining resident
         // layers still cover the prime's copies. A band that starts on a host layer (or has
-        // none) primes first, as before.
+        // none) primes first, as before. An SP window primes with zero enqueues and its resident
+        // layers never pump the sweep schedule.
         let first_host = geo.band.clone().find(|&layer| self.rt.host_layer[layer]);
         let prime_after = first_host
-            .filter(|&host| host > geo.band.start)
+            .filter(|&host| !sp_on && host > geo.band.start)
             .map(|host| match geo.ple_layer {
                 Some(ple) if ple > geo.band.start && ple < host => ple,
                 _ => geo.band.start,
             });
-        if prime_after.is_none() {
+        if sp_on {
+            self.sp_begin_window(&mut routes, progress)?;
+        } else if prime_after.is_none() {
             self.rt.ring.prime(&*self.gpu, &mut self.rt.schedule)?;
         }
         for layer in geo.band.clone() {
@@ -2790,7 +2975,7 @@ impl Run<'_, '_> {
             if self.rt.host_layer[layer] {
                 self.host_layer(w, layer, &mut routes, txn, &mut report)?;
             } else {
-                let primed = prime_after.is_none_or(|after| layer > after);
+                let primed = !sp_on && prime_after.is_none_or(|after| layer > after);
                 self.resident_layer(w, layer, txn, primed)?;
             }
             self.rt.ring.mark_layer_end(&*self.gpu, layer)?;
@@ -2816,8 +3001,11 @@ impl Run<'_, '_> {
                 stats.timeline_overflow, stats.layer_mark_overflow
             )));
         }
+        if sp_on {
+            self.sp_end_window(&stats, w.window.index)?;
+        }
         let sweep = self.rt.schedule.sweep_bytes();
-        if stats.submitted_payload_bytes != sweep {
+        if !sp_on && stats.submitted_payload_bytes != sweep {
             return Err(invalid(format!(
                 "slow-link window submitted {} payload bytes, one sweep is {sweep}",
                 stats.submitted_payload_bytes
@@ -2879,6 +3067,9 @@ impl Run<'_, '_> {
         report: &mut WindowReport,
     ) -> R<()> {
         let geo = self.geo;
+        if routes.sp() {
+            return self.sp_host_layer(w, layer, routes, txn, report);
+        }
         self.rt
             .ring
             .enter_layer(&*self.gpu, &mut self.rt.schedule, layer)?;
@@ -3543,7 +3734,12 @@ pub(crate) fn try_run_prompt(
             return Ok(false);
         }
     };
-    let Selection { plan, profile, geo } = selection;
+    let Selection {
+        plan,
+        profile,
+        geo,
+        sp_verdicts,
+    } = selection;
     // (The head's entry `pending` hidden row is saved per window, right before
     // each window's transaction begins: see `Run::window`.)
     let ple_retained = forward.slowlink_begin(gpu)?;
@@ -3552,6 +3748,9 @@ pub(crate) fn try_run_prompt(
         .runtime
         .take()
         .ok_or_else(|| invalid("slow-link runtime disappeared after selection"))?;
+    if let Some(sp) = runtime.sp.as_mut() {
+        sp.begin_request();
+    }
     let (resident_layers, host_layers, tile_scratch_bytes) = (
         runtime.resident_layers,
         runtime.host_layers,
@@ -3573,6 +3772,7 @@ pub(crate) fn try_run_prompt(
                 retained: ple_retained,
                 histories: Vec::new(),
             },
+            sp_verdicts: &sp_verdicts,
         };
         let mut outcome = Ok(());
         for window in &plan.windows {
@@ -3588,6 +3788,35 @@ pub(crate) fn try_run_prompt(
         outcome
     };
     forward.slowlink.runtime = Some(runtime);
+    // The `sp` receipt object exists only with the knob on: with it off nothing
+    // is built, so the request allocates and reports exactly what it did.
+    let sp_receipt = forward
+        .slowlink
+        .sp_knob()
+        .then(|| {
+            let sp_reports: Vec<(usize, SpWindowReport)> = forward
+                .slowlink
+                .runtime
+                .as_ref()
+                .and_then(|runtime| runtime.sp.as_ref())
+                .map(|sp| sp.reports().to_vec())
+                .unwrap_or_default();
+            let sp_windows: Vec<SpWindowEntry> = plan
+                .windows
+                .iter()
+                .map(|window| SpWindowEntry {
+                    rows: window.rows,
+                    verdict: sp_verdicts.get(window.index).copied().unwrap_or(Ok(())),
+                    report: sp_reports
+                        .iter()
+                        .find(|(index, _)| *index == window.index)
+                        .map(|(_, report)| *report)
+                        .unwrap_or_default(),
+                })
+                .collect();
+            forward.slowlink.sp_receipt(&sp_windows)
+        })
+        .flatten();
     let resident_layer_set = resident_layer_set(forward);
     // ONE `hipMemGetInfo` (total - free) sample after the request, outside every
     // overlap loop: the device's used bytes at that moment, not a continuous
@@ -3610,7 +3839,7 @@ pub(crate) fn try_run_prompt(
         tiles: moe_iu4_tile_counts(profile.geometry.route, &plan.tiles, geo.few_row_limit),
     });
     let receipt = |status: String| {
-        layer_major_receipt(&ReceiptInputs {
+        let mut value = layer_major_receipt(&ReceiptInputs {
             mode,
             plan: &plan,
             resident_layers,
@@ -3621,7 +3850,11 @@ pub(crate) fn try_run_prompt(
             peak_vram_bytes: post_request_vram_used,
             status,
             moe_iu4: moe_iu4.clone(),
-        })
+        });
+        if let (Some(sp), Value::Object(map)) = (&sp_receipt, &mut value) {
+            map.insert("sp".to_string(), sp.clone());
+        }
+        value
     };
     match outcome {
         Ok(()) => {
@@ -4893,22 +5126,26 @@ mod slowlink_prompt {
         let before_dma = Progress {
             txn_open: true,
             ring_primed: false,
+            sp_armed: false,
         };
         assert_eq!(
             before_dma.abort_steps(),
             AbortSteps {
                 drain_ring: false,
+                sync_xfer: false,
                 abort_txn: true
             }
         );
         let during_panel = Progress {
             txn_open: true,
             ring_primed: true,
+            sp_armed: false,
         };
         assert_eq!(
             during_panel.abort_steps(),
             AbortSteps {
                 drain_ring: true,
+                sync_xfer: false,
                 abort_txn: true
             }
         );
@@ -4917,11 +5154,13 @@ mod slowlink_prompt {
         let before_commit = Progress {
             txn_open: true,
             ring_primed: false,
+            sp_armed: false,
         };
         assert_eq!(
             before_commit.abort_steps(),
             AbortSteps {
                 drain_ring: false,
+                sync_xfer: false,
                 abort_txn: true
             }
         );
@@ -4930,7 +5169,23 @@ mod slowlink_prompt {
             consumed.abort_steps(),
             AbortSteps {
                 drain_ring: false,
+                sync_xfer: false,
                 abort_txn: false
+            }
+        );
+        // An SP window also joins the xfer stream, after the ring drain and
+        // before the transaction restore; a non-SP window never touches it.
+        let sp_panel = Progress {
+            txn_open: true,
+            ring_primed: true,
+            sp_armed: true,
+        };
+        assert_eq!(
+            sp_panel.abort_steps(),
+            AbortSteps {
+                drain_ring: true,
+                sync_xfer: true,
+                abort_txn: true
             }
         );
     }
@@ -6859,6 +7114,84 @@ mod slowlink_eager_load {
         assert!(error.contains("QUARANTINED"), "{error}");
         assert!(!error.contains("released to the device pool"), "{error}");
         assert_eq!(dev.quarantined, LOAD_OWNERS[..4].to_vec());
+        assert!(dev.log.iter().all(|entry| !entry.starts_with("release")));
+    }
+
+    #[test]
+    fn slowlink_eager_load_sp_host_owner_binds_last_and_charges_no_device_bytes() {
+        for route in ROUTES {
+            let mut dev = ModelDevice::new(route, 0);
+            let owned: u64 = dev
+                .profile
+                .census
+                .owned_terms()
+                .iter()
+                .map(|(_, b)| b)
+                .sum();
+            assert_eq!(load_owner_charge(&dev.profile, LoadOwner::SpHost), 0);
+            dev.capacity = owned;
+            bind_load_owners_with_sp(&mut dev)
+                .expect("SP adds no device byte: the S1 capacity still fits");
+            assert_eq!(
+                dev.live.iter().map(|(o, _)| *o).collect::<Vec<_>>(),
+                LOAD_OWNERS_SP,
+                "{route:?}: the SP owner binds last"
+            );
+            assert_eq!(dev.used(), owned, "{route:?}: resident bytes are unchanged");
+            assert_eq!(LOAD_OWNERS_SP[..5], LOAD_OWNERS);
+        }
+    }
+
+    #[test]
+    fn slowlink_eager_load_without_sp_binds_exactly_the_s1_owners() {
+        let mut dev = ModelDevice::new(dsp::WindowRoute::Aggregate, u64::MAX);
+        bind_load_owners(&mut dev).unwrap();
+        assert_eq!(
+            dev.live.iter().map(|(o, _)| *o).collect::<Vec<_>>(),
+            LOAD_OWNERS
+        );
+        assert!(dev.log.iter().all(|entry| !entry.contains("SpHost")));
+    }
+
+    #[test]
+    fn slowlink_eager_load_sp_failure_unwinds_every_earlier_owner_in_reverse() {
+        for route in ROUTES {
+            for (index, failing) in LOAD_OWNERS_SP.into_iter().enumerate() {
+                let mut dev = ModelDevice::new(route, u64::MAX);
+                dev.fail_at = Some(failing);
+                let error = bind_load_owners_with_sp(&mut dev).unwrap_err();
+                assert!(error.contains(&format!("{failing:?}")), "{error}");
+                assert!(
+                    error.contains("cleanup: released to the device pool"),
+                    "{error}"
+                );
+                assert!(dev.live.is_empty() && dev.quarantined.is_empty());
+                let released: Vec<_> = dev
+                    .log
+                    .iter()
+                    .filter(|entry| entry.starts_with("release"))
+                    .cloned()
+                    .collect();
+                let expected: Vec<_> = LOAD_OWNERS_SP[..index]
+                    .iter()
+                    .rev()
+                    .map(|owner| format!("release {owner:?}"))
+                    .collect();
+                assert_eq!(released, expected, "{route:?}/{failing:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn slowlink_eager_load_sp_failed_drain_quarantines_every_bound_owner() {
+        let mut dev = ModelDevice::new(dsp::WindowRoute::Aggregate, u64::MAX);
+        dev.fail_at = Some(LoadOwner::SpHost);
+        dev.drain_fails = true;
+        let error = bind_load_owners_with_sp(&mut dev).unwrap_err();
+        assert!(error.contains("SpHost"), "{error}");
+        assert!(error.contains("QUARANTINED"), "{error}");
+        assert!(!error.contains("released to the device pool"), "{error}");
+        assert_eq!(dev.quarantined, LOAD_OWNERS.to_vec());
         assert!(dev.log.iter().all(|entry| !entry.starts_with("release")));
     }
 

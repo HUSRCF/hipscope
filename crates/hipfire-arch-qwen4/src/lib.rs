@@ -86,6 +86,7 @@ pub mod slowlink_admission;
 #[cfg(any(test, feature = "lab", feature = "reference-parity"))]
 pub mod slowlink_load;
 mod slowlink_prefill;
+pub mod slowlink_sp;
 pub mod state;
 #[cfg(any(test, feature = "reference-parity"))]
 pub mod state_parity;

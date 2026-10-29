@@ -30,6 +30,7 @@ pub(crate) mod qt44_qt53_prefill;
 pub mod slab_moe_decode;
 pub mod slab_route;
 pub mod slowlink_prefill;
+pub mod sp_layer;
 pub use moe_program::{MoeStage, SealedMoeOp};
 pub(crate) mod draft_head;
 pub mod moe_dump;

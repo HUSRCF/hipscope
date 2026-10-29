@@ -1,0 +1,1699 @@
+//! SP: the pure admission, window qualification and per-layer protocol of the
+//! short-prompt prefill hook (design `screens/SP/HOOK-DESIGN.md` §5.1, §6,
+//! §7.1, §9 slice E).
+//!
+//! SP is a per-window mode of S1 (the slow-link layer-major prefill): it
+//! streams the top-k* experts of a layer and runs the rest on the CPU, then
+//! applies one canonical combine. Everything here is pure data and decisions:
+//! no device, no stream, no allocation. The runtime (slices A-D, F1/F2) reads
+//! these verdicts before any mutation.
+//!
+//! - [`admit_sp`]: load-time admission. Every decline is a named, sticky
+//!   [`SpDecline`]; the S1 profile (resident layers, census) is never an input
+//!   to it that it can change, so SP adds **zero** VRAM and moves no layer.
+//! - [`qualify_sp_window`]: per-window verdict ([`SpBypass`] when the window
+//!   stays on today's page-order sweep).
+//! - [`SpProtocol`]: the §7.1 state machine, refusing every illegal edge, with
+//!   a [`SpEventBackend`] the runtime implements over HIP events and tests
+//!   implement with a fake.
+
+use crate::slowlink_admission::{CaptureKind, WindowRoute};
+use crate::slowlink_prefill::{TilePlan, WindowPlan};
+use std::fmt;
+
+/// Typed developer boolean `developer.qwen4_sp` (default off).
+pub const SP_ENV: &str = "HIPFIRE_QWEN4_SP";
+/// Lab-only: `all` (k = U), `cpu` (k = 0) or `auto` (the planner).
+#[cfg(feature = "lab")]
+pub const SP_FORCE_K_ENV: &str = "HIPFIRE_QWEN4_SP_FORCE_K";
+/// Lab-only: `1` prints one JSON line per SP layer.
+#[cfg(feature = "lab")]
+pub const SP_TRACE_ENV: &str = "HIPFIRE_QWEN4_SP_TRACE";
+
+/// Fewest rows of an SP window: `CPU_SPLIT_MAX_ROWS + 1`, so D2's qualified
+/// windows of up to four rows are never taken.
+pub const SP_MIN_ROWS: usize = 5;
+/// Most rows of an SP window by gain and by memory.
+pub const SP_MAX_ROWS: usize = 5_376;
+/// Smallest region fit worth arming (abandon criterion of §11): below this
+/// SP is declined at load.
+pub const SP_MIN_REGION_ROWS: usize = 2_048;
+/// `S_cap = SP_S_CAP_FACTOR * sp_max_rows`: the CPU-row staging capacity.
+pub const SP_S_CAP_FACTOR: usize = 5;
+/// The only calibrated architecture.
+pub const SP_ARCH: &str = "gfx1100";
+/// The only calibrated expert count.
+pub const SP_N_EXPERTS: usize = 512;
+
+/// Experts' grouped-row padding slack per expert (`10N + 512 * 15`).
+const GROUPED_SLACK_PER_EXPERT: usize = 15;
+/// Top-k slots per token row.
+const SLOTS_PER_ROW: usize = 10;
+
+/// Rows of the grouped bound `10N + n_exp * 15`, rounded up to 16.
+pub(crate) fn sp_grouped_bound(rows: usize, n_exp: usize) -> Option<usize> {
+    rows.checked_mul(SLOTS_PER_ROW)?
+        .checked_add(n_exp.checked_mul(GROUPED_SLACK_PER_EXPERT)?)?
+        .checked_add(15)
+        .map(|v| v & !15)
+}
+
+/// Pinned host bytes of the SP owners at `max_rows` (§6): `x16_host`
+/// `[max_rows, hidden]` u16, `cpu_rows` `[s_cap, hidden]` u16, `sorted_host`
+/// `[G_max]` i32 and `inv_host` `[max_rows * 10]` i32.
+pub(crate) fn sp_pinned_bytes(hidden: usize, n_exp: usize, max_rows: usize) -> Option<u64> {
+    let h = hidden as u64;
+    let n = max_rows as u64;
+    let s_cap = max_rows.checked_mul(SP_S_CAP_FACTOR)? as u64;
+    let g_max = sp_grouped_bound(max_rows, n_exp)? as u64;
+    let x16 = n.checked_mul(h)?.checked_mul(2)?;
+    let cpu = s_cap.checked_mul(h)?.checked_mul(2)?;
+    let sorted = g_max.checked_mul(4)?;
+    let inv = n.checked_mul(SLOTS_PER_ROW as u64)?.checked_mul(4)?;
+    x16.checked_add(cpu)?.checked_add(sorted)?.checked_add(inv)
+}
+
+// ── lab knobs ─────────────────────────────────────────────────────────
+
+/// Lab placement override (`HIPFIRE_QWEN4_SP_FORCE_K`).
+#[cfg(feature = "lab")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SpForceK {
+    /// k = U: every touched expert streams.
+    All,
+    /// k = 0: every expert runs on the CPU.
+    Cpu,
+    /// The planner decides.
+    Auto,
+}
+
+/// Pure body of [`sp_force_k`]: unset is `Auto`; exact lower-case spellings
+/// only, anything else (including empty) is an error naming the variable.
+#[cfg(feature = "lab")]
+pub fn parse_sp_force_k(raw: Option<&str>) -> Result<SpForceK, String> {
+    match raw {
+        None => Ok(SpForceK::Auto),
+        Some("all") => Ok(SpForceK::All),
+        Some("cpu") => Ok(SpForceK::Cpu),
+        Some("auto") => Ok(SpForceK::Auto),
+        Some(other) => Err(format!(
+            "{SP_FORCE_K_ENV}={other:?} is not one of all, cpu, auto"
+        )),
+    }
+}
+
+/// The lab placement override of this process.
+#[cfg(feature = "lab")]
+pub fn sp_force_k() -> Result<SpForceK, String> {
+    let raw = hipfire_config::developer_var(SP_FORCE_K_ENV).ok();
+    parse_sp_force_k(raw.as_deref())
+}
+
+/// Pure body of [`sp_trace`]: only an exact `1` enables it.
+#[cfg(feature = "lab")]
+pub fn parse_sp_trace(raw: Option<&str>) -> bool {
+    raw == Some("1")
+}
+
+/// `HIPFIRE_QWEN4_SP_TRACE=1`.
+#[cfg(feature = "lab")]
+pub fn sp_trace() -> bool {
+    parse_sp_trace(hipfire_config::developer_var(SP_TRACE_ENV).ok().as_deref())
+}
+
+// ── load-time admission ───────────────────────────────────────────────
+
+/// Everything [`admit_sp`] reads, all decided by the caller before any SP
+/// allocation. Nothing here is an input of the S1 admission, so arming SP can
+/// neither change `resident_layers` nor the census.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SpLoadFacts<'a> {
+    /// `developer.qwen4_sp` (`hipfire_config::memory::qwen4_sp`).
+    pub knob: bool,
+    /// The admitted S1 profile's window route; `None` when S1 was not admitted.
+    pub s1_route: Option<WindowRoute>,
+    /// `gpu.arch`.
+    pub arch: &'a str,
+    /// Routed expert count of the model.
+    pub n_exp: usize,
+    /// A CPU quant exists for the host layers' gate_up dtype.
+    pub cpu_gate_up_quant: bool,
+    /// A CPU quant exists for the host layers' down dtype.
+    pub cpu_down_quant: bool,
+    /// Workers of the splice pool; `None` (or 0) when it is unavailable.
+    pub splice_workers: Option<usize>,
+    /// Largest window rows whose SP layout (`with_sp_rows(..).total_bytes()`)
+    /// fits `census.route_storage` (about 5,593 on the product profile).
+    pub region_fit_rows: usize,
+    /// Model hidden size.
+    pub hidden: usize,
+    /// Pinned host bytes SP may charge (the pinned budget less S1's own).
+    pub pinned_budget_bytes: u64,
+    /// `serve.prefix_cache` is on.
+    pub prefix_cache: bool,
+}
+
+/// The frozen SP profile of a load.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SpProfile {
+    /// `min(SP_MAX_ROWS, region fit)`.
+    pub sp_max_rows: usize,
+    /// CPU-row staging capacity in rows: `5 * sp_max_rows`.
+    pub s_cap: usize,
+    /// Splice-pool workers (`SplitCost.cpu_workers`).
+    pub workers: usize,
+    /// Pinned host bytes the SP owners charge at `sp_max_rows`.
+    pub pinned_bytes: u64,
+}
+
+/// A sticky, named reason SP is not armed on this load.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SpDecline {
+    /// `HIPFIRE_QWEN4_SP` is not `1`.
+    KnobOff,
+    /// No admitted S1 profile.
+    NoS1Profile,
+    /// `sp: arch not calibrated`.
+    ArchNotCalibrated { arch: String },
+    /// The window route is not `Aggregate`.
+    Route { route: WindowRoute },
+    /// The model's expert count is not 512.
+    ExpertCount { n_exp: usize },
+    /// A host layer's gate_up or down dtype has no CPU quant.
+    Quants { gate_up: bool, down: bool },
+    /// The splice pool is unavailable.
+    SplicePool,
+    /// The SP window layout does not fit the route region for enough rows.
+    RegionFit { fit_rows: usize, minimum: usize },
+    /// The SP pinned host owners do not fit the pinned budget.
+    PinnedFit { need: Option<u64>, budget: u64 },
+    /// `serve.prefix_cache` is on.
+    PrefixCache,
+}
+
+impl SpDecline {
+    /// Stable machine label of the reason (receipt `sp.decline`).
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::KnobOff => "knob off",
+            Self::NoS1Profile => "no S1 profile",
+            Self::ArchNotCalibrated { .. } => "arch not calibrated",
+            Self::Route { .. } => "route",
+            Self::ExpertCount { .. } => "n_exp",
+            Self::Quants { .. } => "quants",
+            Self::SplicePool => "splice pool",
+            Self::RegionFit { .. } => "region fit",
+            Self::PinnedFit { .. } => "pinned fit",
+            Self::PrefixCache => "prefix cache",
+        }
+    }
+}
+
+impl fmt::Display for SpDecline {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "sp: {}", self.label())?;
+        match self {
+            Self::KnobOff => write!(f, " ({SP_ENV} is not 1)"),
+            Self::NoS1Profile => write!(f, " (the slow-link prefill profile was not admitted)"),
+            Self::ArchNotCalibrated { arch } => {
+                write!(f, " ({arch:?}; calibrated on {SP_ARCH:?} only)")
+            }
+            Self::Route { route } => {
+                write!(
+                    f,
+                    " ({route:?}; only {:?} is served)",
+                    WindowRoute::Aggregate
+                )
+            }
+            Self::ExpertCount { n_exp } => {
+                write!(f, " ({n_exp} experts; only {SP_N_EXPERTS} is calibrated)")
+            }
+            Self::Quants { gate_up, down } => write!(
+                f,
+                " (CPU quant for gate_up: {gate_up}, down: {down}; both are required)"
+            ),
+            Self::SplicePool => write!(f, " (no splice pool workers)"),
+            Self::RegionFit { fit_rows, minimum } => write!(
+                f,
+                " (the route region fits {fit_rows} SP rows; at least {minimum} are required)"
+            ),
+            Self::PinnedFit { need, budget } => match need {
+                Some(need) => write!(
+                    f,
+                    " (the SP owners need {need} pinned bytes; budget {budget})"
+                ),
+                None => write!(f, " (the SP pinned bytes overflow; budget {budget})"),
+            },
+            Self::PrefixCache => write!(f, " (serve.prefix_cache is on)"),
+        }
+    }
+}
+
+/// Load-time SP admission (§5.1). Checked in a fixed order; the first failing
+/// rule is the sticky reason. Pure.
+pub(crate) fn admit_sp(facts: &SpLoadFacts<'_>) -> Result<SpProfile, SpDecline> {
+    if !facts.knob {
+        return Err(SpDecline::KnobOff);
+    }
+    let Some(route) = facts.s1_route else {
+        return Err(SpDecline::NoS1Profile);
+    };
+    if facts.arch != SP_ARCH {
+        return Err(SpDecline::ArchNotCalibrated {
+            arch: facts.arch.to_string(),
+        });
+    }
+    if route != WindowRoute::Aggregate {
+        return Err(SpDecline::Route { route });
+    }
+    if facts.n_exp != SP_N_EXPERTS {
+        return Err(SpDecline::ExpertCount { n_exp: facts.n_exp });
+    }
+    if !(facts.cpu_gate_up_quant && facts.cpu_down_quant) {
+        return Err(SpDecline::Quants {
+            gate_up: facts.cpu_gate_up_quant,
+            down: facts.cpu_down_quant,
+        });
+    }
+    let workers = match facts.splice_workers {
+        Some(workers) if workers > 0 => workers,
+        _ => return Err(SpDecline::SplicePool),
+    };
+    if facts.region_fit_rows < SP_MIN_REGION_ROWS {
+        return Err(SpDecline::RegionFit {
+            fit_rows: facts.region_fit_rows,
+            minimum: SP_MIN_REGION_ROWS,
+        });
+    }
+    let sp_max_rows = SP_MAX_ROWS.min(facts.region_fit_rows);
+    let need = sp_pinned_bytes(facts.hidden, facts.n_exp, sp_max_rows);
+    match need {
+        Some(bytes) if bytes <= facts.pinned_budget_bytes => {
+            if facts.prefix_cache {
+                return Err(SpDecline::PrefixCache);
+            }
+            Ok(SpProfile {
+                sp_max_rows,
+                s_cap: sp_max_rows * SP_S_CAP_FACTOR,
+                workers,
+                pinned_bytes: bytes,
+            })
+        }
+        _ => Err(SpDecline::PinnedFit {
+            need,
+            budget: facts.pinned_budget_bytes,
+        }),
+    }
+}
+
+// ── per-window qualification ──────────────────────────────────────────
+
+/// Why a window stays on today's page-order sweep (the named `sp_bypass`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SpBypass {
+    /// Fewer than [`SP_MIN_ROWS`] rows.
+    TooFewRows { rows: usize, minimum: usize },
+    /// More than `sp_max_rows` rows.
+    TooManyRows { rows: usize, maximum: usize },
+    /// Interior session cuts (I8: SP is causal only without them).
+    InteriorCuts { cuts: usize },
+    /// A tile of one routing row (a one-row decode tile).
+    OneRowTile { tile: usize },
+    /// K1 rows remain after the tail tiles are K2-ized.
+    K1Rows { rows: usize },
+    /// All-rows or external capture already bypasses S1.
+    Capture(CaptureKind),
+}
+
+impl fmt::Display for SpBypass {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::TooFewRows { rows, minimum } => {
+                write!(
+                    f,
+                    "sp_bypass: {rows} rows is below the {minimum}-row minimum"
+                )
+            }
+            Self::TooManyRows { rows, maximum } => {
+                write!(
+                    f,
+                    "sp_bypass: {rows} rows exceeds the {maximum}-row maximum"
+                )
+            }
+            Self::InteriorCuts { cuts } => {
+                write!(f, "sp_bypass: {cuts} interior session cut(s)")
+            }
+            Self::OneRowTile { tile } => write!(f, "sp_bypass: tile {tile} has one routing row"),
+            Self::K1Rows { rows } => write!(f, "sp_bypass: {rows} K1 rows after K2-ization"),
+            Self::Capture(kind) => write!(f, "sp_bypass: {kind:?} capture"),
+        }
+    }
+}
+
+/// The window rules over plain numbers: the one body both
+/// [`qualify_sp_window`] and the request verdict
+/// ([`crate::slowlink_admission::qualify_request_sp`]) read.
+pub(crate) fn qualify_sp_shape(
+    sp: &SpProfile,
+    rows: usize,
+    cuts: usize,
+    first_one_row_tile: Option<usize>,
+    k1_rows: usize,
+    capture: CaptureKind,
+) -> Result<(), SpBypass> {
+    match capture {
+        CaptureKind::None | CaptureKind::Bounded => {}
+        other => return Err(SpBypass::Capture(other)),
+    }
+    if rows < SP_MIN_ROWS {
+        return Err(SpBypass::TooFewRows {
+            rows,
+            minimum: SP_MIN_ROWS,
+        });
+    }
+    if rows > sp.sp_max_rows {
+        return Err(SpBypass::TooManyRows {
+            rows,
+            maximum: sp.sp_max_rows,
+        });
+    }
+    if cuts != 0 {
+        return Err(SpBypass::InteriorCuts { cuts });
+    }
+    if let Some(tile) = first_one_row_tile {
+        return Err(SpBypass::OneRowTile { tile });
+    }
+    if k1_rows != 0 {
+        return Err(SpBypass::K1Rows { rows: k1_rows });
+    }
+    Ok(())
+}
+
+/// Per-window SP verdict (§5.1), decided before `prompt_txn_begin`.
+/// `tiles` are the window's own tiles ([`crate::slowlink_prefill::Qwen4PromptPlan::window_tiles`]).
+pub(crate) fn qualify_sp_window(
+    sp: &SpProfile,
+    window: &WindowPlan,
+    tiles: &[TilePlan],
+    capture: CaptureKind,
+) -> Result<(), SpBypass> {
+    let one_row = tiles
+        .iter()
+        .find(|tile| tile.routing.route_rows == 1)
+        .map(|tile| tile.index);
+    qualify_sp_shape(
+        sp,
+        window.rows,
+        window.cuts.len(),
+        one_row,
+        window.k1_rows,
+        capture,
+    )
+}
+
+// ── per-layer protocol ────────────────────────────────────────────────
+
+/// What the protocol asks of the event layer. The runtime backs it with HIP
+/// events on the compute and xfer streams; tests back it with a fake.
+pub trait SpEventBackend {
+    /// `x_done[layer]` (xfer, after the last tile's x16 D2H) has completed.
+    fn x_done_complete(&self, layer: usize) -> bool;
+    /// `rows_ready[layer]` (xfer, after the CPU-rows and inverse H2D) has
+    /// completed, so `cpu_rows` and `inv_host` are free for the host.
+    fn rows_ready_complete(&self, layer: usize) -> bool;
+    /// `combine_done[layer]` (compute) has been recorded, so the xfer stream
+    /// can wait on it.
+    fn combine_done_recorded(&self, layer: usize) -> bool;
+}
+
+/// The §7.1 states.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SpState {
+    /// Window prime, or between layers before the next `Staging(0)`.
+    Idle,
+    /// Tile `t` of the layer is staged.
+    Staging(usize),
+    Barrier,
+    Planned,
+    GpuEnqueued,
+    CpuRunning,
+    Uploaded,
+    Combined,
+    Poisoned,
+}
+
+/// An illegal or failed protocol step. Every error leaves the protocol
+/// [`SpState::Poisoned`] (drain required) except [`Self::Poisoned`] itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SpProtocolError {
+    /// `op` is not legal from `state`.
+    Illegal { op: &'static str, state: SpState },
+    /// The protocol was already poisoned; call `fail_window` after the drain.
+    Poisoned,
+    /// SP was disabled for the process by an earlier failure.
+    Unavailable,
+    /// A layer at or below the last combined one, or a layer other than the
+    /// one in flight.
+    WrongLayer { expected: usize, got: usize },
+    /// A tile out of order (or a changed tile count) within the layer.
+    TileOrder { expected: usize, got: usize },
+    /// `barrier` before every tile of the layer was staged.
+    TilesIncomplete { staged: usize, tiles: usize },
+    /// The exact/padded count check failed at the barrier.
+    ReadbackMismatch,
+    /// More groups than ring pages.
+    GroupsExceedPages { groups: usize, pages: usize },
+    /// More CPU slots than the staging capacity.
+    CpuSlotsExceedCap { slots: usize, cap: usize },
+    /// Groups retired do not equal groups enqueued.
+    GroupsNotRetired { retired: usize, groups: usize },
+    /// `retire_group` beyond the enqueued groups.
+    TooManyRetires { groups: usize },
+    /// The x16 D2H of the layer has not completed.
+    XferNotDone { layer: usize },
+    /// `rows_ready[layer]` has not completed: a host write to `cpu_rows` or
+    /// `inv_host` would race the DMA read of the previous layer (I3).
+    RowsReadyPending { layer: usize },
+    /// `combine_done[layer]` has not been recorded: the xfer H2D must wait it (I5).
+    CombineDoneNotRecorded { layer: usize },
+    /// The CPU arm returned an error.
+    CpuFailed,
+    /// `upload` before the CPU rows were written and E1 returned.
+    CpuNotReturned,
+}
+
+impl fmt::Display for SpProtocolError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "sp protocol: {self:?}")
+    }
+}
+
+impl std::error::Error for SpProtocolError {}
+
+/// The per-layer SP state machine (§7.1). One instance per window.
+///
+/// Per host layer `L` the legal order is `stage_tile(L, 0..T)` →
+/// `barrier` → `plan` → `enqueue_gpu` → `retire_group` ×G → `begin_cpu` →
+/// `host_write_cpu_rows` → `cpu_returned(true)` → `upload` → `combine`, then
+/// the next layer or `end_window`. Any other edge is refused and poisons.
+#[derive(Clone, Debug)]
+pub struct SpProtocol {
+    state: SpState,
+    /// The layer in flight (set at `Staging(0)`).
+    layer: Option<usize>,
+    tiles: usize,
+    /// Last layer that reached `Combined` in this window.
+    last_combined: Option<usize>,
+    /// Last layer whose `rows_ready` was recorded (reached `Uploaded`).
+    last_uploaded: Option<usize>,
+    groups: usize,
+    retired: usize,
+    cpu_written: bool,
+    cpu_returned: bool,
+    /// Sticky for the process once a window failed.
+    unavailable: bool,
+}
+
+impl Default for SpProtocol {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SpProtocol {
+    pub const fn new() -> Self {
+        Self {
+            state: SpState::Idle,
+            layer: None,
+            tiles: 0,
+            last_combined: None,
+            last_uploaded: None,
+            groups: 0,
+            retired: 0,
+            cpu_written: false,
+            cpu_returned: false,
+            unavailable: false,
+        }
+    }
+
+    pub fn state(&self) -> SpState {
+        self.state
+    }
+
+    /// The layer in flight, if any.
+    pub fn layer(&self) -> Option<usize> {
+        self.layer
+    }
+
+    /// SP is disabled for the process (a window failed).
+    pub fn unavailable(&self) -> bool {
+        self.unavailable
+    }
+
+    fn poison<T>(&mut self, error: SpProtocolError) -> Result<T, SpProtocolError> {
+        self.state = SpState::Poisoned;
+        self.unavailable = true;
+        Err(error)
+    }
+
+    fn illegal<T>(&mut self, op: &'static str) -> Result<T, SpProtocolError> {
+        let state = self.state;
+        self.poison(SpProtocolError::Illegal { op, state })
+    }
+
+    fn live(&self) -> Result<(), SpProtocolError> {
+        match self.state {
+            SpState::Poisoned => Err(SpProtocolError::Poisoned),
+            _ => Ok(()),
+        }
+    }
+
+    /// Start a window: `Idle`, no layer history. Refused while a window is in
+    /// flight or SP was disabled by a failure.
+    pub fn begin_window(&mut self) -> Result<(), SpProtocolError> {
+        self.live()?;
+        if self.unavailable {
+            return Err(SpProtocolError::Unavailable);
+        }
+        if self.state != SpState::Idle || self.layer.is_some() {
+            return self.illegal("begin_window");
+        }
+        *self = Self::new();
+        Ok(())
+    }
+
+    /// Tile `tile` of `tiles` of host layer `layer` is prepared and its x16 D2H
+    /// enqueued. Legal as tile 0 from `Idle` or `Combined` (the layer must be
+    /// above the last combined one), and as tile `t + 1` of the same layer
+    /// from `Staging(t)`.
+    pub fn stage_tile(
+        &mut self,
+        layer: usize,
+        tile: usize,
+        tiles: usize,
+    ) -> Result<(), SpProtocolError> {
+        self.live()?;
+        if tiles == 0 || tile >= tiles {
+            return self.poison(SpProtocolError::TileOrder {
+                expected: 0,
+                got: tile,
+            });
+        }
+        match self.state {
+            SpState::Idle | SpState::Combined => {
+                if let Some(done) = self.last_combined {
+                    if layer <= done {
+                        return self.poison(SpProtocolError::WrongLayer {
+                            expected: done + 1,
+                            got: layer,
+                        });
+                    }
+                }
+                if tile != 0 {
+                    return self.poison(SpProtocolError::TileOrder {
+                        expected: 0,
+                        got: tile,
+                    });
+                }
+                self.layer = Some(layer);
+                self.tiles = tiles;
+                self.groups = 0;
+                self.retired = 0;
+                self.cpu_written = false;
+                self.cpu_returned = false;
+                self.state = SpState::Staging(0);
+                Ok(())
+            }
+            SpState::Staging(prev) => {
+                let current = self.layer.expect("Staging has a layer");
+                if layer != current {
+                    return self.poison(SpProtocolError::WrongLayer {
+                        expected: current,
+                        got: layer,
+                    });
+                }
+                if tiles != self.tiles || tile != prev + 1 {
+                    return self.poison(SpProtocolError::TileOrder {
+                        expected: prev + 1,
+                        got: tile,
+                    });
+                }
+                self.state = SpState::Staging(tile);
+                Ok(())
+            }
+            _ => self.illegal("stage_tile"),
+        }
+    }
+
+    /// `finish_route_plan_with` returned. Requires every tile staged;
+    /// `exact_ok` is the exact/padded count check (false poisons).
+    pub fn barrier(&mut self, exact_ok: bool) -> Result<(), SpProtocolError> {
+        self.live()?;
+        match self.state {
+            SpState::Staging(t) => {
+                if t + 1 != self.tiles {
+                    let (staged, tiles) = (t + 1, self.tiles);
+                    return self.poison(SpProtocolError::TilesIncomplete { staged, tiles });
+                }
+                if !exact_ok {
+                    return self.poison(SpProtocolError::ReadbackMismatch);
+                }
+                self.state = SpState::Barrier;
+                Ok(())
+            }
+            _ => self.illegal("barrier"),
+        }
+    }
+
+    /// `plan_sp_layer` produced a plan of `groups` groups and `cpu_slots` CPU
+    /// slots; refused above `pages` ring pages or `s_cap` staging rows.
+    pub fn plan(
+        &mut self,
+        groups: usize,
+        pages: usize,
+        cpu_slots: usize,
+        s_cap: usize,
+    ) -> Result<(), SpProtocolError> {
+        self.live()?;
+        if self.state != SpState::Barrier {
+            return self.illegal("plan");
+        }
+        if groups > pages {
+            return self.poison(SpProtocolError::GroupsExceedPages { groups, pages });
+        }
+        if cpu_slots > s_cap {
+            return self.poison(SpProtocolError::CpuSlotsExceedCap {
+                slots: cpu_slots,
+                cap: s_cap,
+            });
+        }
+        self.groups = groups;
+        self.retired = 0;
+        self.state = SpState::Planned;
+        Ok(())
+    }
+
+    /// The whole layer's groups were enqueued on the ring copy stream and the
+    /// GPU walk was enqueued.
+    pub fn enqueue_gpu(&mut self) -> Result<(), SpProtocolError> {
+        self.live()?;
+        if self.state != SpState::Planned {
+            return self.illegal("enqueue_gpu");
+        }
+        self.state = SpState::GpuEnqueued;
+        Ok(())
+    }
+
+    /// One group's GEMMs retired its page.
+    pub fn retire_group(&mut self) -> Result<(), SpProtocolError> {
+        self.live()?;
+        if self.state != SpState::GpuEnqueued {
+            return self.illegal("retire_group");
+        }
+        if self.retired >= self.groups {
+            let groups = self.groups;
+            return self.poison(SpProtocolError::TooManyRetires { groups });
+        }
+        self.retired += 1;
+        Ok(())
+    }
+
+    /// The driver thread starts the CPU arm: every group retired, the layer's
+    /// x16 D2H complete (`x_done`) and `rows_ready[L-1]` proven complete (I3).
+    pub fn begin_cpu(&mut self, events: &dyn SpEventBackend) -> Result<(), SpProtocolError> {
+        self.live()?;
+        if self.state != SpState::GpuEnqueued {
+            return self.illegal("begin_cpu");
+        }
+        if self.retired != self.groups {
+            let (retired, groups) = (self.retired, self.groups);
+            return self.poison(SpProtocolError::GroupsNotRetired { retired, groups });
+        }
+        let layer = self.layer.expect("GpuEnqueued has a layer");
+        if !events.x_done_complete(layer) {
+            return self.poison(SpProtocolError::XferNotDone { layer });
+        }
+        if let Some(prev) = self.last_uploaded {
+            if !events.rows_ready_complete(prev) {
+                return self.poison(SpProtocolError::RowsReadyPending { layer: prev });
+            }
+        }
+        self.state = SpState::CpuRunning;
+        Ok(())
+    }
+
+    /// The host is about to write `cpu_rows` / `inv_host` (I3): legal only in
+    /// `CpuRunning`, and only while `rows_ready[L-1]` is complete.
+    pub fn host_write_cpu_rows(
+        &mut self,
+        events: &dyn SpEventBackend,
+    ) -> Result<(), SpProtocolError> {
+        self.live()?;
+        if self.state != SpState::CpuRunning || self.cpu_written {
+            return self.illegal("host_write_cpu_rows");
+        }
+        if let Some(prev) = self.last_uploaded {
+            if !events.rows_ready_complete(prev) {
+                return self.poison(SpProtocolError::RowsReadyPending { layer: prev });
+            }
+        }
+        self.cpu_written = true;
+        Ok(())
+    }
+
+    /// E1 returned. `ok == false` poisons.
+    pub fn cpu_returned(&mut self, ok: bool) -> Result<(), SpProtocolError> {
+        self.live()?;
+        if self.state != SpState::CpuRunning || !self.cpu_written || self.cpu_returned {
+            return self.illegal("cpu_returned");
+        }
+        if !ok {
+            return self.poison(SpProtocolError::CpuFailed);
+        }
+        self.cpu_returned = true;
+        Ok(())
+    }
+
+    /// The xfer stream waited `combine_done[L-1]` (I5), enqueued the two H2D
+    /// copies and recorded `rows_ready[L]`.
+    pub fn upload(&mut self, events: &dyn SpEventBackend) -> Result<(), SpProtocolError> {
+        self.live()?;
+        if self.state != SpState::CpuRunning {
+            return self.illegal("upload");
+        }
+        if !(self.cpu_written && self.cpu_returned) {
+            return self.poison(SpProtocolError::CpuNotReturned);
+        }
+        if let Some(prev) = self.last_combined {
+            if !events.combine_done_recorded(prev) {
+                return self.poison(SpProtocolError::CombineDoneNotRecorded { layer: prev });
+            }
+        }
+        self.last_uploaded = self.layer;
+        self.state = SpState::Uploaded;
+        Ok(())
+    }
+
+    /// Compute waited `rows_ready[L]`, ran the one combine, recorded
+    /// `combine_done[L]` and ran the tails. Legal only from `Uploaded`.
+    pub fn combine(&mut self) -> Result<(), SpProtocolError> {
+        self.live()?;
+        if self.state != SpState::Uploaded {
+            return self.illegal("combine");
+        }
+        self.last_combined = self.layer;
+        self.state = SpState::Combined;
+        Ok(())
+    }
+
+    /// The window finished: legal from `Idle` or `Combined` only. The protocol
+    /// returns to a fresh `Idle`.
+    pub fn end_window(&mut self) -> Result<(), SpProtocolError> {
+        self.live()?;
+        match self.state {
+            SpState::Idle | SpState::Combined => {
+                let unavailable = self.unavailable;
+                *self = Self::new();
+                self.unavailable = unavailable;
+                Ok(())
+            }
+            _ => self.illegal("end_window"),
+        }
+    }
+
+    /// Any failure from outside the protocol (enqueue, event or E1 error):
+    /// poison and disable SP for the process.
+    pub fn fail(&mut self) {
+        self.state = SpState::Poisoned;
+        self.unavailable = true;
+    }
+
+    /// `fail_window` after the ring and xfer drain: leave `Poisoned`. SP stays
+    /// unavailable for the process ([`Self::begin_window`] refuses).
+    pub fn fail_window(&mut self) -> Result<(), SpProtocolError> {
+        if self.state != SpState::Poisoned {
+            return self.illegal("fail_window");
+        }
+        *self = Self::new();
+        self.unavailable = true;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::slowlink_prefill::TileRouting;
+    use std::cell::Cell;
+
+    // ── knob ────────────────────────────────────────────────────────
+
+    #[test]
+    fn sp_knob_names_and_typed_developer_key() {
+        assert_eq!(SP_ENV, "HIPFIRE_QWEN4_SP");
+        assert!(hipfire_config::is_typed_bool_developer_key(
+            "developer.qwen4_sp"
+        ));
+        assert_eq!(
+            hipfire_config::developer_key_for_env(SP_ENV).as_deref(),
+            Some("developer.qwen4_sp")
+        );
+    }
+
+    #[test]
+    fn sp_min_rows_is_one_past_the_d2_split_rows() {
+        assert_eq!(
+            SP_MIN_ROWS,
+            hipfire_dispatch::cpu_split::CPU_SPLIT_MAX_ROWS + 1
+        );
+    }
+
+    #[cfg(feature = "lab")]
+    #[test]
+    fn sp_lab_knobs_parse() {
+        assert_eq!(parse_sp_force_k(None), Ok(SpForceK::Auto));
+        assert_eq!(parse_sp_force_k(Some("all")), Ok(SpForceK::All));
+        assert_eq!(parse_sp_force_k(Some("cpu")), Ok(SpForceK::Cpu));
+        assert_eq!(parse_sp_force_k(Some("auto")), Ok(SpForceK::Auto));
+        for bad in ["", "ALL", "1", "gpu", " cpu"] {
+            assert!(parse_sp_force_k(Some(bad)).is_err(), "{bad:?}");
+        }
+        assert!(parse_sp_trace(Some("1")));
+        for off in [None, Some("0"), Some(""), Some("true"), Some("2")] {
+            assert!(!parse_sp_trace(off), "{off:?}");
+        }
+    }
+
+    // ── admit_sp ────────────────────────────────────────────────────
+
+    fn facts() -> SpLoadFacts<'static> {
+        SpLoadFacts {
+            knob: true,
+            s1_route: Some(WindowRoute::Aggregate),
+            arch: "gfx1100",
+            n_exp: 512,
+            cpu_gate_up_quant: true,
+            cpu_down_quant: true,
+            splice_workers: Some(16),
+            region_fit_rows: 5_593,
+            hidden: 2560,
+            pinned_budget_bytes: 1 << 30,
+            prefix_cache: false,
+        }
+    }
+
+    #[test]
+    fn admit_sp_truth_table() {
+        let ok = admit_sp(&facts()).unwrap();
+        assert_eq!(ok.sp_max_rows, 5_376);
+        assert_eq!(ok.s_cap, 26_880);
+        assert_eq!(ok.workers, 16);
+        // §6: about 158 MiB pinned at the cap.
+        let mib = ok.pinned_bytes as f64 / (1u64 << 20) as f64;
+        assert!((157.0..159.5).contains(&mib), "{mib}");
+
+        let cases: Vec<(&str, SpLoadFacts<'static>, SpDecline)> = vec![
+            (
+                "knob",
+                SpLoadFacts {
+                    knob: false,
+                    ..facts()
+                },
+                SpDecline::KnobOff,
+            ),
+            (
+                "no s1",
+                SpLoadFacts {
+                    s1_route: None,
+                    ..facts()
+                },
+                SpDecline::NoS1Profile,
+            ),
+            (
+                "arch 1201",
+                SpLoadFacts {
+                    arch: "gfx1201",
+                    ..facts()
+                },
+                SpDecline::ArchNotCalibrated {
+                    arch: "gfx1201".into(),
+                },
+            ),
+            (
+                "arch 1151",
+                SpLoadFacts {
+                    arch: "gfx1151",
+                    ..facts()
+                },
+                SpDecline::ArchNotCalibrated {
+                    arch: "gfx1151".into(),
+                },
+            ),
+            (
+                "route slab",
+                SpLoadFacts {
+                    s1_route: Some(WindowRoute::SlabIu4),
+                    ..facts()
+                },
+                SpDecline::Route {
+                    route: WindowRoute::SlabIu4,
+                },
+            ),
+            (
+                "route sym iu4",
+                SpLoadFacts {
+                    s1_route: Some(WindowRoute::AggregateSymIu4),
+                    ..facts()
+                },
+                SpDecline::Route {
+                    route: WindowRoute::AggregateSymIu4,
+                },
+            ),
+            (
+                "n_exp 256",
+                SpLoadFacts {
+                    n_exp: 256,
+                    ..facts()
+                },
+                SpDecline::ExpertCount { n_exp: 256 },
+            ),
+            (
+                "gate_up quant",
+                SpLoadFacts {
+                    cpu_gate_up_quant: false,
+                    ..facts()
+                },
+                SpDecline::Quants {
+                    gate_up: false,
+                    down: true,
+                },
+            ),
+            (
+                "down quant",
+                SpLoadFacts {
+                    cpu_down_quant: false,
+                    ..facts()
+                },
+                SpDecline::Quants {
+                    gate_up: true,
+                    down: false,
+                },
+            ),
+            (
+                "pool none",
+                SpLoadFacts {
+                    splice_workers: None,
+                    ..facts()
+                },
+                SpDecline::SplicePool,
+            ),
+            (
+                "pool zero",
+                SpLoadFacts {
+                    splice_workers: Some(0),
+                    ..facts()
+                },
+                SpDecline::SplicePool,
+            ),
+            (
+                "region",
+                SpLoadFacts {
+                    region_fit_rows: 2_047,
+                    ..facts()
+                },
+                SpDecline::RegionFit {
+                    fit_rows: 2_047,
+                    minimum: 2_048,
+                },
+            ),
+            (
+                "prefix cache",
+                SpLoadFacts {
+                    prefix_cache: true,
+                    ..facts()
+                },
+                SpDecline::PrefixCache,
+            ),
+        ];
+        for (name, input, want) in cases {
+            let got = admit_sp(&input).unwrap_err();
+            assert_eq!(got, want, "{name}");
+            assert!(got.to_string().starts_with("sp: "), "{name}: {got}");
+        }
+        // Region fit below the cap lowers sp_max_rows and s_cap; the minimum arms.
+        let tight = admit_sp(&SpLoadFacts {
+            region_fit_rows: 2_048,
+            ..facts()
+        })
+        .unwrap();
+        assert_eq!((tight.sp_max_rows, tight.s_cap), (2_048, 10_240));
+        // A fit above the cap is clamped to it.
+        let loose = admit_sp(&SpLoadFacts {
+            region_fit_rows: 100_000,
+            ..facts()
+        })
+        .unwrap();
+        assert_eq!(loose.sp_max_rows, SP_MAX_ROWS);
+        // Pinned fit: exact boundary.
+        let need = ok.pinned_bytes;
+        assert!(admit_sp(&SpLoadFacts {
+            pinned_budget_bytes: need,
+            ..facts()
+        })
+        .is_ok());
+        assert_eq!(
+            admit_sp(&SpLoadFacts {
+                pinned_budget_bytes: need - 1,
+                ..facts()
+            })
+            .unwrap_err(),
+            SpDecline::PinnedFit {
+                need: Some(need),
+                budget: need - 1
+            }
+        );
+        // Order: the knob is first; the arch precedes the route.
+        assert_eq!(
+            admit_sp(&SpLoadFacts {
+                knob: false,
+                arch: "gfx1201",
+                prefix_cache: true,
+                ..facts()
+            })
+            .unwrap_err(),
+            SpDecline::KnobOff
+        );
+        assert_eq!(
+            admit_sp(&SpLoadFacts {
+                arch: "gfx1201",
+                s1_route: Some(WindowRoute::SlabIu4),
+                ..facts()
+            })
+            .unwrap_err()
+            .label(),
+            "arch not calibrated"
+        );
+    }
+
+    #[test]
+    fn sp_pinned_bytes_matches_the_design_terms() {
+        let n = 5_376u64;
+        let want = n * 5_120 + 5 * n * 5_120 + (10 * n + 7_680 + 15) / 16 * 16 * 4 + n * 40;
+        assert_eq!(sp_pinned_bytes(2560, 512, 5_376), Some(want));
+        assert_eq!(sp_grouped_bound(1, 512), Some(7_696));
+        assert_eq!(sp_pinned_bytes(usize::MAX, 512, 5_376), None);
+    }
+
+    // ── qualify_sp_window ───────────────────────────────────────────
+
+    fn profile() -> SpProfile {
+        admit_sp(&facts()).unwrap()
+    }
+
+    /// A window of `rows` rows over `tile_rows`-row tiles with the production
+    /// routing (`route_rows == rows`).
+    fn window_of(rows: usize, tile_rows: usize) -> (WindowPlan, Vec<TilePlan>) {
+        let mut tiles = Vec::new();
+        let mut at = 0;
+        while at < rows {
+            let n = tile_rows.min(rows - at);
+            tiles.push(TilePlan {
+                index: tiles.len(),
+                window: 0,
+                prompt_row: at,
+                window_row: at,
+                stream_offset: 0,
+                rows: n,
+                position: at,
+                routing: TileRouting {
+                    route_rows: n,
+                    bf16_streams: true,
+                },
+                ends_at_cut: None,
+                last_in_window: at + n == rows,
+            });
+            at += n;
+        }
+        let k1_rows = tiles.iter().filter(|t| t.rows == 1).map(|t| t.rows).sum();
+        let tail_rows = tiles
+            .iter()
+            .filter(|t| t.rows > 1 && t.rows < 512)
+            .map(|t| t.rows)
+            .sum();
+        let window = WindowPlan {
+            index: 0,
+            prompt_row: 0,
+            rows,
+            position: 0,
+            tiles: 0..tiles.len(),
+            stream_bytes: 0,
+            cuts: Vec::new(),
+            k1_rows,
+            tail_rows,
+        };
+        (window, tiles)
+    }
+
+    #[test]
+    fn qualify_sp_window_row_bounds() {
+        let sp = profile();
+        let ok = |rows| {
+            let (w, t) = window_of(rows, 768);
+            qualify_sp_window(&sp, &w, &t, CaptureKind::None)
+        };
+        assert_eq!(
+            ok(4),
+            Err(SpBypass::TooFewRows {
+                rows: 4,
+                minimum: 5
+            })
+        );
+        assert_eq!(ok(5), Ok(()));
+        assert_eq!(ok(768), Ok(()));
+        // 769 rows: a 768-row tile and a one-row tail tile (tile index 1).
+        assert_eq!(ok(769), Err(SpBypass::OneRowTile { tile: 1 }));
+        assert_eq!(ok(1024), Ok(()));
+        assert_eq!(ok(5_376), Ok(()));
+        assert_eq!(
+            ok(5_377),
+            Err(SpBypass::TooManyRows {
+                rows: 5_377,
+                maximum: 5_376
+            })
+        );
+        // A tighter region lowers the maximum.
+        let tight = admit_sp(&SpLoadFacts {
+            region_fit_rows: 2_048,
+            ..facts()
+        })
+        .unwrap();
+        let (w, t) = window_of(2_049, 768);
+        assert_eq!(
+            qualify_sp_window(&tight, &w, &t, CaptureKind::None),
+            Err(SpBypass::TooManyRows {
+                rows: 2_049,
+                maximum: 2_048
+            })
+        );
+    }
+
+    #[test]
+    fn qualify_sp_window_cuts_k1_and_capture() {
+        let sp = profile();
+        let (mut w, t) = window_of(1024, 768);
+        assert_eq!(qualify_sp_window(&sp, &w, &t, CaptureKind::Bounded), Ok(()));
+        assert_eq!(qualify_sp_window(&sp, &w, &t, CaptureKind::None), Ok(()));
+        assert_eq!(
+            qualify_sp_window(&sp, &w, &t, CaptureKind::AllRows),
+            Err(SpBypass::Capture(CaptureKind::AllRows))
+        );
+        assert_eq!(
+            qualify_sp_window(&sp, &w, &t, CaptureKind::External),
+            Err(SpBypass::Capture(CaptureKind::External))
+        );
+        w.cuts = vec![768];
+        assert_eq!(
+            qualify_sp_window(&sp, &w, &t, CaptureKind::None),
+            Err(SpBypass::InteriorCuts { cuts: 1 })
+        );
+        w.cuts.clear();
+        // K1 rows that survive K2-ization are refused even with no one-row tile.
+        w.k1_rows = 3;
+        assert_eq!(
+            qualify_sp_window(&sp, &w, &t, CaptureKind::None),
+            Err(SpBypass::K1Rows { rows: 3 })
+        );
+        // A one-row cut segment: a tile of one routing row.
+        let (w2, mut t2) = window_of(1024, 768);
+        t2[0].routing.route_rows = 1;
+        assert_eq!(
+            qualify_sp_window(&sp, &w2, &t2, CaptureKind::None),
+            Err(SpBypass::OneRowTile { tile: 0 })
+        );
+        // F32-tail tiles (2..512 route rows) are K2-ized, so they qualify.
+        let (w3, t3) = window_of(768 + 100, 768);
+        assert!(w3.tail_rows > 0 && w3.k1_rows == 0);
+        assert_eq!(qualify_sp_window(&sp, &w3, &t3, CaptureKind::None), Ok(()));
+    }
+
+    // ── protocol ────────────────────────────────────────────────────
+
+    /// Fake events: each flag is a layer-indexed completion.
+    #[derive(Default)]
+    struct Fake {
+        x_done: Cell<bool>,
+        rows_ready: Cell<bool>,
+        combine_done: Cell<bool>,
+    }
+
+    impl Fake {
+        fn all() -> Self {
+            Self {
+                x_done: Cell::new(true),
+                rows_ready: Cell::new(true),
+                combine_done: Cell::new(true),
+            }
+        }
+    }
+
+    impl SpEventBackend for Fake {
+        fn x_done_complete(&self, _layer: usize) -> bool {
+            self.x_done.get()
+        }
+        fn rows_ready_complete(&self, _layer: usize) -> bool {
+            self.rows_ready.get()
+        }
+        fn combine_done_recorded(&self, _layer: usize) -> bool {
+            self.combine_done.get()
+        }
+    }
+
+    /// Drive `p` for layer `layer` (2 tiles) up to and including `upto`.
+    #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+    enum Step {
+        Staged,
+        Barrier,
+        Planned,
+        GpuEnqueued,
+        Retired,
+        CpuRunning,
+        CpuWritten,
+        CpuReturned,
+        Uploaded,
+        Combined,
+    }
+
+    fn drive(p: &mut SpProtocol, ev: &Fake, layer: usize, upto: Step) {
+        use Step::*;
+        p.stage_tile(layer, 0, 2).unwrap();
+        p.stage_tile(layer, 1, 2).unwrap();
+        if upto == Staged {
+            return;
+        }
+        p.barrier(true).unwrap();
+        if upto == Barrier {
+            return;
+        }
+        p.plan(3, 18, 100, 1000).unwrap();
+        if upto == Planned {
+            return;
+        }
+        p.enqueue_gpu().unwrap();
+        if upto == GpuEnqueued {
+            return;
+        }
+        for _ in 0..3 {
+            p.retire_group().unwrap();
+        }
+        if upto == Retired {
+            return;
+        }
+        p.begin_cpu(ev).unwrap();
+        if upto == CpuRunning {
+            return;
+        }
+        p.host_write_cpu_rows(ev).unwrap();
+        if upto == CpuWritten {
+            return;
+        }
+        p.cpu_returned(true).unwrap();
+        if upto == CpuReturned {
+            return;
+        }
+        p.upload(ev).unwrap();
+        if upto == Uploaded {
+            return;
+        }
+        p.combine().unwrap();
+    }
+
+    fn started() -> SpProtocol {
+        let mut p = SpProtocol::new();
+        p.begin_window().unwrap();
+        p
+    }
+
+    #[test]
+    fn sp_protocol_happy_path_runs_two_layers_and_ends() {
+        let ev = Fake::all();
+        let mut p = started();
+        drive(&mut p, &ev, 3, Step::Combined);
+        assert_eq!(p.state(), SpState::Combined);
+        drive(&mut p, &ev, 5, Step::Combined);
+        assert_eq!(p.layer(), Some(5));
+        p.end_window().unwrap();
+        assert_eq!(p.state(), SpState::Idle);
+        // A new window may start again.
+        p.begin_window().unwrap();
+        assert!(!p.unavailable());
+    }
+
+    /// Every op from every state. A cell is `Ok` only on the one legal edge;
+    /// everything else is refused and poisons.
+    #[test]
+    fn sp_protocol_transition_table_refuses_every_illegal_edge() {
+        use Step::*;
+        // The state a protocol is in after `drive(.., step)`, and the ops legal there.
+        // op names: stage0, stage_next, barrier, plan, enqueue, retire, begin_cpu,
+        // write, returned, upload, combine, end, begin_window
+        let ops = [
+            "stage_same_layer_tile2",
+            "stage_next_layer",
+            "barrier",
+            "plan",
+            "enqueue_gpu",
+            "retire_group",
+            "begin_cpu",
+            "host_write",
+            "cpu_returned",
+            "upload",
+            "combine",
+            "end_window",
+            "begin_window",
+        ];
+        let apply = |p: &mut SpProtocol, ev: &Fake, op: &str| -> Result<(), SpProtocolError> {
+            match op {
+                "stage_same_layer_tile2" => p.stage_tile(3, 2, 2),
+                "stage_next_layer" => p.stage_tile(4, 0, 2),
+                "barrier" => p.barrier(true),
+                "plan" => p.plan(3, 18, 100, 1000),
+                "enqueue_gpu" => p.enqueue_gpu(),
+                "retire_group" => p.retire_group(),
+                "begin_cpu" => p.begin_cpu(ev),
+                "host_write" => p.host_write_cpu_rows(ev),
+                "cpu_returned" => p.cpu_returned(true),
+                "upload" => p.upload(ev),
+                "combine" => p.combine(),
+                "end_window" => p.end_window(),
+                "begin_window" => p.begin_window(),
+                _ => unreachable!(),
+            }
+        };
+        // (state reached, legal ops from it). Retired (GpuEnqueued with all
+        // groups retired) additionally allows nothing but begin_cpu.
+        let table: [(Step, &[&str]); 10] = [
+            (Staged, &["barrier"]),
+            (Barrier, &["plan"]),
+            (Planned, &["enqueue_gpu"]),
+            (GpuEnqueued, &[]), // retire_group is legal only while groups remain: tested below
+            (Retired, &["begin_cpu"]),
+            (CpuRunning, &["host_write"]),
+            (CpuWritten, &["cpu_returned"]),
+            (CpuReturned, &["upload"]),
+            (Uploaded, &["combine"]),
+            (Combined, &["stage_next_layer", "end_window"]),
+        ];
+        // `Staged` additionally legal: none of the stage ops with a *third* tile of two.
+        for (step, legal) in table {
+            for op in ops {
+                let ev = Fake::all();
+                let mut p = started();
+                drive(&mut p, &ev, 3, step);
+                let before = p.state();
+                let got = apply(&mut p, &ev, op);
+                // GpuEnqueued with 3 groups pending: retire_group is its one legal op.
+                let is_legal = legal.contains(&op) || (step == GpuEnqueued && op == "retire_group");
+                if is_legal {
+                    assert!(got.is_ok(), "{step:?} --{op}--> must be legal, got {got:?}");
+                    assert_ne!(p.state(), SpState::Poisoned, "{step:?} {op}");
+                } else {
+                    assert!(
+                        got.is_err(),
+                        "{step:?} --{op}--> must be refused (was {before:?})"
+                    );
+                    assert_eq!(p.state(), SpState::Poisoned, "{step:?} {op} poisons");
+                    assert!(p.unavailable());
+                    // Poisoned refuses every further op without changing state.
+                    for again in ops {
+                        let r = apply(&mut p, &ev, again);
+                        assert!(r.is_err(), "poisoned must refuse {again}");
+                        assert_eq!(p.state(), SpState::Poisoned);
+                    }
+                }
+            }
+        }
+        // `retire_group` beyond the enqueued groups, after Retired, is refused.
+        let ev = Fake::all();
+        let mut p = started();
+        drive(&mut p, &ev, 3, Retired);
+        assert_eq!(
+            p.retire_group(),
+            Err(SpProtocolError::TooManyRetires { groups: 3 })
+        );
+        // Idle (window primed, no layer): stage 0, end_window and a restart are legal; the rest refused.
+        for op in ops {
+            let ev = Fake::all();
+            let mut p = started();
+            let got = match op {
+                "stage_same_layer_tile2" => p.stage_tile(3, 1, 2),
+                "stage_next_layer" => p.stage_tile(4, 0, 2),
+                other => apply(&mut p, &ev, other),
+            };
+            let legal = matches!(op, "stage_next_layer" | "end_window" | "begin_window");
+            assert_eq!(got.is_ok(), legal, "Idle --{op}-->");
+        }
+    }
+
+    #[test]
+    fn sp_protocol_named_hazards() {
+        let ev = Fake::all();
+
+        // Plan twice.
+        let mut p = started();
+        drive(&mut p, &ev, 3, Step::Planned);
+        assert_eq!(
+            p.plan(3, 18, 100, 1000),
+            Err(SpProtocolError::Illegal {
+                op: "plan",
+                state: SpState::Planned
+            })
+        );
+
+        // Combine before Uploaded.
+        let mut p = started();
+        drive(&mut p, &ev, 3, Step::CpuReturned);
+        assert_eq!(
+            p.combine(),
+            Err(SpProtocolError::Illegal {
+                op: "combine",
+                state: SpState::CpuRunning
+            })
+        );
+
+        // Stage L+1 before Combined(L), from every pre-Combined state.
+        for step in [
+            Step::Barrier,
+            Step::Planned,
+            Step::GpuEnqueued,
+            Step::CpuRunning,
+            Step::CpuReturned,
+            Step::Uploaded,
+        ] {
+            let mut p = started();
+            drive(&mut p, &ev, 3, step);
+            assert!(p.stage_tile(4, 0, 2).is_err(), "{step:?}");
+            assert_eq!(p.state(), SpState::Poisoned);
+        }
+        // Staging layer L+1 mid-layer is a wrong layer.
+        let mut p = started();
+        p.stage_tile(3, 0, 2).unwrap();
+        assert_eq!(
+            p.stage_tile(4, 1, 2),
+            Err(SpProtocolError::WrongLayer {
+                expected: 3,
+                got: 4
+            })
+        );
+
+        // Host write to cpu_rows before rows_ready[L-1] completes.
+        let ev = Fake::all();
+        let mut p = started();
+        drive(&mut p, &ev, 3, Step::Combined);
+        drive(&mut p, &ev, 5, Step::Retired);
+        ev.rows_ready.set(false);
+        assert_eq!(
+            p.begin_cpu(&ev),
+            Err(SpProtocolError::RowsReadyPending { layer: 3 })
+        );
+        // ... and the write op itself rechecks (rows_ready regresses to pending).
+        let ev = Fake::all();
+        let mut p = started();
+        drive(&mut p, &ev, 3, Step::Combined);
+        drive(&mut p, &ev, 5, Step::CpuRunning);
+        ev.rows_ready.set(false);
+        assert_eq!(
+            p.host_write_cpu_rows(&ev),
+            Err(SpProtocolError::RowsReadyPending { layer: 3 })
+        );
+        // Host write outside CpuRunning (before begin_cpu).
+        let ev = Fake::all();
+        let mut p = started();
+        drive(&mut p, &ev, 3, Step::Retired);
+        assert!(matches!(
+            p.host_write_cpu_rows(&ev),
+            Err(SpProtocolError::Illegal {
+                op: "host_write_cpu_rows",
+                ..
+            })
+        ));
+
+        // The first layer has no previous rows_ready to wait for.
+        let ev = Fake::all();
+        ev.rows_ready.set(false);
+        let mut p = started();
+        drive(&mut p, &ev, 3, Step::CpuRunning);
+
+        // x_done not complete.
+        let ev = Fake::all();
+        ev.x_done.set(false);
+        let mut p = started();
+        drive(&mut p, &ev, 3, Step::Retired);
+        assert_eq!(
+            p.begin_cpu(&ev),
+            Err(SpProtocolError::XferNotDone { layer: 3 })
+        );
+
+        // Upload before combine_done[L-1] is recorded (I5).
+        let ev = Fake::all();
+        let mut p = started();
+        drive(&mut p, &ev, 3, Step::Combined);
+        drive(&mut p, &ev, 5, Step::CpuReturned);
+        ev.combine_done.set(false);
+        assert_eq!(
+            p.upload(&ev),
+            Err(SpProtocolError::CombineDoneNotRecorded { layer: 3 })
+        );
+
+        // Upload before the CPU arm returned.
+        let ev = Fake::all();
+        let mut p = started();
+        drive(&mut p, &ev, 3, Step::CpuWritten);
+        assert_eq!(p.upload(&ev), Err(SpProtocolError::CpuNotReturned));
+
+        // A layer at or below the last combined one.
+        let ev = Fake::all();
+        let mut p = started();
+        drive(&mut p, &ev, 5, Step::Combined);
+        assert_eq!(
+            p.stage_tile(5, 0, 2),
+            Err(SpProtocolError::WrongLayer {
+                expected: 6,
+                got: 5
+            })
+        );
+    }
+
+    #[test]
+    fn sp_protocol_refuses_bad_plans_tiles_and_failures() {
+        let ev = Fake::all();
+        // Barrier before every tile staged.
+        let mut p = started();
+        p.stage_tile(3, 0, 3).unwrap();
+        p.stage_tile(3, 1, 3).unwrap();
+        assert_eq!(
+            p.barrier(true),
+            Err(SpProtocolError::TilesIncomplete {
+                staged: 2,
+                tiles: 3
+            })
+        );
+        // Tile out of order / repeated / beyond the count / changed count.
+        for (second, tiles) in [(2usize, 3usize), (0, 3), (1, 4)] {
+            let mut p = started();
+            p.stage_tile(3, 0, 3).unwrap();
+            assert!(p.stage_tile(3, second, tiles).is_err());
+            assert_eq!(p.state(), SpState::Poisoned);
+        }
+        let mut p = started();
+        assert!(p.stage_tile(3, 1, 3).is_err(), "first tile must be 0");
+        let mut p = started();
+        assert!(p.stage_tile(3, 3, 3).is_err(), "tile index beyond count");
+        let mut p = started();
+        assert!(p.stage_tile(3, 0, 0).is_err(), "zero tiles");
+
+        // Readback mismatch at the barrier poisons.
+        let mut p = started();
+        p.stage_tile(3, 0, 1).unwrap();
+        assert_eq!(p.barrier(false), Err(SpProtocolError::ReadbackMismatch));
+        assert_eq!(p.state(), SpState::Poisoned);
+
+        // Groups above the pages, CPU slots above the cap.
+        let mut p = started();
+        drive(&mut p, &ev, 3, Step::Barrier);
+        assert_eq!(
+            p.plan(19, 18, 10, 100),
+            Err(SpProtocolError::GroupsExceedPages {
+                groups: 19,
+                pages: 18
+            })
+        );
+        let mut p = started();
+        drive(&mut p, &ev, 3, Step::Barrier);
+        assert_eq!(
+            p.plan(3, 18, 101, 100),
+            Err(SpProtocolError::CpuSlotsExceedCap {
+                slots: 101,
+                cap: 100
+            })
+        );
+        // Boundaries are accepted.
+        let mut p = started();
+        drive(&mut p, &ev, 3, Step::Barrier);
+        p.plan(18, 18, 100, 100).unwrap();
+
+        // begin_cpu with groups still pending.
+        let mut p = started();
+        drive(&mut p, &ev, 3, Step::GpuEnqueued);
+        p.retire_group().unwrap();
+        assert_eq!(
+            p.begin_cpu(&ev),
+            Err(SpProtocolError::GroupsNotRetired {
+                retired: 1,
+                groups: 3
+            })
+        );
+
+        // E1 error poisons.
+        let mut p = started();
+        drive(&mut p, &ev, 3, Step::CpuWritten);
+        assert_eq!(p.cpu_returned(false), Err(SpProtocolError::CpuFailed));
+        assert_eq!(p.state(), SpState::Poisoned);
+        // cpu_returned before the host write is illegal.
+        let mut p = started();
+        drive(&mut p, &ev, 3, Step::CpuRunning);
+        assert!(matches!(
+            p.cpu_returned(true),
+            Err(SpProtocolError::Illegal {
+                op: "cpu_returned",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn sp_protocol_poison_drain_and_sticky_unavailable() {
+        let ev = Fake::all();
+        let mut p = started();
+        drive(&mut p, &ev, 3, Step::GpuEnqueued);
+        p.fail();
+        assert_eq!(p.state(), SpState::Poisoned);
+        assert_eq!(p.retire_group(), Err(SpProtocolError::Poisoned));
+        assert_eq!(p.end_window(), Err(SpProtocolError::Poisoned));
+        assert_eq!(p.begin_window(), Err(SpProtocolError::Poisoned));
+        // fail_window after the drain leaves Poisoned but SP stays disabled.
+        p.fail_window().unwrap();
+        assert_eq!(p.state(), SpState::Idle);
+        assert!(p.unavailable());
+        assert_eq!(p.begin_window(), Err(SpProtocolError::Unavailable));
+        // fail_window outside Poisoned is illegal.
+        let mut p = started();
+        assert!(p.fail_window().is_err());
+        // A window may not begin mid-window, nor end mid-layer.
+        let mut p = started();
+        p.stage_tile(3, 0, 1).unwrap();
+        assert!(p.begin_window().is_err());
+        let mut p = started();
+        p.stage_tile(3, 0, 1).unwrap();
+        assert!(p.end_window().is_err());
+    }
+}

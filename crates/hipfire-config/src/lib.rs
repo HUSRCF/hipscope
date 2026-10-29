@@ -4076,6 +4076,7 @@ const TYPED_BOOL_DEVELOPER_KEYS: &[&str] = &[
     "developer.qwen4_moe_sym_iu4",
     "developer.qwen4_d2_default",
     "developer.qwen4_mtp_head_d2",
+    "developer.qwen4_sp",
     "developer.moe_sym_iu4",
     "developer.qwen4_slowlink_prefill",
     "developer.gdn_qk_indexed",
@@ -7109,6 +7110,44 @@ mod tests {
                 "{raw}"
             );
         }
+    }
+
+    #[test]
+    fn qwen4_sp_is_a_typed_bool_developer_key_default_off() {
+        const KEY: &str = "developer.qwen4_sp";
+        const ENV: &str = "HIPFIRE_QWEN4_SP";
+        assert!(is_developer_key(KEY));
+        assert!(is_typed_bool_developer_key(KEY));
+        assert_eq!(developer_key_for_env(ENV).as_deref(), Some(KEY));
+        // Unset is None (SP defaults off); each spelling reads as a bool.
+        assert_eq!(typed_developer_bool_value(ENV, None), None);
+        for (raw, want) in [("1", true), ("true", true), ("0", false), ("false", false)] {
+            assert_eq!(
+                typed_developer_bool_value(ENV, Some(raw)),
+                Some(want),
+                "{raw}"
+            );
+            let mut layer = ConfigLayer::default();
+            layer.set_cli(KEY, raw).unwrap();
+            assert_eq!(layer.get(KEY), Some(&ConfigValue::Bool(want)), "{raw}");
+            layer.validate().unwrap();
+        }
+        // Garbage is rejected when the layer is built, never silently ignored.
+        for bad in ["", "2", "on", "off", "yes", "maybe"] {
+            let mut layer = ConfigLayer::default();
+            let error = layer.set_cli(KEY, bad).unwrap_err();
+            assert!(
+                matches!(&error, ConfigError::InvalidValue { key, .. } if key == KEY),
+                "{bad:?}: {error}"
+            );
+            assert!(layer.values.is_empty(), "{bad:?} must not be stored");
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "HIPFIRE_QWEN4_SP")]
+    fn qwen4_sp_panics_on_an_unparseable_snapshot_value() {
+        typed_developer_bool_value("HIPFIRE_QWEN4_SP", Some("garbage"));
     }
 
     const MOE_SYM_IU4_KEY: &str = "developer.moe_sym_iu4";
@@ -10470,6 +10509,16 @@ pub mod memory {
     /// same load (non-EP), otherwise the head keeps the GPU route.
     pub fn qwen4_mtp_head_d2() -> Option<bool> {
         super::developer_typed_bool("HIPFIRE_QWEN4_MTP_HEAD_D2")
+    }
+
+    /// `developer.qwen4_sp` (env `HIPFIRE_QWEN4_SP`), a typed boolean read once
+    /// per Qwen4 load by the S1 short-prompt prefill hook (SP: stream the
+    /// top-k* experts, run the rest on the CPU, one canonical combine). Default
+    /// **off**: only an explicit `true`/`1` arms it; unset and `false`/`0` are
+    /// both off. SP additionally needs an admitted S1 profile, gfx1100 and the
+    /// other load-time admission rules; any failed rule declines it by name.
+    pub fn qwen4_sp() -> bool {
+        super::developer_typed_bool("HIPFIRE_QWEN4_SP").unwrap_or(false)
     }
 
     /// Developer kill switch `HIPFIRE_QWEN4_DIRECT_LOAD` for the discrete-GPU
