@@ -904,6 +904,11 @@ fn vector(
             Class::Int,
             (raw(0)? & 0xff_ffff).wrapping_mul(raw(1)? & 0xff_ffff),
         ),
+        // D = bits 47:32 of the 48-bit product of the two 24-bit-masked operands (RDNA ISA V_MUL_HI_U32_U24).
+        "v_mul_hi_u32_u24" => (
+            Class::Int,
+            ((u64::from(raw(0)? & 0xff_ffff) * u64::from(raw(1)? & 0xff_ffff)) >> 32) as u32,
+        ),
         "v_mad_u32_u24" => (
             Class::Int,
             (raw(0)? & 0xff_ffff)
@@ -1232,6 +1237,29 @@ fn vector(
                     "v_pk_mul_f16" => fma_f16(w[0], w[1], 0x8000_0000),
                     _ => fma_f16(w[0], 0x3f80_0000, w[1]),
                 };
+            }
+            (Class::Own, u32::from(half[0]) | u32::from(half[1]) << 16)
+        }
+        // Packed 16-bit logical right shift (VOP3P, `rev` order: S0 is the shift count, S1 the value). Result half
+        // `h` is `S1.half(sel1) >> (S0.half(sel0) & 15)`, where `sel` is `op_sel` (low result) or `op_sel_hi`
+        // (high result) and bit k picks the high half of source k. An inline constant reads as its 32-bit word.
+        "v_pk_lshrrev_b16" => {
+            if m.neg_lo != 0
+                || m.neg_hi != 0
+                || m.neg != 0
+                || m.abs != 0
+                || m.clamp
+                || m.omod != Omod::None
+            {
+                return Err(format!("{name}: neg/abs/clamp/omod are not modeled"));
+            }
+            let (c, x) = (raw(0)?, raw(1)?);
+            let mut half = [0u16; 2];
+            for (h, slot) in half.iter_mut().enumerate() {
+                let sel = if h == 0 { m.op_sel } else { m.op_sel_hi };
+                let cnt = (if sel & 1 != 0 { c >> 16 } else { c }) & 15;
+                let val = (if sel >> 1 & 1 != 0 { x >> 16 } else { x }) as u16;
+                *slot = val >> cnt;
             }
             (Class::Own, u32::from(half[0]) | u32::from(half[1]) << 16)
         }
@@ -3723,6 +3751,76 @@ mod tests {
         st.v[1][0] = 0x3c00_3c00;
         i.mods.neg_lo = 1;
         assert!(run("v_pk_fma_f16", &i, &mut st).is_err());
+    }
+
+    /// RDNA ISA V_MUL_HI_U32_U24: `D0.u = ((S0.u & 0xffffff) * (S1.u & 0xffffff)) >> 32` (48-bit product).
+    #[test]
+    fn v_mul_hi_u32_u24_masks_to_24_bits_and_takes_product_bits_47_32() {
+        let mut st = state();
+        st.exec = 1;
+        let i = insn("v_mul_hi_u32_u24_e32", vec![v(0), v(1), v(2)]);
+        // (2^24-1)^2 = 2^48 - 2^25 + 1; since 2^25 < 2^32 the high word is 2^16 - 1 = 0xffff.
+        st.v[1][0] = 0xabff_ffff; // bits above 24 must be ignored
+        st.v[2][0] = 0xffff_ffff;
+        run("v_mul_hi_u32_u24_e32", &i, &mut st).unwrap();
+        assert_eq!(st.v[0][0], 0xffff);
+        // 2^23 * 2^23 = 2^46 -> 2^14.
+        st.v[1][0] = 0x0080_0000;
+        st.v[2][0] = 0x0080_0000;
+        run("v_mul_hi_u32_u24_e32", &i, &mut st).unwrap();
+        assert_eq!(st.v[0][0], 0x4000);
+        // Inline constant S0 = 36 (as `v_mul_hi_u32_u24 v2, 36, v12`): 36 * 1 = 36 < 2^32 -> 0. An unmasked
+        // 0xff00_0001 would give (0xff00_0001 * 36) >> 32 = 35.
+        let k = insn(
+            "v_mul_hi_u32_u24_e32",
+            vec![v(0), Operand::Inline(InlineConst::Integer(36)), v(2)],
+        );
+        st.v[2][0] = 0xff00_0001;
+        run("v_mul_hi_u32_u24_e32", &k, &mut st).unwrap();
+        assert_eq!(st.v[0][0], 0);
+        // Inline -1 is the word 0xffff_ffff, masked to 0xffffff like any other operand.
+        let k = insn(
+            "v_mul_hi_u32_u24_e32",
+            vec![v(0), Operand::Inline(InlineConst::Integer(-1)), v(2)],
+        );
+        st.v[2][0] = 0xffff_ffff;
+        run("v_mul_hi_u32_u24_e32", &k, &mut st).unwrap();
+        assert_eq!(st.v[0][0], 0xffff);
+    }
+
+    /// RDNA ISA V_PK_LSHRREV_B16: result half `h` = `S1.half(sel1) >> (S0.half(sel0) & 15)`; `op_sel` bit k picks the
+    /// high half of source k for the low result, `op_sel_hi` bit k for the high result.
+    #[test]
+    fn v_pk_lshrrev_b16_selects_halves_per_result_half() {
+        let mut i = insn("v_pk_lshrrev_b16", vec![v(0), v(1), v(2)]);
+        let mut st = state();
+        st.exec = 1;
+        st.v[1][0] = 0x0013_0004; // count: lo 4, hi 19 (&15 = 3)
+        st.v[2][0] = 0xff00_0f0f; // value: lo 0x0f0f, hi 0xff00
+        i.mods.op_sel = 0;
+        i.mods.op_sel_hi = 0;
+        run("v_pk_lshrrev_b16", &i, &mut st).unwrap();
+        assert_eq!(st.v[0][0], 0x00f0_00f0, "both: lo 0x0f0f >> 4");
+        i.mods.op_sel = 0b11;
+        run("v_pk_lshrrev_b16", &i, &mut st).unwrap();
+        assert_eq!(st.v[0][0], 0x00f0_1fe0, "lo: 0xff00 >> 3; hi: 0x0f0f >> 4");
+        i.mods.op_sel = 0b01;
+        i.mods.op_sel_hi = 0b10;
+        run("v_pk_lshrrev_b16", &i, &mut st).unwrap();
+        assert_eq!(st.v[0][0], 0x0ff0_01e1, "lo: 0x0f0f >> 3; hi: 0xff00 >> 4");
+        i.mods.op_sel = 0b10;
+        i.mods.op_sel_hi = 0b01;
+        run("v_pk_lshrrev_b16", &i, &mut st).unwrap();
+        assert_eq!(st.v[0][0], 0x01e1_0ff0, "lo: 0xff00 >> 4; hi: 0x0f0f >> 3");
+        // Modifiers that an integer shift cannot define are refused.
+        i.mods.neg_lo = 1;
+        assert!(run("v_pk_lshrrev_b16", &i, &mut st).is_err());
+        i.mods.neg_lo = 0;
+        i.mods.neg_hi = 1;
+        assert!(run("v_pk_lshrrev_b16", &i, &mut st).is_err());
+        i.mods.neg_hi = 0;
+        i.mods.clamp = true;
+        assert!(run("v_pk_lshrrev_b16", &i, &mut st).is_err());
     }
 
     #[test]

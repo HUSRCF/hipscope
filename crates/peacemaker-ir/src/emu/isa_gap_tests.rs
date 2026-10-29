@@ -794,6 +794,58 @@ fn v_pk_mul_f16_multiplies_both_halves_with_one_rounding() {
     assert!(run(V_PK_MUL_F16, &mut st).is_err());
 }
 
+/// The gfx1201 instruction and its table name, decoded from machine words (gfx12 codec).
+fn dec12(words: &[u32]) -> (Inst, &'static str) {
+    let (inst, n) = crate::codec::gfx12::decode_for(Arch::Gfx1201, words).unwrap_or_else(|e| panic!("decode {words:08x?}: {e}"));
+    assert_eq!(n, words.len(), "{words:08x?} decoded to {n} words");
+    let name = crate::isa::lookup(Arch::Gfx1201, inst.op, inst.form)
+        .unwrap_or_else(|| panic!("{words:08x?} has no gfx1201 row"))
+        .name;
+    (inst, name)
+}
+
+fn run12(words: &[u32], st: &mut State) -> Result<()> {
+    let (inst, name) = dec12(words);
+    assert_eq!(crate::emu::semantic_class(name), Some("alu"), "{name}");
+    super::execute(Arch::Gfx1201, name, &inst, st)
+}
+
+/// `v_mul_hi_u32_u24_e32 v2, 36, v12` (gfx1201, VOP2 0xc).
+const V_MUL_HI_U32_U24: &[u32] = &[0x180418a4];
+/// `v_mul_hi_u32_u24_e32 v2, v1, v12`
+const V_MUL_HI_U32_U24_VV: &[u32] = &[0x18041901];
+/// `v_pk_lshrrev_b16 v20, 8, v20 op_sel:[1,0] op_sel_hi:[0,0]` (gfx1201, VOP3P 0x5).
+const V_PK_LSHRREV_B16: &[u32] = &[0xcc054814, 0x02022888];
+
+/// RDNA ISA V_MUL_HI_U32_U24: `D0.u = ((S0.u & 0xffffff) * (S1.u & 0xffffff)) >> 32`.
+#[test]
+fn v_mul_hi_u32_u24_decoded_masks_and_takes_the_high_word() {
+    let mut st = state();
+    // Inline 36 * (0xff00_0001 & 0xffffff = 1) = 36 -> 0; an unmasked S1 would give (0xff00_0001*36)>>32 = 35.
+    st.v[12][0] = 0xff00_0001;
+    run12(V_MUL_HI_U32_U24, &mut st).unwrap();
+    assert_eq!(st.v[2][0], 0);
+    // 0xffffff * 0xffffff = 2^48 - 2^25 + 1 -> bits 47:32 = 0xffff; the bits above 24 of both sources are ignored.
+    st.v[1][0] = 0xabff_ffff;
+    st.v[12][0] = 0x01ff_ffff;
+    run12(V_MUL_HI_U32_U24_VV, &mut st).unwrap();
+    assert_eq!(st.v[2][0], 0xffff);
+}
+
+/// The real encoding `CC054814 02022888`: op_sel = 0b001 (src0 high half feeds the LOW result), op_sel_hi = 0b000
+/// (both sources' low halves feed the HIGH result). The inline constant 8 is the word 8 (high half 0), so
+/// lo = v20.lo >> (0 & 15) = v20.lo and hi = v20.lo >> 8. Expected values are from the ISA formula, not kernel output.
+#[test]
+fn v_pk_lshrrev_b16_decoded_encoding_executes_with_op_sel() {
+    let (inst, name) = dec12(V_PK_LSHRREV_B16);
+    assert_eq!(name, "v_pk_lshrrev_b16");
+    assert_eq!((inst.mods.op_sel, inst.mods.op_sel_hi & 0b011), (0b001, 0)); // bit 2 of op_sel_hi is the unused src2
+    let mut st = state();
+    st.v[20][0] = 0xab12_cd34;
+    super::execute(Arch::Gfx1201, name, &inst, &mut st).unwrap();
+    assert_eq!(st.v[20][0], 0x00cd_cd34);
+}
+
 // ---- f32 VALU -----------------------------------------------------------------------------------------------------
 
 #[test]
