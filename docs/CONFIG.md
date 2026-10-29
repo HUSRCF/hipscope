@@ -910,10 +910,16 @@ The carrier's cap is provisional (it also charges the DFlash/MTP draft reserve):
 it sizes the VMM reservation and the draft structures before the drafts, DeltaNet
 state and scratch exist. So the automatic context is **re-measured after the
 whole load** (KV prefix, DeltaNet state, scratch, DFlash/MTP/DSpark, eviction):
-the loader finds the largest context whose remaining KV mapping plus the minimum
+the loader finds the largest context whose remaining KV mapping plus the
+per-request reserve fits the VRAM actually free. The reserve is the minimum
 prefill reserve (the minimum PBS, its 1 GiB headroom and 128 MiB of page
-rounding) fits the VRAM actually free, logs one `max_seq fit: measured after
-full load: free=… transient=… kv_mapped_growth_per_token≈… drafts=… ; context
+rounding), plus the owners a request creates lazily after the load: the
+DeltaNet checkpoint rings (snapshot bytes x `HIPFIRE_CACHE_CKPT_MAX`, default
+8, for the AR ring and, with a DFlash/MTP speculator, its own ring) and, with
+native MTP, the per-request `MtpSpecState` (head KV, scratch, verify buffers,
+trunk snapshot and PBS) and the prompt-fill transient. The loader logs one
+`max_seq fit: measured after full load: free=… transient=… (prefill … +
+checkpoints … + mtp …) kv_mapped_growth_per_token≈… drafts=… ; context
 A -> B` line, and lowers the published context (and `card_cap`) to it; below 512
 the load is refused. An explicit `max_seq` that does not fit is refused at load,
 naming the largest fitting value; with `memory.oom_guard` off it loads and only

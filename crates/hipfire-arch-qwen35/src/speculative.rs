@@ -2121,6 +2121,41 @@ impl GdnTape {
         Self::new_armed(gpu, config, max_n, false)
     }
 
+    /// Device bytes [`Self::new_for_config`] allocates for `max_n` rows, computed
+    /// from the config alone (no allocation): the per-LA-layer qkv/alpha/beta
+    /// capture buffers plus the six replay scratches (all F32). With
+    /// `replay_ml` the multi-layer replay arming is charged too: the shared
+    /// q/k/v/out scratch (4 regions of `n_la * rows * v_dim` F32, `rows` capped
+    /// at the replay step ceiling) and the two per-layer pointer tables. The
+    /// scratch is shared per shape on a `Gpu`, so this is an upper bound when
+    /// another tape of the same shape is already armed.
+    pub fn requested_bytes(config: &qwen35::Qwen35Config, max_n: usize, replay_ml: bool) -> usize {
+        let k_dim = config.linear_num_key_heads * config.linear_key_head_dim;
+        let v_dim = config.linear_num_value_heads * config.linear_value_head_dim;
+        let qkv_dim = k_dim * 2 + v_dim;
+        let n_v_heads = config.linear_num_value_heads;
+        let n_la = config
+            .layer_types
+            .iter()
+            .filter(|t| **t == qwen35::LayerType::LinearAttention)
+            .count();
+        let f32_elems = n_la * max_n * (qkv_dim + 2 * n_v_heads) + max_n * (2 * k_dim + 4 * v_dim);
+        let mut bytes = f32_elems * 4;
+        if replay_ml && n_la != 0 {
+            let rows = max_n.min(rdna_compute::dflash_gdn_replay::DFLASH_GDN_REPLAY_MAX_STEPS);
+            let shape = rdna_compute::dflash_gdn_replay::GdnReplayScratchShape {
+                n_layers: n_la,
+                rows,
+                v_dim,
+            };
+            bytes += 4 * shape.region_bytes()
+                + n_la
+                    * (std::mem::size_of::<rdna_compute::dflash_gdn_replay::DflashReplayPreLayer>()
+                        + std::mem::size_of::<rdna_compute::dflash_gdn_replay::GdnLayerTable>());
+        }
+        bytes
+    }
+
     /// DFlash replay tape: [`Self::new_for_config`] plus, when
     /// `HIPFIRE_DN_SNAPSHOT_FLIP` is on, the D8 snapshot-source tables that
     /// [`Self::replay_gdn_from_snapshot`] needs.

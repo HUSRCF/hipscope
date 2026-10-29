@@ -2116,8 +2116,14 @@ pub(crate) fn parse_state_quant(
 struct Qwen35PostLoadFit {
     /// Free VRAM after every load-time owner exists.
     free: usize,
-    /// Per-request prefill transient kept free: the minimum prefill
-    /// reservation (incl. the widened-PBS headroom) plus VMM page slack.
+    /// Per-request prefill transient: the minimum prefill reservation (incl.
+    /// the widened-PBS headroom) plus VMM page slack.
+    prefill: usize,
+    /// DeltaNet checkpoint rings a request can fill ([`Qwen35LazyCharges`]).
+    checkpoints: usize,
+    /// Native-MTP per-request owners ([`Qwen35LazyCharges`]).
+    mtp: usize,
+    /// `prefill + checkpoints + mtp`: kept free of KV mapping.
     transient: usize,
     /// Largest context whose remaining KV mapping plus `transient` fits `free`.
     fit: usize,
@@ -2125,15 +2131,93 @@ struct Qwen35PostLoadFit {
     growth_at_cap: usize,
 }
 
+/// Owners a request creates lazily after the load, which no load-time
+/// allocation shows up for but which a filled context must still find room
+/// for (they came out of the KV room as `hipMalloc` failures at fill).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Qwen35LazyCharges {
+    /// DeltaNet checkpoint rings: `snapshot_bytes x cap x rings`.
+    checkpoints: usize,
+    /// Native MTP `MtpSpecState` (first request) + prompt-fill transient.
+    mtp: usize,
+}
+
+/// Bytes of the checkpoint rings one load can populate at once.
+///
+/// Each snapshot mirrors `dn_state` ([`DeltaNetSnapshot::bytes_for`]); a ring
+/// holds at most `cap` of them. Two rings can be live together: the AR
+/// prefill ring (`LoadedModel.prefill_checkpoints`, gated by
+/// `HIPFIRE_CACHE_CKPT_RESUME` != 0, cap `ckpt_max()`) and, when a DFlash or
+/// native-MTP speculator is attached, that speculator's own ring (gated by
+/// `HIPFIRE_DFLASH_CKPT_RESUME`, i.e. `mtp_cache_policy().checkpoint_resume`,
+/// cap = the same `HIPFIRE_CACHE_CKPT_MAX` knob). `ckpt_max()`,
+/// `mtp_cache_policy().checkpoint_cap` and the DFlash builder all read that
+/// one knob with default 8 and floor 1, so a single `cap` serves every ring.
+fn qwen35_checkpoint_ring_bytes(snapshot_bytes: usize, speculator_ring: bool) -> usize {
+    let policy = hipfire_config::mtp_cache_policy();
+    let ar_ring = hipfire_config::developer_var("HIPFIRE_CACHE_CKPT_RESUME")
+        .ok()
+        .as_deref()
+        != Some("0");
+    let rings = usize::from(ar_ring) + usize::from(speculator_ring && policy.checkpoint_resume);
+    snapshot_bytes
+        .saturating_mul(policy.checkpoint_cap)
+        .saturating_mul(rings)
+}
+
+/// [`Qwen35LazyCharges`] for this load. `mtp` is the native-MTP head (and the
+/// requested chain depth) only when the MTP speculator is the one attached.
+fn qwen35_lazy_charges(
+    config: &hipfire_arch_qwen35::qwen35::Qwen35Config,
+    dn_state: &hipfire_arch_qwen35::qwen35::DeltaNetState,
+    gpu: &Gpu,
+    speculator_ring: bool,
+    mtp: Option<(&hipfire_arch_qwen35::mtp_head::Qwen35MtpHead, usize)>,
+) -> Result<Qwen35LazyCharges, String> {
+    let snapshot_bytes = usize::try_from(DeltaNetSnapshot::bytes_for(dn_state))
+        .map_err(|_| "DeltaNet snapshot sizing overflow".to_string())?;
+    let checkpoints = qwen35_checkpoint_ring_bytes(snapshot_bytes, speculator_ring);
+    let mtp = match mtp {
+        None => 0,
+        Some((head, requested_k)) => {
+            use hipfire_arch_qwen35::mtp_spec::{
+                mtp_head_fills_batched, mtp_prompt_fill_requested_bytes, MtpSpecState,
+            };
+            let max_n = hipfire_arch_qwen35::mtp_speculator::mtp_drafter_max_n(requested_k);
+            let verify_capacity = hipfire_arch_qwen35::mtp_speculator::mtp_verify_capacity(max_n);
+            let state = MtpSpecState::requested_bytes(
+                &gpu.arch,
+                config,
+                snapshot_bytes,
+                &head.config,
+                head.weights.compressed_vocab_size,
+                max_n,
+                verify_capacity,
+            )?;
+            let fill = mtp_prompt_fill_requested_bytes(
+                config,
+                &head.config,
+                mtp_head_fills_batched(head),
+                hipfire_arch_qwen35::qwen35::prefill_max_batch(gpu),
+            );
+            state.saturating_add(fill)
+        }
+    };
+    Ok(Qwen35LazyCharges { checkpoints, mtp })
+}
+
 /// Measured fit of the single-card Qwen VMM cache after the full load
 /// (weights, KV owners' initial prefix, DeltaNet, scratch, drafts). The
 /// carrier's pre-KV `card_cap` is provisional: it cannot charge what is
 /// allocated afterwards. `free` honours the UMA clamp and the emulation cap.
+/// `lazy` charges the per-request owners created after the load, so
+/// `free - transient` is real KV room.
 fn qwen35_post_load_fit(
     config: &hipfire_arch_qwen35::qwen35::Qwen35Config,
     kv: &llama::KvCache,
     gpu: &Gpu,
     cap: usize,
+    lazy: Qwen35LazyCharges,
 ) -> Result<Qwen35PostLoadFit, String> {
     let (free, _) = gpu
         .device_mem_info()
@@ -2142,7 +2226,10 @@ fn qwen35_post_load_fit(
         hipfire_arch_qwen35::qwen35::prefill::minimum_prefill_reservation_bytes(config, &gpu.arch)
             .ok_or("Qwen minimum PBS sizing overflow")?;
     // Same page-rounding slack the carrier's `card_cap` keeps.
-    let transient = minimum.saturating_add(128 << 20);
+    let prefill = minimum.saturating_add(128 << 20);
+    let transient = prefill
+        .saturating_add(lazy.checkpoints)
+        .saturating_add(lazy.mtp);
     let growth = |t: usize| {
         kv.planned_mapped_growth_bytes(gpu, t)
             .map_err(|e| format!("Qwen KV growth plan for {t} tokens: {e}"))
@@ -2151,6 +2238,9 @@ fn qwen35_post_load_fit(
     let growth_at_cap = growth(cap)?;
     Ok(Qwen35PostLoadFit {
         free,
+        prefill,
+        checkpoints: lazy.checkpoints,
+        mtp: lazy.mtp,
         transient,
         fit,
         growth_at_cap,
@@ -2783,6 +2873,24 @@ fn finish_qwen35_load(
             names.join("+")
         }
     };
+    // Per-request owners the speculator/AR paths create lazily, charged to the
+    // post-load fit below. `build_speculator` order: DSpark > DFlash > MTP >
+    // n-gram; the MTP head is only attached when none of the earlier arms is
+    // and eviction is off (the same guard `build_speculator` re-asserts).
+    let lazy_charges = {
+        let spec_slot_free = !adaptive_blocks_generic_spec && dspark_speculator.is_none();
+        let mtp_attaches = spec_slot_free && dflash.is_none() && eviction.is_none();
+        let speculator_ring = spec_slot_free
+            && eviction.is_none()
+            && (dflash.is_some() || (mtp_attaches && mtp.is_some()));
+        let mtp_sizing = if mtp_attaches && matches!(arch_id, 5 | 6) {
+            mtp.as_ref()
+                .map(|head| (head, crate::spec_build::mtp_requested_k(&ctx.spec)))
+        } else {
+            None
+        };
+        qwen35_lazy_charges(config, dn_state, &*ctx.gpu, speculator_ring, mtp_sizing)
+    };
     // Pick the arch-generic speculator: a loaded DFlash draft → DflashSpeculator,
     // else an MTP head → MtpSpeculator<Qwen35MtpDrafter>, else (opt-in) the
     // model-free n-gram drafter. `eviction` is borrowed (not moved) here so it is
@@ -2821,7 +2929,10 @@ fn finish_qwen35_load(
     let mut fit_refusal: Option<String> = None;
     if let Some(mut seq) = ctx.sequence {
         if bundle.kv_cache.uses_vmm_backend() {
-            match qwen35_post_load_fit(config, &bundle.kv_cache, &*ctx.gpu, physical_cap) {
+            let lazy = lazy_charges.clone();
+            match lazy.and_then(|lazy| {
+                qwen35_post_load_fit(config, &bundle.kv_cache, &*ctx.gpu, physical_cap, lazy)
+            }) {
                 Err(e) => fit_refusal = Some(e),
                 Ok(m) => {
                     let requested = ctx.max_seq;
@@ -2831,10 +2942,13 @@ fn finish_qwen35_load(
                             format!("{requested} unchanged")
                         } else if m.fit < admission::QWEN35_MIN_AUTO_CONTEXT {
                             fit_refusal = Some(format!(
-                                "Qwen VMM load refused: after the weights, drafts ({drafts_attached}) and scratch loaded, {} tokens fit (free {} B, minimum prefill reserve {} B), below the minimum automatic context {}; free GPU memory, disable the draft (speculation.dflash off), or use a smaller quantization of this model",
+                                "Qwen VMM load refused: after the weights, drafts ({drafts_attached}) and scratch loaded, {} tokens fit (free {} B, per-request reserve {} B = prefill {} + DeltaNet checkpoints {} + MTP {}), below the minimum automatic context {}; free GPU memory, disable the draft (speculation.dflash off), or use a smaller quantization of this model",
                                 m.fit,
                                 m.free,
                                 m.transient,
+                                m.prefill,
+                                m.checkpoints,
+                                m.mtp,
                                 admission::QWEN35_MIN_AUTO_CONTEXT
                             ));
                             format!("{requested} -> refused")
@@ -2847,8 +2961,8 @@ fn finish_qwen35_load(
                         }
                     } else if requested.min(physical_cap) > m.fit {
                         let message = format!(
-                            "max_seq {requested} does not fit this card: after the weights, drafts and scratch loaded, {} tokens fit (free {} B, minimum prefill reserve {} B); lower memory.max_seq to at most {} or omit it for automatic sizing",
-                            m.fit, m.free, m.transient, m.fit
+                            "max_seq {requested} does not fit this card: after the weights, drafts and scratch loaded, {} tokens fit (free {} B, per-request reserve {} B = prefill {} + DeltaNet checkpoints {} + MTP {}); lower memory.max_seq to at most {} or omit it for automatic sizing",
+                            m.fit, m.free, m.transient, m.prefill, m.checkpoints, m.mtp, m.fit
                         );
                         if hipfire_config::oom_guard_mode() == hipfire_config::OomGuardMode::Off {
                             eprintln!("warning: {message} (memory.oom_guard off: loading anyway)");
@@ -2861,8 +2975,8 @@ fn finish_qwen35_load(
                         format!("{requested} unchanged")
                     };
                     eprintln!(
-                        "max_seq fit: measured after full load: free={} transient={} kv_mapped_growth_per_token≈{per_token} drafts={drafts_attached} ; context {verdict}",
-                        m.free, m.transient
+                        "max_seq fit: measured after full load: free={} transient={} (prefill {} + checkpoints {} + mtp {}) kv_mapped_growth_per_token≈{per_token} drafts={drafts_attached} ; context {verdict}",
+                        m.free, m.transient, m.prefill, m.checkpoints, m.mtp
                     );
                 }
             }

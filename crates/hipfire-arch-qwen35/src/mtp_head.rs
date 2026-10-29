@@ -450,6 +450,54 @@ impl Qwen35MtpHeadScratch {
         }
     }
 
+    /// Device bytes [`Self::new`] allocates for `config` on `arch` (the flash
+    /// partials depend on the arch's flash tile size), from shape arithmetic
+    /// alone. `compressed_vocab` adds the `ensure_compressed_logits` tensor.
+    pub fn requested_bytes(
+        arch: &str,
+        config: &Qwen35MtpHeadConfig,
+        compressed_vocab: Option<usize>,
+    ) -> usize {
+        let dim = config.n_embd;
+        let q_dim = config.head_dim * config.n_head;
+        let kv_dim = config.head_dim * config.n_head_kv;
+        let moe_max_inter = config
+            .moe_intermediate_size
+            .max(config.shared_expert_intermediate_size);
+        // tok_embd, e_norm, h_norm, cur, residual, tmp, t_mtp_out
+        let mut elems = 7 * dim
+            + 2 * dim // concat
+            + 2 * q_dim // q_full
+            + 3 * q_dim // q, gate, attn_out
+            + 2 * kv_dim // k, v
+            + 3 * config.n_ff // gate_ffn, up, ffn_hidden
+            + config.vocab_size; // logits
+        if config.ffn_kind == Qwen35MtpFfnKind::Moe {
+            let batch = config.num_experts_per_tok * config.moe_intermediate_size;
+            elems += config.num_experts // router logits
+                + 1 // scalar
+                + dim // x_rot
+                + 2 * moe_max_inter // gate_up
+                + 3 * moe_max_inter // gate, up, ffn_hidden
+                + dim // ffn_out
+                + 3 * batch // gate/up/rot batch
+                + 2 * config.num_experts_per_tok // topk idx/weights
+                + config.num_experts_per_tok * dim
+                + dim.div_ceil(4); // down_expanded
+        }
+        let tile_size = rdna_compute::attention::q8_flash_tile_size(
+            arch,
+            config.n_head,
+            config.n_head_kv,
+            config.head_dim,
+            config.max_seq,
+        );
+        let max_tiles = (config.max_seq + tile_size - 1) / tile_size;
+        elems += config.n_head * max_tiles * (2 + config.head_dim); // flash_partials
+        elems += compressed_vocab.unwrap_or(0);
+        elems * 4 + 4 // + pos_buf
+    }
+
     pub fn new(gpu: &mut Gpu, config: &Qwen35MtpHeadConfig) -> HipResult<Self> {
         let dim = config.n_embd;
         let q_dim = config.head_dim * config.n_head;
@@ -742,6 +790,15 @@ pub struct Qwen35MtpHeadKvCache {
 }
 
 impl Qwen35MtpHeadKvCache {
+    /// Device bytes [`Self::new_with_kv_mode`] allocates for `MtpKvMode::Q8`:
+    /// one layer, K and V, each `max_seq * n_head_kv * (head_dim / 32) * 34`
+    /// bytes rounded up to whole F32 words. Pure shape arithmetic.
+    pub fn q8_requested_bytes(config: &Qwen35MtpHeadConfig) -> usize {
+        let total_blocks = config.n_head_kv * (config.head_dim / 32);
+        let cache_bytes = config.max_seq * total_blocks * 34;
+        2 * (cache_bytes.div_ceil(4) * 4)
+    }
+
     /// Default constructor: Q8 KV (current ship).
     pub fn new(gpu: &mut Gpu, config: &Qwen35MtpHeadConfig) -> HipResult<Self> {
         Self::new_with_kv_mode(gpu, config, MtpKvMode::Q8)
@@ -2933,6 +2990,18 @@ impl Qwen35MtpHeadBatchedScratch {
         Self::requested_bytes(rows * k)
     }
 
+    /// Requested device bytes of the legacy prompt fill at `rows` rows:
+    /// [`Self::new`]'s full layout plus the `rows x rotation_k` rotation
+    /// scratch. Upper bound of the lean fill layout at the same rows.
+    pub fn legacy_prompt_fill_bytes(
+        config: &Qwen35MtpHeadConfig,
+        rows: usize,
+        rotation_k: usize,
+    ) -> usize {
+        Self::full_requested_bytes(config, rows)
+            .saturating_add(Self::rotation_requested_bytes(rows, rotation_k))
+    }
+
     /// Largest prompt-fill head capacity whose lean scratch + fill rotation
     /// requested bytes do not exceed the legacy full scratch + legacy rotation
     /// requested bytes at `legacy_rows`. The budget capacity is aligned down to
@@ -3685,6 +3754,32 @@ mod prompt_fill_budget_tests {
             LEGACY_K,
             FILL_K,
         )
+    }
+
+    #[test]
+    fn kv_and_scratch_bytes_match_shape_arithmetic() {
+        let c = cfg_27b();
+        // K and V, each 16384 * (4 heads * 256/32 blocks) * 34 B.
+        assert_eq!(
+            Qwen35MtpHeadKvCache::q8_requested_bytes(&c),
+            2 * 16384 * 32 * 34
+        );
+        let tile = rdna_compute::attention::q8_flash_tile_size("gfx1201", 24, 4, 256, 16384);
+        let flash = 24 * 16384usize.div_ceil(tile) * (2 + 256);
+        // 7 dim rows + concat + q_full + 3 q_dim + 2 kv_dim + 3 n_ff + logits.
+        let elems = 7 * 5120 + 2 * 5120 + 2 * 6144 + 3 * 6144 + 2 * 1024 + 3 * 17408 + 248320;
+        assert_eq!(
+            Qwen35MtpHeadScratch::requested_bytes("gfx1201", &c, None),
+            (elems + flash) * 4 + 4
+        );
+        assert_eq!(
+            Qwen35MtpHeadScratch::requested_bytes("gfx1201", &c, Some(32768)),
+            (elems + flash + 32768) * 4 + 4
+        );
+        assert_eq!(
+            Qwen35MtpHeadBatchedScratch::legacy_prompt_fill_bytes(&c, 512, 17408),
+            512 * 565_252 + 512 * 17408 * 4
+        );
     }
 
     #[test]
