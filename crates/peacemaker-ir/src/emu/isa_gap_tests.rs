@@ -846,6 +846,42 @@ fn v_pk_lshrrev_b16_decoded_encoding_executes_with_op_sel() {
     assert_eq!(st.v[20][0], 0x00cd_cd34);
 }
 
+/// `v_mul_hi_u32_u24_e32 v2, 36, v9` (gfx1100, VOP2 0xc: RDNA3 ISA XML sha256 6eee5f87...), the word hipcc emits for the
+/// `kbx * 36` address product of the ggml mmvq objects.
+const V_MUL_HI_U32_U24_G11: &[u32] = &[0x180412a4];
+/// `v_mul_hi_u32_u24_e32 v2, v1, v9`
+const V_MUL_HI_U32_U24_VV_G11: &[u32] = &[0x18041301];
+/// `v_pk_lshrrev_b16 v20, 8, v20 op_sel:[1,0] op_sel_hi:[0,0]` (gfx1100, VOP3P 0x5), same words as gfx1201.
+const V_PK_LSHRREV_B16_G11: &[u32] = &[0xcc054814, 0x02022888];
+
+/// RDNA3 ISA V_MUL_HI_U32_U24: `D0.u = ((S0.u & 0xffffff) * (S1.u & 0xffffff)) >> 32`.
+#[test]
+fn v_mul_hi_u32_u24_gfx1100_masks_and_takes_the_high_word() {
+    let mut st = state();
+    // Inline 36 * (0xff00_0001 & 0xffffff = 1) = 36 -> 0; an unmasked S1 would give (0xff00_0001*36)>>32 = 35.
+    st.v[9][0] = 0xff00_0001;
+    run(V_MUL_HI_U32_U24_G11, &mut st).unwrap();
+    assert_eq!(st.v[2][0], 0);
+    // 0xffffff * 0xffffff = 2^48 - 2^25 + 1 -> bits 47:32 = 0xffff; the bits above 24 of both sources are ignored.
+    st.v[1][0] = 0xabff_ffff;
+    st.v[9][0] = 0x01ff_ffff;
+    run(V_MUL_HI_U32_U24_VV_G11, &mut st).unwrap();
+    assert_eq!(st.v[2][0], 0xffff);
+}
+
+/// The real encoding `CC054814 02022888` decoded by the gfx11 codec: op_sel = 0b001 (src0's high half feeds the LOW
+/// result), op_sel_hi = 0b000. The inline constant 8 is the word 8 (high half 0): lo = v20.lo >> 0, hi = v20.lo >> 8.
+#[test]
+fn v_pk_lshrrev_b16_gfx1100_decoded_encoding_executes_with_op_sel() {
+    let (inst, name) = dec(V_PK_LSHRREV_B16_G11);
+    assert_eq!(name, "v_pk_lshrrev_b16");
+    assert_eq!((inst.mods.op_sel, inst.mods.op_sel_hi & 0b011), (0b001, 0));
+    let mut st = state();
+    st.v[20][0] = 0xab12_cd34;
+    super::execute(Arch::Gfx1100, name, &inst, &mut st).unwrap();
+    assert_eq!(st.v[20][0], 0x00cd_cd34);
+}
+
 // ---- f32 VALU -----------------------------------------------------------------------------------------------------
 
 #[test]
