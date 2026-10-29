@@ -13242,14 +13242,14 @@ struct SeedPrefill {
 }
 
 impl SeedPrefill {
-    fn plan(gpu: &Gpu, target: &DflashTargetParts<'_>) -> Self {
+    fn plan(gpu: &Gpu, target: &DflashTargetParts<'_>, end_tokens: usize) -> Self {
         let ceiling = match dflash_seed_ceiling(
             gpu,
             target.weights,
             target.config,
             target.dn_state,
             target.kv_cache,
-            0,
+            qwen35::prefill::request_kv_growth_deduction(gpu, target.kv_cache, end_tokens),
         ) {
             Ok(limit) => limit,
             Err(e) => {
@@ -13416,7 +13416,7 @@ pub fn seed_target_hidden_from_prompt_abortable_parts(
             snap.free_gpu(gpu);
         }
     }
-    let mut seed = SeedPrefill::plan(gpu, target);
+    let mut seed = SeedPrefill::plan(gpu, target, prompt_tokens.len());
     LAST_DFLASH_SEED_CEILING.store(seed.ceiling, std::sync::atomic::Ordering::Relaxed);
     let result = (|| -> HipResult<bool> {
         let mut seq_pos: usize = 0;
@@ -13516,7 +13516,7 @@ pub fn seed_target_hidden_suffix_abortable_parts(
     ckpt_interval: usize,
     ckpt_cap: usize,
 ) -> HipResult<bool> {
-    let mut seed = SeedPrefill::plan(gpu, target);
+    let mut seed = SeedPrefill::plan(gpu, target, start_pos + suffix.len());
     let result = (|| -> HipResult<bool> {
         let mut off: usize = 0;
         let mut pos = start_pos;

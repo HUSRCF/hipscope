@@ -3475,13 +3475,17 @@ where
     // the MTP buffers below take memory, as AR's query sees it.
     let trunk_chunk_max = match route {
         MtpPromptRoute::Own => head_rows,
-        MtpPromptRoute::ArRoute => match qwen35::ordinary_prefill_chunk_limit(
+        MtpPromptRoute::ArRoute => match qwen35::prefill::ordinary_prefill_chunk_limit_deducting(
             gpu,
             &target.weights,
             &target.config,
             &target.dn_state,
             &target.kv_cache,
-            None,
+            qwen35::prefill::request_kv_growth_deduction(
+                gpu,
+                &target.kv_cache,
+                start_pos + prompt_tokens.len(),
+            ),
         ) {
             Ok(limit) => limit,
             Err(e) => {

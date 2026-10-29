@@ -4734,7 +4734,14 @@ pub fn generate(
             let chunk_max = if m.kv_adaptive.is_some() {
                 qwen35::PREFILL_MAX_BATCH
             } else {
-                match qwen35::ordinary_prefill_chunk_limit(gpu, weights, config, dn, kv, None) {
+                let deduction = qwen35::prefill::request_kv_growth_deduction(
+                    gpu,
+                    kv,
+                    m.seq_pos + new_tokens.len(),
+                );
+                match qwen35::prefill::ordinary_prefill_chunk_limit_deducting(
+                    gpu, weights, config, dn, kv, deduction,
+                ) {
                     Ok(limit) => limit,
                     Err(e) => {
                         eprintln!(

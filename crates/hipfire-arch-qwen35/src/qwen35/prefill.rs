@@ -2525,6 +2525,21 @@ fn memory_admitted_rung(
     }
     Ok(WIDENED_COMMIT_ROWS)
 }
+/// Physical KV bytes this request will still map to reach `end_tokens` rows
+/// (clamped to the cache's physical capacity). Zero on non-VMM KV, when the
+/// mapping already covers the request, or if the query errors. Feed to
+/// [`ordinary_prefill_chunk_limit_deducting`] so the once-per-prompt chunk
+/// ceiling is sized against memory the same request is about to map.
+pub fn request_kv_growth_deduction(
+    gpu: &Gpu,
+    kv_cache: &llama::KvCache,
+    end_tokens: usize,
+) -> usize {
+    kv_cache
+        .planned_mapped_growth_bytes(gpu, end_tokens.min(kv_cache.physical_cap))
+        .unwrap_or(0)
+}
+
 ///
 /// Effective admitted ordinary chunk ceiling for this request: static
 /// eligibility, highest performance-admitted rung, explicit requested
