@@ -26,8 +26,8 @@ use super::*;
 use crate::gpu_forward::panel_stage::{RingSchedule, SpSchedule};
 use crate::slowlink_admission::qualify_request_sp;
 use crate::slowlink_sp::{
-    admit_sp, qualify_sp_window, sp_mode_for, SpBypass, SpDecline, SpEventBackend, SpLoadFacts,
-    SpMode, SpProfile, SpProtocol, SpProtocolError, SP_MAX_ROWS,
+    admit_sp_noted, qualify_sp_window, sp_mode_for, SpBypass, SpDecline, SpEventBackend,
+    SpLoadFacts, SpMode, SpProfile, SpProtocol, SpProtocolError, SP_MAX_ROWS,
 };
 use hipfire_dispatch::cpu_exec::{
     cpu_quant_for, moe_cpu_grouped_rows_bf16, CpuMoeExpert, SpCpuExpert, SpCpuScratch, SpCpuStats,
@@ -287,7 +287,7 @@ pub(crate) fn sp_load_decision(
     f16_route_ready: bool,
 ) -> Result<SpOutcome, String> {
     let placement = lab_placement()?;
-    let hybrid_knob = hipfire_config::memory::qwen4_sp();
+    let hybrid_knob = crate::slowlink_sp::hybrid_knob(&gpu.arch);
     let touched_knob = crate::slowlink_sp::touched_knob(&gpu.arch);
     let force_all = placement == SpPlacement::All;
     let mode = sp_mode_for(hybrid_knob, touched_knob, force_all);
@@ -336,7 +336,13 @@ pub(crate) fn sp_load_decision(
         );
         facts.prefix_cache = serve_prefix_cache();
     }
-    Ok(admit_sp(&facts).map(|sp| match sp.mode {
+    let admitted = admit_sp_noted(&facts).map(|(sp, hybrid_decline)| {
+        if let Some(decline) = hybrid_decline {
+            eprintln!("  {}", sp_hybrid_fallback_line(&decline, sp.mode));
+        }
+        sp
+    });
+    Ok(admitted.map(|sp| match sp.mode {
         SpMode::TouchedOnly => SpBind::TouchedOnly(TouchedBindPlan {
             profile: sp,
             pages,
@@ -2890,6 +2896,13 @@ mod tests {
             "{line}"
         );
         assert!(sp_s1_unavailable_line("x").contains("(S1) is unavailable"));
+        let line = super::super::sp_hybrid_fallback_line(&declined, SpMode::TouchedOnly);
+        assert!(
+            line.starts_with(
+                "qwen4 SP: hybrid mode declined, falling back to touched_only: sp: region fit"
+            ) && line.contains("4096-row S1 window"),
+            "{line}"
+        );
     }
 
     fn plan_agg_on(profile: &SlowlinkProfile, rows: usize) -> Qwen4PromptPlan {

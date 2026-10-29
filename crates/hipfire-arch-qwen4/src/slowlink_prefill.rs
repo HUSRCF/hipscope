@@ -1938,6 +1938,15 @@ pub(crate) fn sp_s1_unavailable_line(reason: &str) -> String {
     )
 }
 
+/// The load line of a hybrid decline that touched-only replaced (default on gfx1100): the
+/// reason hybrid did not arm and the mode that runs instead.
+pub(crate) fn sp_hybrid_fallback_line(hybrid: &SpDecline, now: SpMode) -> String {
+    format!(
+        "qwen4 SP: hybrid mode declined, falling back to {}: {hybrid}",
+        now.label()
+    )
+}
+
 fn sp_log_s1_unavailable(reason: &str) {
     eprintln!("  {}", sp_s1_unavailable_line(reason));
 }
@@ -1954,7 +1963,8 @@ pub(crate) fn bind_at_load(
     bundle: &mut Qwen4Bundle,
     gpu: &mut Gpu,
 ) -> Result<(), String> {
-    let sp_knob = hipfire_config::memory::qwen4_sp() || crate::slowlink_sp::touched_knob(&gpu.arch);
+    let hybrid_knob = crate::slowlink_sp::hybrid_knob(&gpu.arch);
+    let sp_knob = hybrid_knob || crate::slowlink_sp::touched_knob(&gpu.arch);
     let Some(profile) = forward.slowlink_profile().copied() else {
         if sp_knob {
             sp_log_decision(Err(&SpDecline::NoS1Profile));
@@ -1989,7 +1999,7 @@ pub(crate) fn bind_at_load(
         let pages = plan.spec.as_ref().map_or(0, |spec| spec.pages());
         // The F16 `Aggregate` route dry run: only a hybrid SP on a symmetric-IU4 profile needs
         // it (its windows run the F16 route); every other load is ready by construction.
-        let f16_route_ready = if hipfire_config::memory::qwen4_sp() {
+        let f16_route_ready = if hybrid_knob {
             match sp_f16_route_probe(&*forward, &*bundle, gpu, &profile) {
                 Ok(()) => true,
                 Err(why) => {

@@ -158,6 +158,20 @@ impl SpMode {
     }
 }
 
+/// The hybrid-SP knob of a load on `arch`: an explicit `developer.qwen4_sp`
+/// (`HIPFIRE_QWEN4_SP`, `0` is the kill switch) wins, unset is **on for exact gfx1100** (the
+/// only calibrated arch) and off elsewhere. When the hybrid mode declines at load, the
+/// touched-only mode (its own knob) is the fallback ([`admit_sp_noted`]). Pure;
+/// [`hybrid_knob`] reads the process value.
+pub fn hybrid_knob_for(explicit: Option<bool>, arch: &str) -> bool {
+    explicit.unwrap_or(arch == SP_ARCH)
+}
+
+/// [`hybrid_knob_for`] with the process's `developer.qwen4_sp`.
+pub fn hybrid_knob(arch: &str) -> bool {
+    hybrid_knob_for(hipfire_config::memory::qwen4_sp(), arch)
+}
+
 /// The touched-only knob of a load on `arch`: an explicit `developer.qwen4_sp_touched`
 /// (`HIPFIRE_QWEN4_SP_TOUCHED`, `0` is the kill switch) wins, unset is **on for exact
 /// gfx1100** (the only calibrated arch; byte-identical to stream-all S1) and off elsewhere.
@@ -198,8 +212,12 @@ pub fn f16_moe_scope(append: bool, sp_f16_window: bool) -> bool {
 /// | off | on | any | touched-only |
 /// | on | off | no | hybrid |
 /// | on | off | yes | touched-only |
-/// | on | on | no | hybrid (hybrid wins) |
+/// | on | on | no | hybrid (hybrid wins; touched-only is its fallback when it declines) |
 /// | on | on | yes | touched-only |
+///
+/// Both knobs are unset-on for exact gfx1100 ([`hybrid_knob_for`], [`touched_knob_for`]), so the
+/// gfx1100 default is hybrid with touched-only behind it; `HIPFIRE_QWEN4_SP=0` leaves
+/// touched-only, `HIPFIRE_QWEN4_SP_TOUCHED=0` leaves hybrid without a fallback, both `0` is off.
 ///
 /// A placement forced to k = U (lab `HIPFIRE_QWEN4_SP_FORCE_K=all`) is the
 /// touched-only placement by definition: streaming every touched expert with no
@@ -424,9 +442,36 @@ impl fmt::Display for SpDecline {
 /// no owner and leaves the numerics of S1 untouched); it needs the ring to hold
 /// one page per group of a layer that touches every expert.
 pub(crate) fn admit_sp(facts: &SpLoadFacts<'_>) -> Result<SpProfile, SpDecline> {
+    admit_sp_noted(facts).map(|(profile, _)| profile)
+}
+
+/// [`admit_sp`] that also returns the hybrid decline a touched-only fallback replaced. When the
+/// knobs select the hybrid mode and it declines (a small window's region fit, no CPU quant, the
+/// pinned budget, `serve.prefix_cache`, the F16 route ...) while the touched-only knob is on,
+/// touched-only is admitted instead and the hybrid decline is returned beside it so the load can
+/// say why; if touched-only declines too, the HYBRID decline is the verdict (it is the mode the
+/// knobs asked for). A forced placement k = U never selects the hybrid mode, so it has no
+/// fallback to speak of.
+pub(crate) fn admit_sp_noted(
+    facts: &SpLoadFacts<'_>,
+) -> Result<(SpProfile, Option<SpDecline>), SpDecline> {
     let Some(mode) = sp_mode_for(facts.knob, facts.touched_knob, facts.force_all) else {
         return Err(SpDecline::KnobOff);
     };
+    match admit_mode(facts, mode) {
+        Ok(profile) => Ok((profile, None)),
+        Err(hybrid) if mode == SpMode::Hybrid && facts.touched_knob => {
+            match admit_mode(facts, SpMode::TouchedOnly) {
+                Ok(profile) => Ok((profile, Some(hybrid))),
+                Err(_) => Err(hybrid),
+            }
+        }
+        Err(decline) => Err(decline),
+    }
+}
+
+/// The admission rules of `mode`, in their fixed order (the mode is already chosen).
+fn admit_mode(facts: &SpLoadFacts<'_>, mode: SpMode) -> Result<SpProfile, SpDecline> {
     let Some(route) = facts.s1_route else {
         return Err(SpDecline::NoS1Profile);
     };
@@ -1158,6 +1203,144 @@ mod tests {
         );
     }
 
+    /// Hybrid SP is the gfx1100 default: unset is on there and off elsewhere, an explicit value
+    /// wins everywhere, and touched-only (also default on) is the fallback when hybrid declines.
+    #[test]
+    fn hybrid_defaults_on_for_gfx1100_with_touched_only_as_the_fallback() {
+        for (explicit, arch, want) in [
+            (None, "gfx1100", true),
+            (Some(true), "gfx1100", true),
+            (Some(false), "gfx1100", false),
+            (None, "gfx1151", false),
+            (None, "gfx1201", false),
+            (Some(true), "gfx1201", true),
+            (Some(false), "gfx1201", false),
+        ] {
+            assert_eq!(hybrid_knob_for(explicit, arch), want, "{explicit:?} {arch}");
+        }
+        // The two knobs resolved from (SP, TOUCHED, arch) -> (mode, hybrid decline replaced).
+        let admit = |sp: Option<bool>,
+                     touched: Option<bool>,
+                     arch: &'static str,
+                     tweak: &dyn Fn(&mut SpLoadFacts<'static>)| {
+            let mut facts = SpLoadFacts {
+                knob: hybrid_knob_for(sp, arch),
+                touched_knob: touched_knob_for(touched, arch),
+                arch,
+                ..facts()
+            };
+            tweak(&mut facts);
+            admit_sp_noted(&facts)
+        };
+        let none: &dyn Fn(&mut SpLoadFacts<'static>) = &|_| {};
+        // Defaults on gfx1100: hybrid, no fallback needed.
+        let (profile, note) = admit(None, None, "gfx1100", none).unwrap();
+        assert_eq!((profile.mode, note), (SpMode::Hybrid, None));
+        // SP=0 leaves touched-only; TOUCHED=0 leaves hybrid; both 0 is off.
+        assert_eq!(
+            admit(Some(false), None, "gfx1100", none).unwrap().0.mode,
+            SpMode::TouchedOnly
+        );
+        assert_eq!(
+            admit(None, Some(false), "gfx1100", none).unwrap().0.mode,
+            SpMode::Hybrid
+        );
+        assert_eq!(
+            admit(Some(false), Some(false), "gfx1100", none).unwrap_err(),
+            SpDecline::KnobOff
+        );
+        // Other arches: nothing arms by default; an explicit 1 declines by arch name.
+        assert_eq!(
+            admit(None, None, "gfx1201", none).unwrap_err(),
+            SpDecline::KnobOff
+        );
+        assert_eq!(
+            admit(Some(true), None, "gfx1201", none).unwrap_err(),
+            SpDecline::ArchNotCalibrated {
+                arch: "gfx1201".into()
+            }
+        );
+        // Every hybrid decline falls back to touched-only on gfx1100 and is reported:
+        // small window (region fit), no CPU quant, no splice pool, pinned budget, prefix
+        // cache, expert count, no F16 route on a symmetric profile.
+        type Tweak = fn(&mut SpLoadFacts<'static>);
+        let declines: [(&str, Tweak, SpDecline); 7] = [
+            (
+                "small window",
+                |f| {
+                    f.region_fit_rows = 769;
+                    f.window_rows = 4_096;
+                },
+                SpDecline::RegionFit {
+                    fit_rows: 769,
+                    minimum: 2_048,
+                    window_rows: 4_096,
+                },
+            ),
+            (
+                "quants",
+                |f| f.cpu_down_quant = false,
+                SpDecline::Quants {
+                    gate_up: true,
+                    down: false,
+                },
+            ),
+            ("pool", |f| f.splice_workers = None, SpDecline::SplicePool),
+            (
+                "pinned",
+                |f| f.pinned_budget_bytes = 1,
+                SpDecline::PinnedFit {
+                    need: sp_pinned_bytes(2560, 512, SP_MAX_ROWS),
+                    budget: 1,
+                },
+            ),
+            (
+                "prefix cache",
+                |f| f.prefix_cache = true,
+                SpDecline::PrefixCache,
+            ),
+            (
+                "experts",
+                |f| f.n_exp = 256,
+                SpDecline::ExpertCount { n_exp: 256 },
+            ),
+            (
+                "f16 route",
+                |f| {
+                    f.s1_route = Some(WindowRoute::AggregateSymIu4);
+                    f.f16_route_ready = false;
+                },
+                SpDecline::F16Route {
+                    route: WindowRoute::AggregateSymIu4,
+                },
+            ),
+        ];
+        for (name, tweak, want) in declines {
+            let (profile, note) = admit(None, None, "gfx1100", &tweak).unwrap();
+            assert_eq!(profile.mode, SpMode::TouchedOnly, "{name}");
+            assert_eq!(note, Some(want.clone()), "{name}");
+            // TOUCHED=0 removes the fallback: the hybrid decline is the verdict.
+            assert_eq!(
+                admit(None, Some(false), "gfx1100", &tweak).unwrap_err(),
+                want,
+                "{name}"
+            );
+        }
+        // Both modes declining reports the hybrid decline (the mode the knobs asked for).
+        let both = |f: &mut SpLoadFacts<'static>| {
+            f.splice_workers = None;
+            f.pages = 8;
+        };
+        assert_eq!(
+            admit(None, None, "gfx1100", &both).unwrap_err(),
+            SpDecline::SplicePool
+        );
+        // A forced placement k = U selects touched-only directly: no hybrid decline to report.
+        let forced = |f: &mut SpLoadFacts<'static>| f.force_all = true;
+        let (profile, note) = admit(None, None, "gfx1100", &forced).unwrap();
+        assert_eq!((profile.mode, note), (SpMode::TouchedOnly, None));
+    }
+
     #[test]
     fn sp_min_rows_is_one_past_the_d2_split_rows() {
         assert_eq!(
@@ -1560,12 +1743,21 @@ mod tests {
             ..touched_facts()
         })
         .is_ok());
-        // Hybrid wins with both knobs on: it keeps its own CPU requirements.
+        // Hybrid wins with both knobs on and keeps its own CPU requirements; when it declines
+        // the touched-only mode (its knob on) is the fallback, and the hybrid decline is
+        // reported beside it. Without the touched-only knob the hybrid decline is the verdict.
+        let both_no_pool = SpLoadFacts {
+            knob: true,
+            splice_workers: None,
+            ..touched_facts()
+        };
+        let (profile, note) = admit_sp_noted(&both_no_pool).unwrap();
+        assert_eq!(profile.mode, SpMode::TouchedOnly);
+        assert_eq!(note, Some(SpDecline::SplicePool));
         assert_eq!(
             admit_sp(&SpLoadFacts {
-                knob: true,
-                splice_workers: None,
-                ..touched_facts()
+                touched_knob: false,
+                ..both_no_pool
             })
             .unwrap_err(),
             SpDecline::SplicePool

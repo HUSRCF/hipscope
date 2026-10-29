@@ -7114,13 +7114,13 @@ mod tests {
     }
 
     #[test]
-    fn qwen4_sp_is_a_typed_bool_developer_key_default_off() {
+    fn qwen4_sp_is_a_typed_bool_developer_key_unset_follows_the_arch_default() {
         const KEY: &str = "developer.qwen4_sp";
         const ENV: &str = "HIPFIRE_QWEN4_SP";
         assert!(is_developer_key(KEY));
         assert!(is_typed_bool_developer_key(KEY));
         assert_eq!(developer_key_for_env(ENV).as_deref(), Some(KEY));
-        // Unset is None (SP defaults off); each spelling reads as a bool.
+        // Unset is None (the consumer applies the gfx1100 default); each spelling reads as a bool.
         assert_eq!(typed_developer_bool_value(ENV, None), None);
         for (raw, want) in [("1", true), ("true", true), ("0", false), ("false", false)] {
             assert_eq!(
@@ -10546,12 +10546,15 @@ pub mod memory {
 
     /// `developer.qwen4_sp` (env `HIPFIRE_QWEN4_SP`), a typed boolean read once
     /// per Qwen4 load by the S1 short-prompt prefill hook (SP: stream the
-    /// top-k* experts, run the rest on the CPU, one canonical combine). Default
-    /// **off**: only an explicit `true`/`1` arms it; unset and `false`/`0` are
-    /// both off. SP additionally needs an admitted S1 profile, gfx1100 and the
-    /// other load-time admission rules; any failed rule declines it by name.
-    pub fn qwen4_sp() -> bool {
-        super::developer_typed_bool("HIPFIRE_QWEN4_SP").unwrap_or(false)
+    /// top-k* experts, run the rest on the CPU, one canonical combine). `None`
+    /// (unset) follows the arch default, which the consumer resolves
+    /// (`slowlink_sp::hybrid_knob_for`): **on for exact gfx1100**, off elsewhere. An
+    /// explicit `false`/`0` is the kill switch; an explicit `true`/`1` asks for it on any arch
+    /// (every arch but gfx1100 declines it by name). SP additionally needs an admitted S1
+    /// profile, gfx1100 and the other load-time admission rules; a failed rule declines it by
+    /// name and, with `developer.qwen4_sp_touched` on, the touched-only mode runs instead.
+    pub fn qwen4_sp() -> Option<bool> {
+        super::developer_typed_bool("HIPFIRE_QWEN4_SP")
     }
 
     /// `developer.qwen4_sp_touched` (env `HIPFIRE_QWEN4_SP_TOUCHED`), a typed
