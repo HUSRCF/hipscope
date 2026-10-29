@@ -345,6 +345,25 @@ fn try_a8_hin_prepared(
         .map(Some)
 }
 
+/// Symmetric qt49 (MQ3G256V2) weight that enters the gfx1201 A4 producer/consumer
+/// pair: validated provenance, the A4 flag, exact gfx1201, and no active
+/// higher-priority A8 route. Every producer admitted here has a prepared
+/// MQ3V25 consumer at its call site (no producer runs without its consumer).
+pub(crate) fn mq3v25_a4_weight(gpu: &Gpu, dtype: DType) -> bool {
+    dtype == DType::MQ3G256V2
+        && gpu.arch == "gfx1201"
+        && !gpu.flags.mq3v25_a8_enabled(gpu.mq3v2_symmetric)
+        && gpu.flags.mq3v25_a4_enabled(gpu.mq3v2_symmetric)
+}
+
+/// The shared-input producer of a projection group anchored at `anchor` may run
+/// for a qt49 A4 route only when every sibling projection has the same dtype
+/// (the one prepared consumer reads all of them); any other anchor is
+/// unaffected. Keeps the rule "no producer runs without its consumer".
+pub(crate) fn mq3v25_a4_consumers_agree(gpu: &Gpu, anchor: DType, siblings: &[DType]) -> bool {
+    !mq3v25_a4_weight(gpu, anchor) || siblings.iter().all(|&dtype| dtype == anchor)
+}
+
 /// C2: when MQ4V2 + IU4 producer sidecar is live, emit block_i4_128 from
 /// RMSNorm/FWHT and return a prepared handle. `None` → caller keeps the
 /// incumbent fused_rmsnorm + standalone-quantizer path.
@@ -618,10 +637,12 @@ fn try_packed_mq4_ffn_gate_up(
 /// ([`try_iu4_silu_prepared`] with an AWQ scale: uniform MQ4G256V2, `Residual`
 /// epilogue, no S4 f16 route, portable gfx11 sidecar live; or on exact
 /// gfx1201 [`try_gfx12_silu_quant_fused_prepared`]'s AWQ twin) and gate/up are
-/// MQ4G256V2 of equal shape. Decided once per FFN, before gate/up; the gate/up
-/// hook then reports whether it actually emitted h
-/// (`Gpu::gemm_gate_up_silu_mq4g256v2_iu4_prepared` adds the per-arch tile
-/// rule and `HIPFIRE_F1LITE`).
+/// MQ4G256V2 of equal shape (or, when [`mq3v25_a4_weight`] admits, equal-dtype
+/// symmetric qt49 gate/up/down feeding the same AWQ h producer). Decided once
+/// per FFN, before gate/up; the gate/up hook then reports whether it actually
+/// emitted h (`Gpu::gemm_gate_up_silu_mq4g256v2_iu4_prepared` /
+/// `gemm_gate_up_silu_mq3v25_iu4_prepared` add the per-arch tile rule and
+/// `HIPFIRE_F1LITE`).
 #[allow(clippy::too_many_arguments)]
 fn f1lite_ffn_eligible(
     gpu: &Gpu,
@@ -633,12 +654,12 @@ fn f1lite_ffn_eligible(
     hidden_dim: usize,
     n: usize,
 ) -> bool {
-    w_gate.dtype == DType::MQ4G256V2
-        && w_up.dtype == DType::MQ4G256V2
+    (w_gate.dtype == DType::MQ4G256V2 || mq3v25_a4_weight(gpu, w_gate.dtype))
+        && w_up.dtype == w_gate.dtype
         && w_gate.m == hidden_dim
         && w_up.m == hidden_dim
         && w_gate.k == w_up.k
-        && w_down.dtype == DType::MQ4G256V2
+        && w_down.dtype == w_gate.dtype
         && w_down.awq_scale.is_some()
         && w_down.k == hidden_dim
         && matches!(epilogue, BatchEpilogue::Residual)
@@ -688,7 +709,9 @@ fn try_gfx12_silu_quant_fused_prepared(
     n: usize,
     emit_f32: bool,
 ) -> HipResult<Option<rdna_compute::Int4MmqPrepared>> {
-    if w_down.dtype != DType::MQ4G256V2 || !gpu.iu4_silu_quant_fused_active(n, k) {
+    if !(w_down.dtype == DType::MQ4G256V2 || mq3v25_a4_weight(gpu, w_down.dtype))
+        || !gpu.iu4_silu_quant_fused_active(n, k)
+    {
         return Ok(None);
     }
     let res = gpu.reserve_int4_mmq(k, n)?;
@@ -696,7 +719,12 @@ fn try_gfx12_silu_quant_fused_prepared(
         gate,
         up,
         w_down.awq_scale,
-        if emit_f32 { Some(x_rot) } else { None },
+        // The MQ3 consumer's small-tail and fallback readers need the f32 plane.
+        if emit_f32 || w_down.dtype == DType::MQ3G256V2 {
+            Some(x_rot)
+        } else {
+            None
+        },
         res,
         k,
         n,
@@ -721,7 +749,9 @@ pub(crate) fn try_gfx12_rmsnorm_quant_fused_prepared(
     n: usize,
     emit_f32: bool,
 ) -> HipResult<Option<rdna_compute::Int4MmqPrepared>> {
-    if next_linear.dtype != DType::MQ4G256V2 || !gpu.iu4_producer_quant_fused_active(n, k) {
+    if !(next_linear.dtype == DType::MQ4G256V2 || mq3v25_a4_weight(gpu, next_linear.dtype))
+        || !gpu.iu4_producer_quant_fused_active(n, k)
+    {
         return Ok(None);
     }
     let res = gpu.reserve_int4_mmq(k, n)?;
@@ -729,7 +759,12 @@ pub(crate) fn try_gfx12_rmsnorm_quant_fused_prepared(
         x,
         norm_weight,
         next_linear.awq_scale,
-        if emit_f32 { Some(x_rot) } else { None },
+        // The MQ3 consumer's small-tail and fallback readers need the f32 plane.
+        if emit_f32 || next_linear.dtype == DType::MQ3G256V2 {
+            Some(x_rot)
+        } else {
+            None
+        },
         res,
         k,
         eps,
@@ -1915,7 +1950,9 @@ fn swiglu_ffn_gate_up_batched(
             n,
             false,
         )?;
-        if iu4_prep.is_none() {
+        if iu4_prep.is_none()
+            && mq3v25_a4_consumers_agree(gpu, layer.w_gate.dtype, &[layer.w_up.dtype])
+        {
             // gfx1201 slices-2: fused rmsnorm+quant producer (bit-identical).
             iu4_prep = try_gfx12_rmsnorm_quant_fused_prepared(
                 gpu,
@@ -2020,7 +2057,42 @@ fn swiglu_ffn_gate_up_batched(
             n,
         )?;
         return Ok(FfnGateOutput::A8H);
-    } else if let Some(prep) = &iu4_prep {
+    } else if let Some(prep) = iu4_prep.as_ref().filter(|_| {
+        mq3v25_a4_weight(gpu, layer.w_gate.dtype) && layer.w_up.dtype == layer.w_gate.dtype
+    }) {
+        // Symmetric qt49 A4 (gfx1201): F1-lite single launch emits h when
+        // admitted (the down hook then runs the AWQ h producer exactly as
+        // for MQ4); else the SET pair. No MQ4-only epilogue (A4 down
+        // sidecar) applies to qt49.
+        if f1lite
+            && gpu.gemm_gate_up_silu_mq3v25_iu4_prepared(
+                &layer.w_gate.buf,
+                &layer.w_up.buf,
+                prep,
+                &pbs.gate_ffn_batch,
+                layer.w_gate.m,
+                layer.w_up.m,
+                layer.w_gate.k,
+                n,
+            )?
+        {
+            return Ok(FfnGateOutput::Iu4H);
+        }
+        gpu.gemm_gate_up_mq3v25_iu4_prepared(
+            &layer.w_gate.buf,
+            &layer.w_up.buf,
+            prep,
+            &pbs.gate_ffn_batch,
+            &pbs.up_batch,
+            layer.w_gate.m,
+            layer.w_up.m,
+            layer.w_gate.k,
+            n,
+        )?;
+    } else if let Some(prep) = iu4_prep
+        .as_ref()
+        .filter(|_| !mq3v25_a4_weight(gpu, layer.w_gate.dtype))
+    {
         // F1-lite: one GEMM v2 launch emits h; else the SET pair below.
         // A4 fusion (gfx1151 V2B only, default on; `HIPFIRE_V2B_A4_EPI=0` opts out): the epilogue
         // also writes the w_down sidecar, so no h and no hin producer.
@@ -2492,7 +2564,17 @@ fn swiglu_ffn_down_batched(
         gpu.silu_mul_f32(&pbs.gate_ffn_batch, &pbs.up_batch, &pbs.ffn_hidden_batch)?;
     }
     // Batched w_down + residual/partial.
-    if let Some(prep) = &iu4_prep {
+    if let (Some(prep), true) = (&iu4_prep, mq3v25_a4_weight(gpu, layer.w_down.dtype)) {
+        gpu.gemm_mq3v25_residual_iu4_prepared(
+            &layer.w_down.buf,
+            prep,
+            &pbs.x_batch,
+            layer.w_down.m,
+            layer.w_down.k,
+            n,
+            true,
+        )?;
+    } else if let Some(prep) = &iu4_prep {
         gpu.gemm_mq4g256v2_residual_wmma_iu4_prepared(
             &layer.w_down.buf,
             prep,

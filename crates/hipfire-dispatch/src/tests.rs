@@ -2984,6 +2984,53 @@ fn moe_dtypes_paro() -> MoeDtypes<'static> {
     d
 }
 
+#[test]
+fn mq3v25_route_requires_marker_flag_multirow_and_exact_arch() {
+    use crate::families::gemm::mq3v25_route;
+    for arch in ["gfx1100", "gfx1151", "gfx1200", "gfx1201", "gfx942"] {
+        let mut flags = rdna_compute::FeatureFlags::for_test(arch);
+        flags.iu4_prefill = Some(true);
+        let default_on = arch == "gfx1201";
+        assert_eq!(mq3v25_route(&flags, true, 8192, 4096), default_on, "{arch}");
+        assert!(!mq3v25_route(&flags, false, 8192, 4096), "{arch}");
+        assert!(!mq3v25_route(&flags, true, 1, 4096), "{arch}");
+
+        flags.mq3v25_a4 = Some(true);
+        let forced_on = matches!(arch, "gfx1100" | "gfx1201");
+        assert_eq!(mq3v25_route(&flags, true, 8192, 4096), forced_on, "{arch}");
+        assert!(!mq3v25_route(&flags, false, 8192, 4096), "{arch}");
+        assert!(!mq3v25_route(&flags, true, 1, 4096), "{arch}");
+        if arch == "gfx1100" {
+            assert!(!mq3v25_route(&flags, true, 8192, 4100));
+            assert!(!mq3v25_route(&flags, true, 64, 4096));
+        }
+
+        flags.mq3v25_a4 = Some(false);
+        assert!(!mq3v25_route(&flags, true, 8192, 4096), "{arch}");
+
+        flags.mq3v25_a4 = Some(true);
+        flags.iu4_prefill = Some(false);
+        assert!(!mq3v25_route(&flags, true, 8192, 4096), "{arch}");
+    }
+}
+
+#[test]
+fn mq3v25_a8_route_requires_flag_symmetric_multirow_and_exact_arch() {
+    use crate::families::gemm::mq3v25_a8_route;
+    for arch in ["gfx1100", "gfx1151", "gfx1200", "gfx1201", "gfx942"] {
+        let mut flags = rdna_compute::FeatureFlags::for_test(arch);
+        assert!(!mq3v25_a8_route(&flags, true, 8192), "{arch}");
+        flags.mq3v25_a8 = true;
+        assert_eq!(
+            mq3v25_a8_route(&flags, true, 8192),
+            arch == "gfx1201",
+            "{arch}"
+        );
+        assert!(!mq3v25_a8_route(&flags, false, 8192), "{arch}");
+        assert!(!mq3v25_a8_route(&flags, true, 1), "{arch}");
+    }
+}
+
 fn flags_default() -> rdna_compute::feature_flags::FeatureFlags {
     rdna_compute::feature_flags::FeatureFlags::for_test("gfx1100")
 }

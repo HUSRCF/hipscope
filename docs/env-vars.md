@@ -1958,6 +1958,8 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_MOE_TIER_MAP` | crates/hipfire-quantize/src/pipeline.rs | developer |
 | `HIPFIRE_MQ` | crates/rdna-compute/src/gemm.rs | developer |
 | `HIPFIRE_MQ2_DOWN_ROWS` | crates/hipfire-arch-maple/src/forward.rs, crates/rdna-compute/src/gemv.rs | developer |
+| `HIPFIRE_MQ3V25_A4` | crates/rdna-compute/src/feature_flags.rs | developer |
+| `HIPFIRE_MQ3V25_A8` | crates/rdna-compute/src/feature_flags.rs | developer |
 | `HIPFIRE_MQ3_DOWN_ROWS` | crates/rdna-compute/src/gemv.rs, crates/rdna-compute/src/kernels.rs | developer |
 | `HIPFIRE_MQ3_MB4` | crates/hipfire-config/src/lib.rs, crates/rdna-compute/examples/test_gemm_hfq3g256_wmma.rs | experimental |
 | `HIPFIRE_MQ4C_RESIDUAL_KERNEL` | crates/rdna-compute/examples/bench_vgpr_cap_sweep.rs, crates/rdna-compute/examples/mq4c_parity.rs | harness |

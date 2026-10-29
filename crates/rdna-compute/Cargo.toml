@@ -395,6 +395,18 @@ name = "bench_mq3g256gl_moe_gate_up"
 required-features = ["lab"]
 
 [[example]]
+name = "bench_mq3v25_a8"
+required-features = ["lab"]
+
+[[example]]
+name = "bench_mq3v25_iu4"
+required-features = ["lab"]
+
+[[example]]
+name = "bench_mq3v25_iu4_g11"
+required-features = ["lab"]
+
+[[example]]
 name = "bench_mq4_gate_up"
 required-features = ["lab"]
 

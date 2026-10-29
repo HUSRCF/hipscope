@@ -540,7 +540,9 @@ pub fn batch_chunk_full_attn_input_projection(
             n,
             false,
         )?;
-        if iu4_prep.is_none() {
+        if iu4_prep.is_none()
+            && mq3v25_a4_consumers_agree(gpu, layer.wq.dtype, &[layer.wk.dtype, layer.wv.dtype])
+        {
             // gfx1201 slices-2: fused rmsnorm+quant producer (bit-identical).
             iu4_prep = try_gfx12_rmsnorm_quant_fused_prepared(
                 gpu,
@@ -627,7 +629,31 @@ pub fn batch_chunk_full_attn_input_projection(
             layer.wv.k,
             n,
         )?;
-    } else if let Some(prep) = &iu4_prep {
+    } else if let Some(prep) = iu4_prep
+        .as_ref()
+        .filter(|_| mq3v25_a4_weight(gpu, layer.wq.dtype) && qkv_same_dtype)
+    {
+        // Symmetric qt49 A4 (gfx1201): three SETs over one producer. A
+        // mixed-dtype q/k/v falls through to the readers of the f32 plane
+        // the MQ3 producer always emits.
+        gpu.gemm_qkv_mq3v25_iu4_prepared(
+            &layer.wq.buf,
+            &layer.wk.buf,
+            &layer.wv.buf,
+            prep,
+            &pbs.fa_q_full_batch,
+            &pbs.fa_k_batch,
+            &pbs.fa_v_batch,
+            layer.wq.m,
+            layer.wk.m,
+            layer.wv.m,
+            layer.wq.k,
+            n,
+        )?;
+    } else if let Some(prep) = iu4_prep
+        .as_ref()
+        .filter(|_| !mq3v25_a4_weight(gpu, layer.wq.dtype))
+    {
         gpu.gemm_qkv_mq4g256v2_wmma_iu4_prepared(
             &layer.wq.buf,
             &layer.wk.buf,

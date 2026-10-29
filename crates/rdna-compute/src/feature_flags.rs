@@ -275,6 +275,13 @@ pub struct FeatureFlags {
     // ── Kernel variant overrides ─────────────────────────────────
     pub lloyd_mb4: Option<Mb4Mode>,
     pub mq3_mb4: Option<Mb4Mode>,
+    /// Symmetric qt49 (MQ3V2 `mq3v2.symmetric`) W3A4 prefill override
+    /// (`HIPFIRE_MQ3V25_A4`). Unset follows the per-arch default of
+    /// [`Self::mq3v25_a4_enabled`]; `0` is the kill switch.
+    pub mq3v25_a4: Option<bool>,
+    /// Symmetric qt49 W3A8 prefill on exact gfx1201 (`HIPFIRE_MQ3V25_A8=1`,
+    /// developer, default off). Wins over A4 when both are requested.
+    pub mq3v25_a8: bool,
     pub hfq4g128_mmq: bool,
     pub hfq3_mmq_layer_min: Option<usize>,
     pub hfq3_mmq_layer_max: Option<usize>,
@@ -1129,6 +1136,8 @@ impl FeatureFlags {
             // Kernel variant overrides
             lloyd_mb4: parse_mb4("HIPFIRE_LLOYD_MB4"),
             mq3_mb4: parse_mb4("HIPFIRE_MQ3_MB4"),
+            mq3v25_a4: parse_bool("HIPFIRE_MQ3V25_A4"),
+            mq3v25_a8: parse_bool("HIPFIRE_MQ3V25_A8").unwrap_or(false),
             hfq4g128_mmq: value("HIPFIRE_HFQ4G128_MMQ").as_deref() != Ok("0"),
             hfq3_mmq_layer_min: parse_usize("HIPFIRE_HFQ3_MMQ_LAYER_MIN"),
             hfq3_mmq_layer_max: parse_usize("HIPFIRE_HFQ3_MMQ_LAYER_MAX"),
@@ -1476,6 +1485,26 @@ impl FeatureFlags {
     pub fn iu4_prefill_enabled(&self) -> bool {
         self.iu4_prefill.unwrap_or(true)
             && matches!(self.arch.as_str(), "gfx1100" | "gfx1151" | "gfx1201")
+    }
+
+    /// Symmetric qt49 W3A4 prefill for an artifact whose loader validated the
+    /// `mq3v2.symmetric` zero contract (`symmetric`). Shares the W4A4 opt-out
+    /// (`kernel.iu4_prefill`). Default on exact gfx1201; exact gfx1100 runs
+    /// only on `HIPFIRE_MQ3V25_A4=1`; every other arch keeps the F16 route.
+    pub fn mq3v25_a4_enabled(&self, symmetric: bool) -> bool {
+        symmetric
+            && self.iu4_prefill_enabled()
+            && match self.arch.as_str() {
+                "gfx1201" => self.mq3v25_a4.unwrap_or(true),
+                "gfx1100" => self.mq3v25_a4.unwrap_or(false),
+                _ => false,
+            }
+    }
+
+    /// Symmetric qt49 W3A8 prefill: explicit developer opt-in on exact
+    /// gfx1201 only. Wins over [`Self::mq3v25_a4_enabled`].
+    pub fn mq3v25_a8_enabled(&self, symmetric: bool) -> bool {
+        self.mq3v25_a8 && symmetric && self.arch == "gfx1201"
     }
 
     /// A8 projection route, only when explicitly selected: `HIPFIRE_A8_PREFILL`
@@ -1859,6 +1888,8 @@ impl FeatureFlags {
             mmq_diag_quantize_only: false,
             lloyd_mb4: None,
             mq3_mb4: None,
+            mq3v25_a4: None,
+            mq3v25_a8: false,
             hfq4g128_mmq: true,
             hfq3_mmq_layer_min: None,
             hfq3_mmq_layer_max: None,

@@ -2,8 +2,13 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 // gfx1201 symmetric qt49 A8, 128 weight rows x 128 tokens, eight waves.
+// Activations are the shared A8 `block_i8_128` blocks (136 B, [K/128][N],
+// nibble-pair qs order: per 8-K group q0,q2,q4,q6,q1,q3,q5,q7), produced by
+// `quantize_int8_mmq_ds128` / the fused A8 producers. The block's `s` is
+// unused: symmetric qt49 has no zero term (q = u - 4).
 // K64 single-buffer slabs in fragment order (288-byte skew per K16);
-// W is widened from 3-bit q=u-4 to signed int8 at LDS publication.
+// W is widened from 3-bit q=u-4 to signed int8 at LDS publication, in the
+// same nibble-pair order, so each weight byte meets its own activation.
 // Dynamic LDS: A 9216 B, W 9216 B, row scales 512 B, token scales
 // 512 B = 19456 B. Epilogue reuses LDS for eight 512-float wave tiles.
 #include <hip/hip_runtime.h>
@@ -14,6 +19,8 @@ typedef int32_t __attribute__((ext_vector_type(2))) i32x2;
 typedef int32_t __attribute__((ext_vector_type(8))) i32x8;
 typedef float __attribute__((ext_vector_type(8))) f32x8;
 
+// 8 codes (3 bits each, code i at bits 3i) -> 8 signed bytes in nibble-pair
+// order: dword 0 = codes 0,2,4,6; dword 1 = codes 1,3,5,7.
 __device__ __forceinline__ i32x2 mq3v25_widen_i8(unsigned bits) {
     const unsigned c0 = 0xFFFEFDFCu, c1 = 0x03020100u;
     i32x2 wide;
@@ -22,7 +29,7 @@ __device__ __forceinline__ i32x2 mq3v25_widen_i8(unsigned bits) {
         unsigned sel = 0;
         #pragma unroll
         for (int j = 0; j < 4; ++j)
-            sel |= ((bits >> (3 * (half * 4 + j))) & 7u) << (8 * j);
+            sel |= ((bits >> (3 * (2 * j + half))) & 7u) << (8 * j);
         wide[half] = (int)__builtin_amdgcn_perm(c1, c0, sel);
     }
     return wide;

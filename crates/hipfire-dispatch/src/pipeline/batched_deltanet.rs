@@ -546,7 +546,13 @@ pub fn batch_chunk_delta_net_input_projection(
             n,
             !fold_betaalpha,
         )?;
-        if iu4_prep.is_none() {
+        if iu4_prep.is_none()
+            && mq3v25_a4_consumers_agree(
+                gpu,
+                layer.wqkv.dtype,
+                &[layer.wz.dtype, layer.w_beta.dtype, layer.w_alpha.dtype],
+            )
+        {
             // gfx1201 slices-2: fused rmsnorm+quant producer (bit-identical).
             iu4_prep = try_gfx12_rmsnorm_quant_fused_prepared(
                 gpu,
@@ -646,7 +652,36 @@ pub fn batch_chunk_delta_net_input_projection(
             layer.w_alpha.k,
             n,
         )?;
-    } else if let Some(prep) = &iu4_prep {
+    } else if let Some(prep) = iu4_prep.as_ref().filter(|_| {
+        mq3v25_a4_weight(gpu, layer.wqkv.dtype)
+            && [layer.wz.dtype, layer.w_beta.dtype, layer.w_alpha.dtype]
+                .iter()
+                .all(|&dtype| dtype == layer.wqkv.dtype)
+    }) {
+        // Symmetric qt49 A4 (gfx1201): four SETs over one producer. It
+        // bypasses the MQ4-only beta/alpha fold, the zba SET and the fused
+        // QKVZ + `gdn_chunk_prep` epilogue (the caller runs the ordinary prep).
+        gpu.gemm_qkvza_mq3v25_iu4_prepared(
+            &layer.wqkv.buf,
+            &layer.wz.buf,
+            &layer.w_beta.buf,
+            &layer.w_alpha.buf,
+            prep,
+            &pbs.dn_qkv_batch,
+            &pbs.dn_z_batch,
+            &pbs.dn_beta_batch,
+            &pbs.dn_alpha_batch,
+            layer.wqkv.m,
+            layer.wz.m,
+            layer.w_beta.m,
+            layer.w_alpha.m,
+            layer.wqkv.k,
+            n,
+        )?;
+    } else if let Some(prep) = iu4_prep
+        .as_ref()
+        .filter(|_| !mq3v25_a4_weight(gpu, layer.wqkv.dtype))
+    {
         if fold_betaalpha {
             gpu.gemm_qkvza_mq4g256v2_wmma_iu4_fold_prepared(
                 &layer.wqkv.buf,

@@ -22720,6 +22720,666 @@ impl Gpu {
         result
     }
 
+    /// Symmetric qt49 W3A4 consumer over the token-order K128 `block_i4_128`
+    /// sidecar. gfx1201 handles partial tiles; gfx1100 V2C needs full tiles.
+    fn gemm_mq3v25_prequant_iu4(
+        &mut self,
+        a: &GpuTensor,
+        xq: *mut c_void,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        n: usize,
+        add: bool,
+    ) -> HipResult<()> {
+        if !self.flags.mq3v25_a4_enabled(self.mq3v2_symmetric) || k % 256 != 0 || m == 0 || n == 0 {
+            return Err(hip_bridge::HipError::new(
+                1,
+                "MQ3V25 A4 requires validated symmetric qt49 on gfx1100/gfx1201, positive M/N and K divisible by 256",
+            ));
+        }
+        if self.scratch.int4_mmq_slab_at(xq) {
+            return Err(hip_bridge::HipError::new(
+                1,
+                "MQ3V25 A4 reads token-order block_i4_128, not the slab sidecar",
+            ));
+        }
+        let (module, kernel, src, grid, block, lds) = match self.arch.as_str() {
+            "gfx1100" if m % 128 == 0 && n % 128 == 0 => (
+                "gemm_mq3v25_iu4_v2c_gfx1100",
+                "gemm_mq3v25_residual_iu4_v2c",
+                kernels::GEMM_MQ3V25_RESIDUAL_IU4_V2C_GFX11_SRC,
+                [(n / 128) as u32, (m / 128) as u32, 1],
+                [32, 8, 1],
+                32768,
+            ),
+            "gfx1201" => (
+                "gemm_mq3v25_residual_mmq_iu4_gfx1201",
+                "gemm_mq3v25_residual_mmq_iu4",
+                kernels::GEMM_MQ3V25_RESIDUAL_MMQ_IU4_GFX12_SRC,
+                [m.div_ceil(128) as u32, n.div_ceil(128) as u32, 1],
+                [256, 1, 1],
+                20480,
+            ),
+            _ => {
+                return Err(hip_bridge::HipError::new(
+                    1,
+                    "MQ3V25 A4 gfx1100 kernel requires full M/N tiles",
+                ))
+            }
+        };
+        self.bind_thread()?;
+        self.flush_residual_fold()?;
+        self.ensure_kernel(module, src, kernel)?;
+        let mut a_ptr = a.buf.as_ptr();
+        let mut x_ptr = xq;
+        let mut y_ptr = y.buf.as_ptr();
+        let mut mi = m as i32;
+        let mut ki = k as i32;
+        let mut ni = n as i32;
+        let mut ai = i32::from(add);
+        let mut params = [
+            &mut a_ptr as *mut _ as *mut c_void,
+            &mut x_ptr as *mut _ as *mut c_void,
+            &mut y_ptr as *mut _ as *mut c_void,
+            &mut mi as *mut _ as *mut c_void,
+            &mut ki as *mut _ as *mut c_void,
+            &mut ni as *mut _ as *mut c_void,
+            &mut ai as *mut _ as *mut c_void,
+        ];
+        let bytes = m * (k / 256) * crate::dispatch::MQ3G256V2_GROUP_BYTES + n * m * 4;
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", kernel, bytes);
+        let result = self.launch_maybe_blob(kernel, grid, block, lds, &mut params, || {
+            let mut b = hip_bridge::KernargBlob::new();
+            b.push_ptr(a_ptr);
+            b.push_ptr(x_ptr);
+            b.push_ptr(y_ptr);
+            b.push_i32(mi);
+            b.push_i32(ki);
+            b.push_i32(ni);
+            b.push_i32(ai);
+            b
+        });
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
+    /// gfx1100 consumers only accept complete token tiles. Keep the aligned
+    /// prefix on IU4 and leave a short suffix for the incumbent fp16 GEMM.
+    fn mq3v25_iu4_full_n(&self, n: usize) -> usize {
+        match self.arch.as_str() {
+            "gfx1100" => n / 128 * 128,
+            _ => n,
+        }
+    }
+
+    /// gfx1100 full-tile consumers cannot read a short beta/alpha row block.
+    /// Keep those small projections on the incumbent SET while their full-
+    /// tile QKV/Z siblings reuse the single IU4 pack.
+    fn gemm_mq3v25_iu4_set_or_legacy(
+        &mut self,
+        a: &GpuTensor,
+        x: &GpuTensor,
+        xq: *mut c_void,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> HipResult<()> {
+        let tile = match self.arch.as_str() {
+            "gfx1100" => 128,
+            _ => 1,
+        };
+        if m % tile != 0 || n % tile != 0 {
+            self.gemm_mq3g256v2(a, x, y, m, k, n)
+        } else {
+            self.gemm_mq3v25_prequant_iu4(a, xq, y, m, k, n, false)
+        }
+    }
+
+    /// Consumer-facing SET/ADD for unfused batched qt49 projections.
+    pub fn gemm_mq3v25_residual_iu4(
+        &mut self,
+        a: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        n: usize,
+        add: bool,
+    ) -> HipResult<()> {
+        if !self.flags.mq3v25_a4_enabled(self.mq3v2_symmetric) {
+            return Err(hip_bridge::HipError::new(1, "MQ3V25 A4 is not admitted"));
+        }
+        let full = self.mq3v25_iu4_full_n(n);
+        if full == 0 {
+            return if add {
+                self.gemm_mq3g256v2_residual_wmma(a, x, y, m, k, n)
+            } else {
+                self.gemm_mq3g256v2(a, x, y, m, k, n)
+            };
+        }
+        if full == n {
+            let xq = self.ensure_int4_mmq_x(x, n, k)?;
+            return self.gemm_mq3v25_prequant_iu4(a, xq, y, m, k, n, add);
+        }
+        let x_body = x.sub_offset(0, full * k);
+        let y_body = y.sub_offset(0, full * m);
+        let xq = self.ensure_int4_mmq_x(&x_body, full, k)?;
+        self.gemm_mq3v25_prequant_iu4(a, xq, &y_body, m, k, full, add)?;
+        let tail = n - full;
+        let x_tail = x.sub_offset(full * k, tail * k);
+        let y_tail = y.sub_offset(full * m, tail * m);
+        if add {
+            self.gemm_mq3g256v2_residual_wmma(a, &x_tail, &y_tail, m, k, tail)
+        } else {
+            self.gemm_mq3g256v2(a, &x_tail, &y_tail, m, k, tail)
+        }
+    }
+
+    pub fn gemm_mq3v25_residual_iu4_prepared(
+        &mut self,
+        a: &GpuTensor,
+        prep: &crate::scratch::Int4MmqPrepared,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        n: usize,
+        add: bool,
+    ) -> HipResult<()> {
+        let xq = self.int4_mmq_prepared_ptr(prep, k, n)?;
+        self.gemm_mq3v25_prequant_iu4(a, xq, y, m, k, n, add)
+    }
+
+    /// Four SETs, one producer; partial beta/alpha rows are guarded by the
+    /// kernel rather than going through the MQ4-only small-tail converter.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_qkvza_mq3v25_iu4_prepared(
+        &mut self,
+        wqkv: &GpuTensor,
+        wz: &GpuTensor,
+        wb: &GpuTensor,
+        wa: &GpuTensor,
+        prep: &crate::scratch::Int4MmqPrepared,
+        qkv: &GpuTensor,
+        z: &GpuTensor,
+        beta: &GpuTensor,
+        alpha: &GpuTensor,
+        mqkv: usize,
+        mz: usize,
+        mb: usize,
+        ma: usize,
+        k: usize,
+        n: usize,
+    ) -> HipResult<()> {
+        let xq = self.int4_mmq_prepared_ptr(prep, k, n)?;
+        self.gemm_mq3v25_prequant_iu4(wqkv, xq, qkv, mqkv, k, n, false)?;
+        self.gemm_mq3v25_prequant_iu4(wz, xq, z, mz, k, n, false)?;
+        self.gemm_mq3v25_prequant_iu4(wb, xq, beta, mb, k, n, false)?;
+        self.gemm_mq3v25_prequant_iu4(wa, xq, alpha, ma, k, n, false)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_qkv_mq3v25_iu4_prepared(
+        &mut self,
+        wq: &GpuTensor,
+        wk: &GpuTensor,
+        wv: &GpuTensor,
+        prep: &crate::scratch::Int4MmqPrepared,
+        q: &GpuTensor,
+        kout: &GpuTensor,
+        v: &GpuTensor,
+        mq: usize,
+        mk: usize,
+        mv: usize,
+        k: usize,
+        n: usize,
+    ) -> HipResult<()> {
+        let xq = self.int4_mmq_prepared_ptr(prep, k, n)?;
+        self.gemm_mq3v25_prequant_iu4(wq, xq, q, mq, k, n, false)?;
+        self.gemm_mq3v25_prequant_iu4(wk, xq, kout, mk, k, n, false)?;
+        self.gemm_mq3v25_prequant_iu4(wv, xq, v, mv, k, n, false)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_gate_up_mq3v25_iu4_prepared(
+        &mut self,
+        wg: &GpuTensor,
+        wu: &GpuTensor,
+        prep: &crate::scratch::Int4MmqPrepared,
+        gate: &GpuTensor,
+        up: &GpuTensor,
+        mg: usize,
+        mu: usize,
+        k: usize,
+        n: usize,
+    ) -> HipResult<()> {
+        let xq = self.int4_mmq_prepared_ptr(prep, k, n)?;
+        self.gemm_mq3v25_prequant_iu4(wg, xq, gate, mg, k, n, false)?;
+        self.gemm_mq3v25_prequant_iu4(wu, xq, up, mu, k, n, false)
+    }
+
+    /// Single-launch gate/up-SiLU h producer, only when the F1-lite caller
+    /// consumes h instead of the separate gate and up scratch.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_gate_up_silu_mq3v25_iu4_prepared(
+        &mut self,
+        wg: &GpuTensor,
+        wu: &GpuTensor,
+        prep: &crate::scratch::Int4MmqPrepared,
+        h: &GpuTensor,
+        mg: usize,
+        mu: usize,
+        k: usize,
+        n: usize,
+    ) -> HipResult<bool> {
+        if self.arch != "gfx1201"
+            || !self.flags.mq3v25_a4_enabled(self.mq3v2_symmetric)
+            || mg != mu
+            || mg % 128 != 0
+            || k % 256 != 0
+            || mg == 0
+            || n == 0
+            || bf16_h_a4_enabled()
+            || hipfire_config::developer_var("HIPFIRE_F1LITE").as_deref() == Ok("0")
+        {
+            return Ok(false);
+        }
+        self.bind_thread()?;
+        self.flush_residual_fold()?;
+        let xq = self.int4_mmq_prepared_ptr(prep, k, n)?;
+        if self.scratch.int4_mmq_slab_at(xq) {
+            return Err(hip_bridge::HipError::new(
+                1,
+                "MQ3V25 A4 reads token-order block_i4_128, not the slab sidecar",
+            ));
+        }
+        const MODULE: &str = "gemm_mq3v25_residual_mmq_iu4_gfx1201";
+        const KERNEL: &str = "gemm_mq3v25_gate_up_silu_mmq_iu4";
+        self.ensure_kernel(
+            MODULE,
+            kernels::GEMM_MQ3V25_RESIDUAL_MMQ_IU4_GFX12_SRC,
+            KERNEL,
+        )?;
+        let mut gp = wg.buf.as_ptr();
+        let mut up = wu.buf.as_ptr();
+        let mut xp = xq;
+        let mut hp = h.buf.as_ptr();
+        let mut mi = mg as i32;
+        let mut ki = k as i32;
+        let mut ni = n as i32;
+        let mut params = [
+            &mut gp as *mut _ as *mut c_void,
+            &mut up as *mut _ as *mut c_void,
+            &mut xp as *mut _ as *mut c_void,
+            &mut hp as *mut _ as *mut c_void,
+            &mut mi as *mut _ as *mut c_void,
+            &mut ki as *mut _ as *mut c_void,
+            &mut ni as *mut _ as *mut c_void,
+        ];
+        let timer = crate::profile::begin_timer(
+            &self.hip,
+            "gemm",
+            KERNEL,
+            2 * mg * (k / 256) * crate::dispatch::MQ3G256V2_GROUP_BYTES + n * mg * 4,
+        );
+        let result = self.launch_maybe_blob(
+            KERNEL,
+            [(2 * mg).div_ceil(128) as u32, n.div_ceil(128) as u32, 1],
+            [256, 1, 1],
+            20480,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(gp);
+                b.push_ptr(up);
+                b.push_ptr(xp);
+                b.push_ptr(hp);
+                b.push_i32(mi);
+                b.push_i32(ki);
+                b.push_i32(ni);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result.map(|()| true)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_qkvza_mq3v25_iu4(
+        &mut self,
+        wqkv: &GpuTensor,
+        wz: &GpuTensor,
+        wb: &GpuTensor,
+        wa: &GpuTensor,
+        x: &GpuTensor,
+        qkv: &GpuTensor,
+        z: &GpuTensor,
+        beta: &GpuTensor,
+        alpha: &GpuTensor,
+        mqkv: usize,
+        mz: usize,
+        mb: usize,
+        ma: usize,
+        k: usize,
+        n: usize,
+    ) -> HipResult<()> {
+        if !self.flags.mq3v25_a4_enabled(self.mq3v2_symmetric) {
+            return Err(hip_bridge::HipError::new(1, "MQ3V25 A4 is not admitted"));
+        }
+        let full = self.mq3v25_iu4_full_n(n);
+        if full == 0 {
+            return self.gemm_qkvza_mq3g256v2_wmma(
+                wqkv, wz, wb, wa, x, qkv, z, beta, alpha, mqkv, mz, mb, ma, k, n,
+            );
+        }
+        if full != n {
+            let x_body = x.sub_offset(0, full * k);
+            let qkv_body = qkv.sub_offset(0, full * mqkv);
+            let z_body = z.sub_offset(0, full * mz);
+            let beta_body = beta.sub_offset(0, full * mb);
+            let alpha_body = alpha.sub_offset(0, full * ma);
+            let xq = self.ensure_int4_mmq_x(&x_body, full, k)?;
+            self.gemm_mq3v25_iu4_set_or_legacy(wqkv, &x_body, xq, &qkv_body, mqkv, k, full)?;
+            self.gemm_mq3v25_iu4_set_or_legacy(wz, &x_body, xq, &z_body, mz, k, full)?;
+            self.gemm_mq3v25_iu4_set_or_legacy(wb, &x_body, xq, &beta_body, mb, k, full)?;
+            self.gemm_mq3v25_iu4_set_or_legacy(wa, &x_body, xq, &alpha_body, ma, k, full)?;
+            let tail = n - full;
+            return self.gemm_qkvza_mq3g256v2_wmma(
+                wqkv,
+                wz,
+                wb,
+                wa,
+                &x.sub_offset(full * k, tail * k),
+                &qkv.sub_offset(full * mqkv, tail * mqkv),
+                &z.sub_offset(full * mz, tail * mz),
+                &beta.sub_offset(full * mb, tail * mb),
+                &alpha.sub_offset(full * ma, tail * ma),
+                mqkv,
+                mz,
+                mb,
+                ma,
+                k,
+                tail,
+            );
+        }
+        let xq = self.ensure_int4_mmq_x(x, n, k)?;
+        self.gemm_mq3v25_iu4_set_or_legacy(wqkv, x, xq, qkv, mqkv, k, n)?;
+        self.gemm_mq3v25_iu4_set_or_legacy(wz, x, xq, z, mz, k, n)?;
+        self.gemm_mq3v25_iu4_set_or_legacy(wb, x, xq, beta, mb, k, n)?;
+        self.gemm_mq3v25_iu4_set_or_legacy(wa, x, xq, alpha, ma, k, n)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_qkv_mq3v25_iu4(
+        &mut self,
+        wq: &GpuTensor,
+        wk: &GpuTensor,
+        wv: &GpuTensor,
+        x: &GpuTensor,
+        q: &GpuTensor,
+        kout: &GpuTensor,
+        v: &GpuTensor,
+        mq: usize,
+        mk: usize,
+        mv: usize,
+        k: usize,
+        n: usize,
+    ) -> HipResult<()> {
+        if !self.flags.mq3v25_a4_enabled(self.mq3v2_symmetric) {
+            return Err(hip_bridge::HipError::new(1, "MQ3V25 A4 is not admitted"));
+        }
+        let full = self.mq3v25_iu4_full_n(n);
+        if full == 0 {
+            return self.gemm_qkv_mq3g256v2_wmma(wq, wk, wv, x, q, kout, v, mq, mk, mv, k, n);
+        }
+        if full != n {
+            let x_body = x.sub_offset(0, full * k);
+            let q_body = q.sub_offset(0, full * mq);
+            let k_body = kout.sub_offset(0, full * mk);
+            let v_body = v.sub_offset(0, full * mv);
+            let xq = self.ensure_int4_mmq_x(&x_body, full, k)?;
+            self.gemm_mq3v25_iu4_set_or_legacy(wq, &x_body, xq, &q_body, mq, k, full)?;
+            self.gemm_mq3v25_iu4_set_or_legacy(wk, &x_body, xq, &k_body, mk, k, full)?;
+            self.gemm_mq3v25_iu4_set_or_legacy(wv, &x_body, xq, &v_body, mv, k, full)?;
+            let tail = n - full;
+            return self.gemm_qkv_mq3g256v2_wmma(
+                wq,
+                wk,
+                wv,
+                &x.sub_offset(full * k, tail * k),
+                &q.sub_offset(full * mq, tail * mq),
+                &kout.sub_offset(full * mk, tail * mk),
+                &v.sub_offset(full * mv, tail * mv),
+                mq,
+                mk,
+                mv,
+                k,
+                tail,
+            );
+        }
+        let xq = self.ensure_int4_mmq_x(x, n, k)?;
+        self.gemm_mq3v25_iu4_set_or_legacy(wq, x, xq, q, mq, k, n)?;
+        self.gemm_mq3v25_iu4_set_or_legacy(wk, x, xq, kout, mk, k, n)?;
+        self.gemm_mq3v25_iu4_set_or_legacy(wv, x, xq, v, mv, k, n)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_gate_up_mq3v25_iu4(
+        &mut self,
+        wg: &GpuTensor,
+        wu: &GpuTensor,
+        x: &GpuTensor,
+        gate: &GpuTensor,
+        up: &GpuTensor,
+        mg: usize,
+        mu: usize,
+        k: usize,
+        n: usize,
+    ) -> HipResult<()> {
+        if !self.flags.mq3v25_a4_enabled(self.mq3v2_symmetric) {
+            return Err(hip_bridge::HipError::new(1, "MQ3V25 A4 is not admitted"));
+        }
+        let full = self.mq3v25_iu4_full_n(n);
+        if full == 0 {
+            return self.gemm_gate_up_mq3g256v2_wmma(wg, wu, x, gate, up, mg, mu, k, n);
+        }
+        if full != n {
+            let x_body = x.sub_offset(0, full * k);
+            let gate_body = gate.sub_offset(0, full * mg);
+            let up_body = up.sub_offset(0, full * mu);
+            let xq = self.ensure_int4_mmq_x(&x_body, full, k)?;
+            self.gemm_mq3v25_iu4_set_or_legacy(wg, &x_body, xq, &gate_body, mg, k, full)?;
+            self.gemm_mq3v25_iu4_set_or_legacy(wu, &x_body, xq, &up_body, mu, k, full)?;
+            let tail = n - full;
+            return self.gemm_gate_up_mq3g256v2_wmma(
+                wg,
+                wu,
+                &x.sub_offset(full * k, tail * k),
+                &gate.sub_offset(full * mg, tail * mg),
+                &up.sub_offset(full * mu, tail * mu),
+                mg,
+                mu,
+                k,
+                tail,
+            );
+        }
+        let xq = self.ensure_int4_mmq_x(x, n, k)?;
+        self.gemm_mq3v25_iu4_set_or_legacy(wg, x, xq, gate, mg, k, n)?;
+        self.gemm_mq3v25_iu4_set_or_legacy(wu, x, xq, up, mu, k, n)
+    }
+
+    /// Signed-i8 K128 qt49 consumer; the caller provides one packed activation
+    /// shared by every projection in a fused family.
+    fn gemm_mq3v25_prequant_iu8(
+        &mut self,
+        a: &GpuTensor,
+        xq: *mut c_void,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        n: usize,
+        add: bool,
+    ) -> HipResult<()> {
+        if !self.flags.mq3v25_a8_enabled(self.mq3v2_symmetric) || k % 256 != 0 || m == 0 || n == 0 {
+            return Err(hip_bridge::HipError::new(
+                1,
+                "MQ3V25 A8 requires validated symmetric qt49, exact gfx1201 and K divisible by 256",
+            ));
+        }
+        self.bind_thread()?;
+        self.flush_residual_fold()?;
+        const MODULE: &str = "gemm_mq3v25_residual_mmq_iu8_gfx1201";
+        const KERNEL: &str = "gemm_mq3v25_residual_mmq_iu8";
+        self.ensure_kernel(
+            MODULE,
+            kernels::GEMM_MQ3V25_RESIDUAL_MMQ_IU8_GFX12_SRC,
+            KERNEL,
+        )?;
+        let mut ap = a.buf.as_ptr();
+        let mut xp = xq;
+        let mut yp = y.buf.as_ptr();
+        let mut mi = m as i32;
+        let mut ki = k as i32;
+        let mut ni = n as i32;
+        let mut ai = i32::from(add);
+        let mut params = [
+            &mut ap as *mut _ as *mut c_void,
+            &mut xp as *mut _ as *mut c_void,
+            &mut yp as *mut _ as *mut c_void,
+            &mut mi as *mut _ as *mut c_void,
+            &mut ki as *mut _ as *mut c_void,
+            &mut ni as *mut _ as *mut c_void,
+            &mut ai as *mut _ as *mut c_void,
+        ];
+        let timer = crate::profile::begin_timer(
+            &self.hip,
+            "gemm",
+            KERNEL,
+            m * (k / 256) * crate::dispatch::MQ3G256V2_GROUP_BYTES + n * m * 4,
+        );
+        let result = self.launch_maybe_blob(
+            KERNEL,
+            [m.div_ceil(128) as u32, n.div_ceil(128) as u32, 1],
+            [256, 1, 1],
+            19456,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(ap);
+                b.push_ptr(xp);
+                b.push_ptr(yp);
+                b.push_i32(mi);
+                b.push_i32(ki);
+                b.push_i32(ni);
+                b.push_i32(ai);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
+    pub fn gemm_mq3v25_residual_iu8(
+        &mut self,
+        a: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        n: usize,
+        add: bool,
+    ) -> HipResult<()> {
+        if !self.flags.mq3v25_a8_enabled(self.mq3v2_symmetric) {
+            return Err(hip_bridge::HipError::new(1, "MQ3V25 A8 is not admitted"));
+        }
+        let xq = self.ensure_int8_mmq_x(x, n, k)?;
+        self.gemm_mq3v25_prequant_iu8(a, xq, y, m, k, n, add)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_qkvza_mq3v25_iu8(
+        &mut self,
+        wqkv: &GpuTensor,
+        wz: &GpuTensor,
+        wb: &GpuTensor,
+        wa: &GpuTensor,
+        x: &GpuTensor,
+        qkv: &GpuTensor,
+        z: &GpuTensor,
+        beta: &GpuTensor,
+        alpha: &GpuTensor,
+        mqkv: usize,
+        mz: usize,
+        mb: usize,
+        ma: usize,
+        k: usize,
+        n: usize,
+    ) -> HipResult<()> {
+        if !self.flags.mq3v25_a8_enabled(self.mq3v2_symmetric) {
+            return Err(hip_bridge::HipError::new(1, "MQ3V25 A8 is not admitted"));
+        }
+        let xq = self.ensure_int8_mmq_x(x, n, k)?;
+        self.gemm_mq3v25_prequant_iu8(wqkv, xq, qkv, mqkv, k, n, false)?;
+        self.gemm_mq3v25_prequant_iu8(wz, xq, z, mz, k, n, false)?;
+        self.gemm_mq3v25_prequant_iu8(wb, xq, beta, mb, k, n, false)?;
+        self.gemm_mq3v25_prequant_iu8(wa, xq, alpha, ma, k, n, false)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_qkv_mq3v25_iu8(
+        &mut self,
+        wq: &GpuTensor,
+        wk: &GpuTensor,
+        wv: &GpuTensor,
+        x: &GpuTensor,
+        q: &GpuTensor,
+        kout: &GpuTensor,
+        v: &GpuTensor,
+        mq: usize,
+        mk: usize,
+        mv: usize,
+        k: usize,
+        n: usize,
+    ) -> HipResult<()> {
+        if !self.flags.mq3v25_a8_enabled(self.mq3v2_symmetric) {
+            return Err(hip_bridge::HipError::new(1, "MQ3V25 A8 is not admitted"));
+        }
+        let xq = self.ensure_int8_mmq_x(x, n, k)?;
+        self.gemm_mq3v25_prequant_iu8(wq, xq, q, mq, k, n, false)?;
+        self.gemm_mq3v25_prequant_iu8(wk, xq, kout, mk, k, n, false)?;
+        self.gemm_mq3v25_prequant_iu8(wv, xq, v, mv, k, n, false)
+    }
+
+    /// No fused iu8 gate/up entry exists: one quantizer, two SET launches,
+    /// followed by the caller's unchanged SiLU epilogue.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_gate_up_mq3v25_iu8(
+        &mut self,
+        wg: &GpuTensor,
+        wu: &GpuTensor,
+        x: &GpuTensor,
+        gate: &GpuTensor,
+        up: &GpuTensor,
+        mg: usize,
+        mu: usize,
+        k: usize,
+        n: usize,
+    ) -> HipResult<()> {
+        if !self.flags.mq3v25_a8_enabled(self.mq3v2_symmetric) {
+            return Err(hip_bridge::HipError::new(1, "MQ3V25 A8 is not admitted"));
+        }
+        let xq = self.ensure_int8_mmq_x(x, n, k)?;
+        self.gemm_mq3v25_prequant_iu8(wg, xq, gate, mg, k, n, false)?;
+        self.gemm_mq3v25_prequant_iu8(wu, xq, up, mu, k, n, false)
+    }
+
     /// ADD-epilogue fold, caller side. Offers `delta` (f32, >= n*m elements,
     /// otherwise dead until the next RMSNorm) to the next residual GEMM. When
     /// that GEMM takes the gfx1151 V2B route it writes its sum into `delta`

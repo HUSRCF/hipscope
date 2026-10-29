@@ -3233,6 +3233,21 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
                 "quantize_int8_mmq_ds128"
             ]
         );
+        // Symmetric qt49 MQ3V25 A4 (default on gfx1201 for qt49 artifacts) and
+        // the opt-in A8 consumer (`HIPFIRE_MQ3V25_A8=1`).
+        add!(
+            "gemm_mq3v25_residual_mmq_iu4_gfx1201",
+            kernels::GEMM_MQ3V25_RESIDUAL_MMQ_IU4_GFX12_SRC,
+            [
+                "gemm_mq3v25_gate_up_silu_mmq_iu4",
+                "gemm_mq3v25_residual_mmq_iu4"
+            ]
+        );
+        add!(
+            "gemm_mq3v25_residual_mmq_iu8_gfx1201",
+            kernels::GEMM_MQ3V25_RESIDUAL_MMQ_IU8_GFX12_SRC,
+            ["gemm_mq3v25_residual_mmq_iu8"]
+        );
         // One-pass plain rotate + A8 `block_i8_128` producer of the same route
         // (`Gpu::rotate_x_mq_i8_batched`, `Gpu::mq6_i8_prepare_x`).
         add!(
@@ -3445,6 +3460,13 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
         );
     }
     if arch == "gfx1100" {
+        // Symmetric qt49 MQ3V25 A4 full-tile consumer (`HIPFIRE_MQ3V25_A4=1`,
+        // `Gpu::gemm_mq3v25_residual_iu4`).
+        add!(
+            "gemm_mq3v25_iu4_v2c_gfx1100",
+            kernels::GEMM_MQ3V25_RESIDUAL_IU4_V2C_GFX11_SRC,
+            ["gemm_mq3v25_residual_iu4_v2c"]
+        );
         add!(
             "qwen4_moe_scatter_stable_top10_gfx1100",
             kernels::qwen4_moe_scatter_stable_top10_gfx1100_src(),
@@ -10765,9 +10787,27 @@ mod tests {
                 "{module} must not be a P0 module"
             );
         }
+        // Symmetric qt49 MQ3V25 A4/A8 prefill consumers (gfx1201).
+        const MQ3V25_ADDED_MODULES: [&str; 2] = [
+            "gemm_mq3v25_residual_mmq_iu4_gfx1201",
+            "gemm_mq3v25_residual_mmq_iu8_gfx1201",
+        ];
+        for module in MQ3V25_ADDED_MODULES {
+            assert!(
+                by_name.contains_key(module),
+                "missing MQ3V25 module {module}"
+            );
+            assert!(
+                !expected
+                    .lines()
+                    .any(|l| l.split('\t').next() == Some(module)),
+                "{module} must not be a P0 module"
+            );
+        }
         assert_eq!(
             registry.len(),
             count
+                + MQ3V25_ADDED_MODULES.len()
                 + PRE_S1_ADDED_SINCE_P0
                 + S1_ADDED_MODULES.len()
                 + NATIVE_A3B_ADDED_MODULES.len()

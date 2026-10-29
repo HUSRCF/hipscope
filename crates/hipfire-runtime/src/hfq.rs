@@ -3792,9 +3792,7 @@ fn validate_mq3v2_symmetric_groups_impl(hfq: &HfqFile) -> Result<(), String> {
         }
     }
     if hfq.mq3v2_symmetric && n_groups == 0 {
-        return Err(
-            "mq3v2 symmetric: marker mq3v2.symmetric=1 but no qt=49 groups exist".into(),
-        );
+        return Err("mq3v2 symmetric: marker mq3v2.symmetric=1 but no qt=49 groups exist".into());
     }
     Ok(())
 }
@@ -5317,7 +5315,6 @@ mod mq_i4_header_tests {
     }
 }
 
-
 // ─── MQ3V2 symmetric marker + qt49 zero contract (MQ V2.5 S4) ───────────────
 
 #[cfg(test)]
@@ -5477,10 +5474,7 @@ mod mq3v2_symmetric_tests {
         );
         assert!(path.is_file(), "missing B1a artifact at {}", path.display());
         let f = HfqFile::open(path).expect("B1a open");
-        assert!(
-            f.mq3v2_symmetric(),
-            "B1a must carry mq3v2.symmetric=1"
-        );
+        assert!(f.mq3v2_symmetric(), "B1a must carry mq3v2.symmetric=1");
         f.validate_mq3v2_symmetric_groups()
             .expect("B1a qt49 symmetric groups must validate");
     }
@@ -5488,10 +5482,13 @@ mod mq3v2_symmetric_tests {
     #[test]
     #[ignore = "real multi-GB HFQ artifacts; run with --ignored"]
     fn mq3v2_symmetric_real_asymmetric_base_marker_false() {
-        let path = std::path::Path::new(
-            "/home/kaden/qcal/ladder-v2/artifacts/qwen3.8-27b.mq3v2.base.hfq",
+        let path =
+            std::path::Path::new("/home/kaden/qcal/ladder-v2/artifacts/qwen3.8-27b.mq3v2.base.hfq");
+        assert!(
+            path.is_file(),
+            "missing asymmetric base at {}",
+            path.display()
         );
-        assert!(path.is_file(), "missing asymmetric base at {}", path.display());
         let f = HfqFile::open(path).expect("base open");
         assert!(
             !f.mq3v2_symmetric(),

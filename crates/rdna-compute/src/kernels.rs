@@ -5428,6 +5428,30 @@ pub const GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_SYMFOLD_G12R_SRC: &str = concat!
     include_str!("../../../kernels/src/block_i4_128_quant.hip"),
     include_str!("../../../kernels/src/gemm_mq4g256v2_residual_mmq_iu4.gfx12.hip")
 );
+/// Exact gfx1201 symmetric qt49 (MQ3V25) A4 consumer: MQ3 unpack plus the
+/// symmetric fold over the production MQ4 `block_i4_128` activation block and
+/// 128x128 tile geometry (`gemm_mq3v25_residual_mmq_iu4`, F1-lite
+/// `gemm_mq3v25_gate_up_silu_mmq_iu4`; [256,1,1], LDS 20480). The shared
+/// quantizer prelude is included without its standalone kernel.
+pub const GEMM_MQ3V25_RESIDUAL_MMQ_IU4_GFX12_SRC: &str = concat!(
+    "#define HIPFIRE_BLOCK_I4_128_QUANT_NO_STANDALONE 1\n",
+    "#define IU4_SYMMETRIC_FOLD 1\n",
+    "#define IU4_G12_RASTER 1\n",
+    include_str!("../../../kernels/src/block_i4_128_quant.hip"),
+    include_str!("../../../kernels/src/gemm_mq3v25_residual_mmq_iu4.gfx12.hip")
+);
+/// gfx1100 symmetric qt49 (MQ3V25) A4 full-tile V2C consumer
+/// (`gemm_mq3v25_residual_iu4_v2c`; [N/128, M/128, 1], [32,8,1], LDS 32768).
+pub const GEMM_MQ3V25_RESIDUAL_IU4_V2C_GFX11_SRC: &str =
+    include_str!("../../../kernels/src/gemm_mq3v25_residual_iu4_v2c.gfx11.hip");
+/// Exact gfx1201 symmetric qt49 (MQ3V25) A8 consumer over the 136-byte
+/// `block_i8_128` activations of `Gpu::ensure_int8_mmq_x` (standalone
+/// quantizer omitted; [256,1,1], LDS 19456).
+pub const GEMM_MQ3V25_RESIDUAL_MMQ_IU8_GFX12_SRC: &str = concat!(
+    "#define HIPFIRE_BLOCK_I8_128_QUANT_NO_STANDALONE 1\n",
+    include_str!("../../../kernels/src/block_i8_128_quant.hip"),
+    include_str!("../../../kernels/src/gemm_mq3v25_residual_mmq_iu8.gfx12.hip")
+);
 /// Scheduler policy registered with each built-in module. Unlisted modules use
 /// the upstream default; profile lowering lives in Radiowave.
 pub fn scheduler_profile_for_module(arch: &str, name: &str) -> radiowave::SchedulerProfile {

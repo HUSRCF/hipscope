@@ -302,6 +302,7 @@ pub fn resolve_dense_flags(gpu: &Gpu, config: &Qwen35Config) -> SwResult<DenseRe
 pub fn apply_source_dispatch_flags(gpu: &mut Gpu, hfq: &HfqFile) -> bool {
     let symmetric = hfq.mq4v2_symmetric();
     gpu.mq4v2_symmetric = symmetric;
+    gpu.mq3v2_symmetric = hfq.mq3v2_symmetric();
     symmetric
 }
 
@@ -2651,6 +2652,9 @@ fn import_inner(
     let meta = decode_dense_seal(&manifest.dispatch_metadata)?;
     // Same stamp model_load applies before a load; predicates read it.
     gpu.mq4v2_symmetric = meta.flags.mq4v2_symmetric;
+    // The dense recipe carries no qt49 provenance: imported weights run with
+    // the symmetric MQ3V25 A4/A8 route closed (matches the hydrated marker).
+    gpu.mq3v2_symmetric = false;
     let plan = plan_import(gpu, config, manifest, lease.allocation_fds().len(), meta)?;
 
     // ── map: one allocation per unique owner ──
