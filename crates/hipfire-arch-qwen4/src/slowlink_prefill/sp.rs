@@ -2778,6 +2778,120 @@ mod tests {
         );
     }
 
+    /// Regression (card job spkldP3): `qwen4_kld` loaded with `max_seq` 4096, so the admitted
+    /// S1 window was 4096 rows and its route region (96 MiB on the SymIu4 profile, 116 MiB on the
+    /// F16 one) fits only 769 / 1,032 hybrid-SP rows, below the 2,048 minimum: admission
+    /// declined `sp: region fit` and, with the decline visible nowhere, SP simply never ran. The
+    /// window is `min(S1_WINDOW_ROWS, max_seq)`, so the hybrid mode needs a window of about 9K
+    /// rows on SymIu4 (8K on F16); the product window (16,896) fits 4,507 / 5,376.
+    #[test]
+    fn hybrid_sp_region_fit_follows_the_load_window() {
+        use crate::slowlink_sp::{admit_sp, SpDecline, SpLoadFacts, SP_MIN_REGION_ROWS};
+        let facts_for = |profile: &SlowlinkProfile| SpLoadFacts {
+            knob: true,
+            touched_knob: false,
+            force_all: false,
+            pages: 18,
+            f16_route_ready: true,
+            window_rows: profile.window_rows,
+            s1_route: Some(profile.geometry.route),
+            arch: "gfx1100",
+            n_exp: 512,
+            cpu_gate_up_quant: true,
+            cpu_down_quant: true,
+            splice_workers: Some(16),
+            region_fit_rows: sp_region_fit_rows(profile),
+            hidden: profile.geometry.hidden,
+            pinned_budget_bytes: 1 << 30,
+            prefix_cache: false,
+        };
+        let at =
+            |route, window| super::super::slowlink_prompt::product_profile_window(route, window);
+        // (route, window rows) -> the exact fit the card's census implied.
+        for (route, window, fit) in [
+            (SYM, 4096, 769),
+            (AGG, 4096, 1032),
+            (SYM, 8192, 1964),
+            (AGG, 8192, 2492),
+            (SYM, 16_896, 4507),
+            (AGG, 16_896, 5376),
+        ] {
+            let profile = at(route, window);
+            assert_eq!(
+                sp_region_fit_rows(&profile),
+                fit,
+                "{route:?} window {window}"
+            );
+            let admitted = admit_sp(&facts_for(&profile));
+            if fit < SP_MIN_REGION_ROWS {
+                let decline = admitted.unwrap_err();
+                assert_eq!(
+                    decline,
+                    SpDecline::RegionFit {
+                        fit_rows: fit,
+                        minimum: SP_MIN_REGION_ROWS,
+                        window_rows: window
+                    },
+                    "{route:?} window {window}"
+                );
+                // The decline text names the window and the remedy.
+                let text = decline.to_string();
+                assert!(
+                    text.contains(&format!("{window}-row S1 window"))
+                        && text.contains("larger max_seq"),
+                    "{text}"
+                );
+                // ... and touched-only is unaffected: it needs only a 2,048-row window.
+                let touched = SpLoadFacts {
+                    knob: false,
+                    touched_knob: true,
+                    ..facts_for(&profile)
+                };
+                assert!(admit_sp(&touched).is_ok(), "{route:?} window {window}");
+            } else {
+                let sp = admitted.unwrap_or_else(|d| panic!("{route:?} window {window}: {d}"));
+                assert_eq!(sp.sp_max_rows, fit.min(SP_MAX_ROWS));
+            }
+        }
+    }
+
+    /// The decision lines print without a `tracing` subscriber (`qwen4_kld` installs none):
+    /// they are built by pure functions and written with `eprintln!`.
+    #[test]
+    fn sp_decision_lines_are_the_armed_mode_or_the_named_decline() {
+        use super::super::{sp_decision_line, sp_s1_unavailable_line};
+        let hybrid = sym_hybrid_profile();
+        assert_eq!(
+            sp_decision_line(Ok(&hybrid)),
+            "qwen4 SP: hybrid mode armed (SP windows use Aggregate F16; others SymIu4)"
+        );
+        let touched = SpProfile {
+            mode: SpMode::TouchedOnly,
+            window_route: SYM,
+            ..hybrid
+        };
+        assert_eq!(
+            sp_decision_line(Ok(&touched)),
+            format!(
+                "qwen4 SP: touched_only mode armed (single windows of 5..={} rows, no session cut)",
+                SP_MAX_ROWS
+            )
+        );
+        let declined = crate::slowlink_sp::SpDecline::RegionFit {
+            fit_rows: 769,
+            minimum: 2048,
+            window_rows: 4096,
+        };
+        let line = sp_decision_line(Err(&declined));
+        assert!(
+            line.starts_with("qwen4 SP: knob on but not armed: sp: region fit")
+                && line.contains("4096-row S1 window")
+                && line.contains("769"),
+            "{line}"
+        );
+        assert!(sp_s1_unavailable_line("x").contains("(S1) is unavailable"));
+    }
+
     fn plan_agg_on(profile: &SlowlinkProfile, rows: usize) -> Qwen4PromptPlan {
         plan_for_profile(profile, 0, rows, &[], &gfx1100_routing, 8)
             .unwrap()

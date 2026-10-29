@@ -1375,10 +1375,15 @@ fn score(
         ));
     }
     // KV capacity large enough that short-context corpora (code24, n_ctx 512) load through S1
-    // and exercise SP: S1's minimum request (1537) is not enough, because the admitted window's
-    // route region also carries the K1+tail cohort rows (~3.1K on the SymIu4 profile), so a
-    // 1537-row window is refused as degenerate. Logit rows stay n_ctx: scores are unchanged.
-    const KLD_S1_MAX_SEQ: usize = 4096;
+    // and exercise SP, with the PRODUCT S1 window. S1's minimum request (1537) is not enough:
+    // the admitted window's route region also carries the K1+tail cohort rows (~3.1K on the
+    // SymIu4 profile), so a 1537-row window is refused as degenerate. And the window is
+    // `min(S1_WINDOW_ROWS, max_seq)`, so a 4096-row `max_seq` gives a 4096-row window whose
+    // route region (96 MiB on the SymIu4 profile) fits only 769 hybrid-SP rows (< the 2048
+    // minimum): `sp: region fit` declines and SP never runs. The product window
+    // (16,896 rows, the one a 262,144-token load admits) fits 4,507 rows on SymIu4 and 5,376 on
+    // the F16 route. Logit rows stay n_ctx: scores are unchanged.
+    const KLD_S1_MAX_SEQ: usize = hipfire_arch_qwen4::slowlink_admission::S1_WINDOW_ROWS;
     let max_seq = n_ctx.max(KLD_S1_MAX_SEQ);
     let mut m = Model::load(model, max_seq, n_ctx, ple_hot, pin)?;
     emit_untiered_receipt(&m, output)?;

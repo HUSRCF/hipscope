@@ -1863,10 +1863,10 @@ fn load_decline(
     .err()
 }
 
-/// The one INFO line of the SP load decision (a SP knob is on): the armed mode and its
-/// row cap, or the named sticky decline. SP is otherwise silent in the daemon log, so a
-/// declined knob used to look like an SP that ran no layers.
-pub(crate) fn sp_log_decision(decision: Result<&SpProfile, &SpDecline>) {
+/// The one line of the SP load decision (a SP knob is on): the armed mode and its row cap, or
+/// the named sticky decline. SP is otherwise silent, so a declined knob used to look like an SP
+/// that ran no layers. Pure: [`sp_log_decision`] prints it.
+pub(crate) fn sp_decision_line(decision: Result<&SpProfile, &SpDecline>) -> String {
     fn route_name(route: dsp::WindowRoute) -> &'static str {
         match route {
             dsp::WindowRoute::Aggregate => "Aggregate F16",
@@ -1875,29 +1875,28 @@ pub(crate) fn sp_log_decision(decision: Result<&SpProfile, &SpDecline>) {
         }
     }
     match decision {
-        Ok(sp) if sp.window_route != sp.base_route => tracing::info!(
-            mode = sp.mode.label(),
-            sp_max_rows = sp.sp_max_rows,
-            sp_route = sp.window_route.label(),
-            base_route = sp.base_route.label(),
+        Ok(sp) if sp.window_route != sp.base_route => format!(
             "qwen4 SP: {} mode armed (SP windows use {}; others {})",
             sp.mode.label(),
             route_name(sp.window_route),
             route_name(sp.base_route),
         ),
-        Ok(sp) => tracing::info!(
-            mode = sp.mode.label(),
-            sp_max_rows = sp.sp_max_rows,
+        Ok(sp) => format!(
             "qwen4 SP: {} mode armed (single windows of {}..={} rows, no session cut)",
             sp.mode.label(),
             crate::slowlink_sp::SP_MIN_ROWS,
             sp.sp_max_rows,
         ),
-        Err(decline) => tracing::info!(
-            reason = decline.label(),
-            "qwen4 SP: knob on but not armed: {decline}"
-        ),
+        Err(decline) => format!("qwen4 SP: knob on but not armed: {decline}"),
     }
+}
+
+/// Print [`sp_decision_line`] to stderr like the other load lines (`qwen4 S1 plan:`, the S1
+/// load line), NOT through `tracing`: the daemon installs a subscriber but the examples
+/// (`qwen4_kld`, `qwen4_greedy_ids`) and tools do not, and the SP decision must be visible on
+/// every path that runs `bind_at_load`.
+pub(crate) fn sp_log_decision(decision: Result<&SpProfile, &SpDecline>) {
+    eprintln!("  {}", sp_decision_line(decision));
 }
 
 /// The load-time dry run of the F16 `Aggregate` route on a symmetric-IU4 profile: the admitted
@@ -1932,12 +1931,15 @@ fn sp_f16_route_probe(
     )
 }
 
-/// [`sp_log_decision`] for a load whose S1 runtime itself was declined (SP rides on S1).
-fn sp_log_s1_unavailable(reason: &str) {
-    tracing::info!(
-        reason = "S1 unavailable",
+/// The SP decision line of a load whose S1 runtime itself was declined (SP rides on S1).
+pub(crate) fn sp_s1_unavailable_line(reason: &str) -> String {
+    format!(
         "qwen4 SP: knob on but not armed: the slow-link prefill (S1) is unavailable on this load: {reason}"
-    );
+    )
+}
+
+fn sp_log_s1_unavailable(reason: &str) {
+    eprintln!("  {}", sp_s1_unavailable_line(reason));
 }
 
 /// Materialize the whole admitted S1 runtime ONCE, at the selected load, after
@@ -1991,8 +1993,8 @@ pub(crate) fn bind_at_load(
             match sp_f16_route_probe(&*forward, &*bundle, gpu, &profile) {
                 Ok(()) => true,
                 Err(why) => {
-                    tracing::info!(
-                        "qwen4 SP: the F16 Aggregate route does not admit the admitted tile on this \
+                    eprintln!(
+                        "  qwen4 SP: the F16 Aggregate route does not admit the admitted tile on this \
                          load: {why}"
                     );
                     false
@@ -4943,6 +4945,17 @@ mod slowlink_prompt {
             .expect("a 40 GiB load admits the product S1 profile");
         assert_eq!(profile.tile_rows, S1_PRODUCT_TILE_ROWS);
         profile
+    }
+
+    /// The product profile admitted with a window of `window_rows` rows (the load's own
+    /// `S1_WINDOW_ROWS.min(max_seq)`: a small `max_seq` shrinks the window and its route region).
+    pub(super) fn product_profile_window(
+        route: dsp::WindowRoute,
+        window_rows: usize,
+    ) -> SlowlinkProfile {
+        let mut inputs = fixture_inputs(route, AdmissionPurpose::Product, 0, 0);
+        inputs.window_rows = window_rows;
+        admit(&inputs).expect("a 40 GiB load admits the product S1 profile")
     }
 
     /// The ACTUAL primitive-purpose profile (the 512-row tile).

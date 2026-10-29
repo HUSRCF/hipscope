@@ -295,8 +295,14 @@ pub enum SpDecline {
     Quants { gate_up: bool, down: bool },
     /// The splice pool is unavailable.
     SplicePool,
-    /// The SP window layout does not fit the route region for enough rows.
-    RegionFit { fit_rows: usize, minimum: usize },
+    /// The SP window layout does not fit the route region for enough rows. The region is the
+    /// admitted S1 window's (`window_rows` = `min(16,896, max_seq)` rounded to whole tiles), so a
+    /// load with a small `max_seq` has a small region and declines here.
+    RegionFit {
+        fit_rows: usize,
+        minimum: usize,
+        window_rows: usize,
+    },
     /// The SP pinned host owners do not fit the pinned budget.
     PinnedFit { need: Option<u64>, budget: u64 },
     /// `serve.prefix_cache` is on.
@@ -361,9 +367,14 @@ impl fmt::Display for SpDecline {
                 " (CPU quant for gate_up: {gate_up}, down: {down}; both are required)"
             ),
             Self::SplicePool => write!(f, " (no splice pool workers)"),
-            Self::RegionFit { fit_rows, minimum } => write!(
+            Self::RegionFit {
+                fit_rows,
+                minimum,
+                window_rows,
+            } => write!(
                 f,
-                " (the route region fits {fit_rows} SP rows; at least {minimum} are required)"
+                " (the route region of the {window_rows}-row S1 window fits {fit_rows} SP rows; \
+                 at least {minimum} are required: load with a larger max_seq to grow the window)"
             ),
             Self::PinnedFit { need, budget } => match need {
                 Some(need) => write!(
@@ -449,6 +460,7 @@ fn admit_hybrid(facts: &SpLoadFacts<'_>, base_route: WindowRoute) -> Result<SpPr
         return Err(SpDecline::RegionFit {
             fit_rows: facts.region_fit_rows,
             minimum: SP_MIN_REGION_ROWS,
+            window_rows: facts.window_rows,
         });
     }
     let sp_max_rows = SP_MAX_ROWS.min(facts.region_fit_rows);
@@ -486,6 +498,7 @@ fn admit_touched_only(
         return Err(SpDecline::RegionFit {
             fit_rows: facts.window_rows,
             minimum: SP_MIN_REGION_ROWS,
+            window_rows: facts.window_rows,
         });
     }
     let need = facts.n_exp.div_ceil(TOUCHED_EXPERTS_PER_PAGE);
@@ -1244,6 +1257,7 @@ mod tests {
                 SpDecline::RegionFit {
                     fit_rows: 2_047,
                     minimum: 2_048,
+                    window_rows: 16_896,
                 },
             ),
             (
@@ -1441,6 +1455,7 @@ mod tests {
                 SpDecline::RegionFit {
                     fit_rows: 2_047,
                     minimum: 2_048,
+                    window_rows: 2_047,
                 },
             ),
             (
