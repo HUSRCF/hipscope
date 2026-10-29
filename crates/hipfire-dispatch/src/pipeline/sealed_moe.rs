@@ -3708,6 +3708,9 @@ fn validate_decode(
             params.batch_size
         )));
     }
+    if let Some(residency) = params.routed_experts.mutable_residency() {
+        residency.validate_active_rows(1).map_err(invalid)?;
+    }
     if params.hidden == 0 || params.mi == 0 {
         return Err(invalid("decode dimensions must be nonzero"));
     }
@@ -3850,16 +3853,60 @@ fn validate_decode(
     Ok(())
 }
 
+fn validate_mutable_verify(
+    ctx: &DispatchCtx,
+    params: &MoePrefillParams<'_>,
+) -> Result<(), DispatchError> {
+    let Some(residency) = params.routed_experts.mutable_residency() else {
+        return Ok(());
+    };
+    if ctx.arch.arch() != "gfx1201"
+        || !(2..=MutableExpertResidency::MAX_VERIFY_ROWS).contains(&params.batch_size)
+        || ctx.batch_size != params.batch_size
+    {
+        return Err(invalid(
+            "mutable residency requires exact gfx1201 bounded verify rows and matching context",
+        ));
+    }
+    if params.cpu_deferred_experts
+        || params.routed_experts.cpu_split().is_some()
+        || !matches!(params.prelude.route, PrefillRouteMode::Replicated)
+        || params.ep_row_gather.is_some()
+        || params.ep_tile_exchange.is_some()
+        || params.routed_out.is_some()
+        || params.shared_down_out.is_some()
+        || params.expert_stage_ptrs.is_some()
+    {
+        return Err(invalid(
+            "mutable verify refuses CPU splice/split, EP and staging overrides",
+        ));
+    }
+    if params.dtypes.routed_gate_up != DType::MQ4G256V2
+        || params.dtypes.routed_down != DType::MQ4G128V2
+        || params.dtypes.routed_has_mixed_experts
+        || params.expert_down_awq_ptrs.is_some()
+        || params.expert_dtype_tags.is_some()
+        || params.down_awq_scale.is_some()
+        || !params
+            .route_policy
+            .as_ref()
+            .is_some_and(|policy| matches!(policy.capability, MoeRouteCapability::Qt44Qt53Grouped))
+    {
+        return Err(invalid(
+            "mutable verify requires the qualified QT44/QT53 route without AWQ/tags",
+        ));
+    }
+    residency
+        .validate_active_rows(params.batch_size)
+        .map_err(invalid)
+}
+
 fn validate_prefill(
-    _ctx: &DispatchCtx,
+    ctx: &DispatchCtx,
     experts: &BoundMoeExperts<'_>,
     params: &MoePrefillParams<'_>,
 ) -> Result<(), DispatchError> {
-    if params.routed_experts.mutable_residency().is_some() {
-        return Err(invalid(
-            "mutable residency is decode-only; prefill requires frozen resources",
-        ));
-    }
+    validate_mutable_verify(ctx, params)?;
     if params.batch_size == 0 {
         return Err(invalid("grouped prefill batch_size is zero"));
     }
@@ -3965,7 +4012,7 @@ fn validate_prefill(
         params.expert_down_ptrs,
         params.expert_down_awq_ptrs,
         params.expert_dtype_tags,
-        None,
+        params.routed_experts.mutable_pointer_entries(),
     )?;
     validate_dtype_tag_table(
         params.expert_dtype_tags,
@@ -4956,6 +5003,10 @@ pub fn validate_retained_moe_binding(
     dtype_tags: Option<&GpuTensor>,
     host_entries: Option<MoePointerEntries<'_>>,
 ) -> Result<(), DispatchError> {
+    if let Some(residency) = routed_experts.mutable_residency() {
+        // The retained body is the qualified singleton decode body only.
+        residency.validate_active_rows(1).map_err(invalid)?;
+    }
     validate_live_binding(
         experts,
         Some(routed_experts),
@@ -5610,6 +5661,7 @@ mod tests {
         inner: &'a FakeRouted,
         residency: MutableExpertResidency,
         identity: u64,
+        entries: Option<MoePointerEntries<'a>>,
     }
     impl RoutedExpertWeights for MutableRouted<'_> {
         fn len(&self) -> usize {
@@ -5623,6 +5675,9 @@ mod tests {
         }
         fn mutable_residency(&self) -> Option<&MutableExpertResidency> {
             Some(&self.residency)
+        }
+        fn mutable_pointer_entries(&self) -> Option<MoePointerEntries<'_>> {
+            self.entries
         }
     }
 
@@ -5700,6 +5755,7 @@ mod tests {
             inner: &fixture.routed,
             residency: residency.clone(),
             identity: 77,
+            entries: None,
         };
         let mut cache = table.prepare_binding(0, 1, 0).unwrap();
         cache
@@ -5801,6 +5857,7 @@ mod tests {
             inner: &fixture.routed,
             residency: mutable_capability(&fixture, 8),
             identity: 77,
+            entries: None,
         };
         assert!(validate_retained_moe_binding(
             &bound,
@@ -5816,6 +5873,7 @@ mod tests {
             inner: &fixture.routed,
             residency: residency.clone(),
             identity: 78,
+            entries: None,
         };
         assert!(validate_retained_moe_binding(
             &bound,
@@ -5850,6 +5908,166 @@ mod tests {
     }
 
     #[test]
+    fn mutable_verify_requires_exact_reader_and_independent_host_mirrors() {
+        use crate::families::moe::{MoeRouteFormats, MoeRouteGeometry, MoeRoutePolicy};
+        let table = mutable_table();
+        let fixture = live_fixture(&table, 0x5400_0000);
+        let cap = mutable_capability(&fixture, 12);
+        // Independent architecture mirrors, not cap.snapshot() compared to itself.
+        let gu = fixture
+            .routed
+            .experts
+            .iter()
+            .map(|e| e.gate_up.buf.buf.as_ptr() as usize)
+            .collect::<Vec<_>>();
+        let dn = fixture
+            .routed
+            .experts
+            .iter()
+            .map(|e| e.down.buf.buf.as_ptr() as usize)
+            .collect::<Vec<_>>();
+        let routed = MutableRouted {
+            inner: &fixture.routed,
+            residency: cap.clone(),
+            identity: 81,
+            entries: Some(MoePointerEntries {
+                gate_up: &gu,
+                down: &dn,
+            }),
+        };
+        let mut cache = table.prepare_binding(0, 1, 0).unwrap();
+        cache
+            .bind_live(
+                &table,
+                &routed,
+                &fixture.gate_up_ptrs,
+                &fixture.down_ptrs,
+                None,
+                None,
+            )
+            .unwrap();
+        let bound = BoundMoeExperts::from_cache(&table, &cache).unwrap();
+        let scratch = prefill_scratch(0x5500_0000);
+        let mut params = ep_prefill_params(
+            &scratch,
+            &routed,
+            &fixture.gate_up_ptrs,
+            &fixture.down_ptrs,
+            None,
+        );
+        params.prelude.route = PrefillRouteMode::Replicated;
+        params.dtypes.routed_gate_up = DType::MQ4G256V2;
+        params.dtypes.routed_down = DType::MQ4G128V2;
+        params.route_policy = Some(MoeRoutePolicy {
+            capability: MoeRouteCapability::Qt44Qt53Grouped,
+            geometry: MoeRouteGeometry {
+                experts: 512,
+                top_k: 10,
+                hidden: 2560,
+                routed_intermediate: 640,
+                shared_intermediate: 640,
+            },
+            formats: MoeRouteFormats {
+                router: DType::BF16,
+                shared_selector: DType::BF16,
+                shared_gate: DType::BF16,
+                shared_up: DType::BF16,
+                shared_down: DType::BF16,
+                routed_gate_up: DType::MQ4G256V2,
+                routed_down: DType::MQ4G128V2,
+            },
+            slab_cold_codec: None,
+            expert_keep_mask: 0,
+        });
+        let ctx = DispatchCtx::for_test("gfx1201").with_batch_size(2);
+        assert!(validate_mutable_verify(&ctx, &params).is_err());
+        let wrong_rows = cap.begin_verify(0, 4).unwrap();
+        assert!(validate_mutable_verify(&ctx, &params).is_err());
+        // SAFETY: CPU descriptors only; no GPU work submitted.
+        unsafe { wrong_rows.retire_after_gpu_wait() }.unwrap();
+        let guard = cap.begin_verify(0, 2).unwrap();
+        validate_mutable_verify(&ctx, &params).unwrap();
+        let binding = |source: &dyn RoutedExpertWeights| {
+            validate_live_binding(
+                &bound,
+                Some(source),
+                &fixture.gate_up_ptrs,
+                &fixture.down_ptrs,
+                None,
+                None,
+                source.mutable_pointer_entries(),
+            )
+        };
+        binding(&routed).unwrap();
+        let missing = MutableRouted {
+            inner: &fixture.routed,
+            residency: cap.clone(),
+            identity: 81,
+            entries: None,
+        };
+        assert!(binding(&missing).is_err());
+        let bad_gu = [0xdead, gu[1]];
+        let stale = MutableRouted {
+            inner: &fixture.routed,
+            residency: cap.clone(),
+            identity: 81,
+            entries: Some(MoePointerEntries {
+                gate_up: &bad_gu,
+                down: &dn,
+            }),
+        };
+        assert!(binding(&stale).is_err());
+        let wrong_owner = MutableRouted {
+            inner: &fixture.routed,
+            residency: mutable_capability(&fixture, 13),
+            identity: 81,
+            entries: routed.entries,
+        };
+        assert!(binding(&wrong_owner).is_err());
+        assert!(
+            validate_retained_moe_binding(
+                &bound,
+                &routed,
+                &fixture.gate_up_ptrs,
+                &fixture.down_ptrs,
+                None,
+                None,
+                routed.entries
+            )
+            .is_err(),
+            "batch guard cannot authorize an AR tape"
+        );
+        assert!(validate_mutable_verify(
+            &DispatchCtx::for_test("gfx1100").with_batch_size(2),
+            &params
+        )
+        .is_err());
+        assert!(validate_mutable_verify(
+            &DispatchCtx::for_test("gfx1201").with_batch_size(3),
+            &params
+        )
+        .is_err());
+        params.cpu_deferred_experts = true;
+        assert!(validate_mutable_verify(&ctx, &params).is_err());
+        params.cpu_deferred_experts = false;
+        params.prelude.route = PrefillRouteMode::ProduceRoot {
+            slot: &scratch.route_slot,
+        };
+        assert!(validate_mutable_verify(&ctx, &params).is_err());
+        params.prelude.route = PrefillRouteMode::Replicated;
+        params.expert_down_awq_ptrs = Some(&fixture.down_ptrs);
+        assert!(validate_mutable_verify(&ctx, &params).is_err());
+        params.expert_down_awq_ptrs = None;
+        for rows in [0, 1, 9] {
+            params.batch_size = rows;
+            assert!(validate_mutable_verify(&ctx, &params).is_err());
+        }
+        // SAFETY: metadata-only tests.
+        unsafe { guard.retire_after_gpu_wait() }.unwrap();
+        assert!(binding(&routed).is_err());
+    }
+
+    #[test]
     fn mutable_decode_refuses_unqualified_arch_cpu_and_ep_before_sealing() {
         let table = mutable_table();
         let fixture = live_fixture(&table, 0x5100_0000);
@@ -5857,6 +6075,7 @@ mod tests {
             inner: &fixture.routed,
             residency: mutable_capability(&fixture, 9),
             identity: 79,
+            entries: None,
         };
         let mut cache = table.prepare_binding(0, 1, 0).unwrap();
         cache
@@ -5909,7 +6128,10 @@ mod tests {
             None,
         );
         let error = validate_prefill(&ctx, &bound, &params).unwrap_err();
-        assert!(format!("{error:?}").contains("decode-only"), "{error:?}");
+        assert!(
+            format!("{error:?}").contains("bounded verify rows"),
+            "{error:?}"
+        );
     }
 
     #[test]
