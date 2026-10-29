@@ -58,9 +58,11 @@ mod config_view;
 mod doctor;
 mod emu;
 mod fit;
+mod inspect;
 mod kernel_pack;
 mod npu_trunk;
 mod ple;
+mod prefill_progress;
 mod process_identity;
 mod pull_select;
 mod serve;
@@ -156,6 +158,8 @@ pub(crate) enum Commands {
     Doctor(doctor::DoctorArgs),
     /// What fits on this machine: context, placement, route and expected speed for a model.
     Fit(fit::FitArgs),
+    /// Read a GGUF header: architecture, tensor types, bits per weight and whether hipfire can serve it.
+    Inspect(inspect::InspectArgs),
 }
 
 #[derive(Args, Debug)]
@@ -184,8 +188,10 @@ enum ConfigAction {
     Reset { key: Option<String> },
     /// Explain a key's type, scope, default, effective value, and provenance.
     Explain {
-        key: String,
-        /// Explain the key for one model (same as `hipfire config MODEL explain KEY`).
+        /// Key to explain; omit to list every effective setting with its source
+        /// and audit the HIPFIRE_* environment.
+        key: Option<String>,
+        /// Explain for one model (same as `hipfire config MODEL explain KEY`).
         #[arg(long, value_name = "MODEL")]
         model: Option<String>,
         #[command(flatten)]
@@ -1091,6 +1097,7 @@ fn run() -> Result<()> {
                 | Commands::Ps(_)
                 | Commands::Version(_)
                 | Commands::Rm(_)
+                | Commands::Inspect(_)
         )
     ) {
         // SAFETY: restores the default disposition before any thread starts.
@@ -1100,6 +1107,7 @@ fn run() -> Result<()> {
     match cli.command {
         None => launch_tui(&paths, &[]),
         Some(Commands::Tui(args)) => launch_tui(&paths, &args.arguments),
+        Some(Commands::Inspect(args)) => inspect::inspect_command(args),
         Some(Commands::Config(args)) => config_command(&paths, args),
         Some(Commands::Registry(args)) => registry_command(&paths, args),
         Some(Commands::List(args)) => list_command(&paths, args),
@@ -1241,9 +1249,17 @@ fn config_command(paths: &Paths, args: ConfigArgs) -> Result<()> {
             }
             Ok(())
         }
-        ConfigAction::Explain { key, output, .. } => {
-            config_view::explain_global_to(paths, &key, output.json, &mut std::io::stdout())
-        }
+        ConfigAction::Explain { key, output, .. } => match key {
+            Some(key) => {
+                config_view::explain_global_to(paths, &key, output.json, &mut std::io::stdout())
+            }
+            None => config_view::explain_all_global_to(
+                paths,
+                output.json,
+                &hipfire_config::env_audit::audit_process_env(),
+                &mut std::io::stdout(),
+            ),
+        },
         ConfigAction::Overrides(output) => {
             config_view::overrides_to(paths, output.json, &mut std::io::stdout())
         }
@@ -1490,9 +1506,21 @@ fn model_config_command_to(
             }
             Ok(())
         }
-        ConfigAction::Explain { key, output, .. } => {
-            config_view::explain_model_to(paths, registry, model_name, &key, output.json, out)
-        }
+        ConfigAction::Explain {
+            key: None, output, ..
+        } => config_view::explain_all_model_to(
+            paths,
+            registry,
+            model_name,
+            output.json,
+            &hipfire_config::env_audit::audit_process_env(),
+            out,
+        ),
+        ConfigAction::Explain {
+            key: Some(key),
+            output,
+            ..
+        } => config_view::explain_model_to(paths, registry, model_name, &key, output.json, out),
         ConfigAction::Migrate
         | ConfigAction::Schema(_)
         | ConfigAction::Profile { .. }
@@ -2694,13 +2722,8 @@ fn run_command(paths: &Paths, args: RunArgs) -> Result<()> {
             model_path = find_model_path(paths, registry, &args.model);
         }
     }
-    let model_path = model_path.ok_or_else(|| {
-        anyhow!(
-            "model not found: {}{}",
-            args.model,
-            model_suggestions(registry, &args.model)
-        )
-    })?;
+    let model_path =
+        model_path.ok_or_else(|| model_not_found_error(paths, registry, &args.model))?;
     if let Some(image) = &args.image {
         if !image.is_file() {
             bail!("image not found: {}", image.display());
@@ -2708,12 +2731,31 @@ fn run_command(paths: &Paths, args: RunArgs) -> Result<()> {
     }
     if let Some(draft) = &args.model_draft {
         if !draft.is_file() {
-            bail!("DFlash draft not found: {}", draft.display());
+            let fix = match card.pullable().filter(|entry| entry.dflash.is_some()).and(card.tag()) {
+                Some(tag) => format!(
+                    "fetch the registry draft: hipfire pull {tag} (then drop --model-draft to use it)"
+                ),
+                None => "pass an existing draft with -md <path>, or run without it: --spec off"
+                    .to_owned(),
+            };
+            bail!("DFlash draft not found: {}\n  {fix}", draft.display());
         }
     }
     if let Some(vision) = &args.vision {
         if !vision.is_file() {
-            bail!("vision sidecar not found: {}", vision.display());
+            let pull = match card
+                .pullable()
+                .filter(|entry| entry.vision.is_some())
+                .and(card.tag())
+            {
+                Some(tag) => format!(", fetch the registry vision tower: hipfire pull {tag}"),
+                None => String::new(),
+            };
+            bail!(
+                "vision sidecar not found: {}\n  pass an existing --vision <path>{pull}, or disable \
+                 vision: HIPFIRE_VISION_MODE=off (hipfire config set vision.mode off)",
+                vision.display()
+            );
         }
     }
     if args
@@ -2791,9 +2833,7 @@ fn run_command(paths: &Paths, args: RunArgs) -> Result<()> {
         true,
     )?;
 
-    let daemon = find_daemon(paths).ok_or_else(|| {
-        anyhow!("daemon binary not found; build `cargo build --release -p hipfire-daemon`")
-    })?;
+    let daemon = find_daemon(paths).ok_or_else(|| daemon_not_found_error(paths))?;
     let process_config = hipfire_config::ProcessConfig::from_resolved(&resolved)?;
     let mut engine = Engine::spawn_configured(
         &daemon,
@@ -2802,23 +2842,23 @@ fn run_command(paths: &Paths, args: RunArgs) -> Result<()> {
         Some(&model_path),
     )?;
     engine.ping()?;
-    let mut params = load_params(
+    let mut params = load_params_with_overrides(
         &resolved,
         entry,
         &paths.models,
         &model_path,
         max_tokens,
-        args.kv_mode.as_deref(),
-        args.kv_backend.as_deref(),
         canonical.as_deref(),
-        args.model_draft.is_some(),
-        args.head.as_deref(),
+        &LoadOverrides {
+            kv_mode: args.kv_mode.as_deref(),
+            kv_backend: args.kv_backend.as_deref(),
+            kv_k: args.kv_k.as_deref(),
+            kv_v: args.kv_v.as_deref(),
+            speculation: args.speculation.as_deref(),
+            head: args.head.as_deref(),
+            explicit_draft: args.model_draft.is_some(),
+        },
     )?;
-    apply_kv_axis_overrides(&mut params, args.kv_k.as_deref(), args.kv_v.as_deref())?;
-    let selector = args
-        .speculation
-        .clone()
-        .unwrap_or(config_string(&resolved, "speculation.mode")?);
     // Tensor-parallel load: forward `tp` like `bench --tp` / `serve --tp` so the
     // daemon takes the EP/dense-TP route instead of the single-GPU one.
     if let Some(tp) = args.tp.filter(|&tp| tp > 1) {
@@ -2828,10 +2868,6 @@ fn run_command(paths: &Paths, args: RunArgs) -> Result<()> {
     if let Some(max_seq) = args.max_seq {
         params["max_seq"] = serde_json::json!(max_seq);
     }
-    apply_speculation_selector(&mut params, &selector)?;
-    // Final effective selector wins: re-project inherited draft only when DFlash
-    // remains enabled (config-off + `run --spec dflash` must still carry draft).
-    project_dflash_draft(&mut params, developer_dflash_draft(&resolved));
     if let Some(draft) = &args.model_draft {
         params["draft"] = serde_json::json!(draft.display().to_string());
         if args.speculation.is_none() {
@@ -2967,9 +3003,28 @@ fn run_command(paths: &Paths, args: RunArgs) -> Result<()> {
     // End the streamed answer's line at `commit_ready`, before the commit is
     // sent, so later daemon stderr never lands on the answer's line.
     let mut line_ended = false;
-    let done = engine.generate(&request, |event| {
+    // Prefill progress redraws one stderr line, only on a terminal and never
+    // under `--json`; it is erased before the first token is written.
+    let mut prefill = prefill_progress::PrefillLine::new(
+        !args.json && std::io::stderr().is_terminal(),
+        Instant::now(),
+    );
+    let generated = engine.generate(&request, |event| {
         match event.get("type").and_then(serde_json::Value::as_str) {
+            Some("prefill_progress") => {
+                if let (Some(done), Some(total)) = (
+                    event.get("done").and_then(serde_json::Value::as_u64),
+                    event.get("total").and_then(serde_json::Value::as_u64),
+                ) {
+                    if let Some(draw) = prefill.update(done, total, Instant::now()) {
+                        eprint!("{draw}");
+                    }
+                }
+            }
             Some("token") => {
+                if let Some(erase) = prefill.clear() {
+                    eprint!("{erase}");
+                }
                 if let Some(text) = event.get("text").and_then(serde_json::Value::as_str) {
                     content.push_str(text);
                     if stream {
@@ -2979,6 +3034,9 @@ fn run_command(paths: &Paths, args: RunArgs) -> Result<()> {
                 }
             }
             Some("commit_ready") if stream && !line_ended => {
+                if let Some(erase) = prefill.clear() {
+                    eprint!("{erase}");
+                }
                 println!();
                 std::io::stdout().flush()?;
                 line_ended = true;
@@ -2986,7 +3044,12 @@ fn run_command(paths: &Paths, args: RunArgs) -> Result<()> {
             _ => {}
         }
         Ok(())
-    })?;
+    });
+    // Also covers an error or cancel before any token.
+    if let Some(erase) = prefill.clear() {
+        eprint!("{erase}");
+    }
+    let done = generated?;
     if let Some(message) = spill.as_mut().and_then(spill::SpillMonitor::check) {
         spill::emit(&message);
     }
@@ -3281,13 +3344,11 @@ fn img_command(paths: &Paths, args: ImgArgs) -> Result<()> {
                 args.model
             )
         } else {
-            anyhow!("model not found: {}", args.model)
+            model_not_found_error(paths, registry, &args.model)
         }
     })?;
     let resolved = resolved_for_model(paths, &args.model, canonical.as_deref(), entry)?;
-    let daemon = find_daemon(paths).ok_or_else(|| {
-        anyhow!("daemon binary not found; build `cargo build --release -p hipfire-daemon`")
-    })?;
+    let daemon = find_daemon(paths).ok_or_else(|| daemon_not_found_error(paths))?;
     let process_config = hipfire_config::ProcessConfig::from_resolved(&resolved)?;
     let engine = Engine::spawn_configured(
         &daemon,
@@ -3481,13 +3542,11 @@ fn embed_command(paths: &Paths, args: EmbedArgs) -> Result<()> {
             std::fs::canonicalize(&direct).unwrap_or(direct)
         } else {
             find_model_path(paths, registry, &args.model)
-                .ok_or_else(|| anyhow!("model not found: {}", args.model))?
+                .ok_or_else(|| model_not_found_error(paths, registry, &args.model))?
         }
     };
     let resolved = resolved_for_model(paths, &args.model, None, None)?;
-    let daemon = find_daemon(paths).ok_or_else(|| {
-        anyhow!("daemon binary not found; build `cargo build --release -p hipfire-daemon`")
-    })?;
+    let daemon = find_daemon(paths).ok_or_else(|| daemon_not_found_error(paths))?;
     let process_config = hipfire_config::ProcessConfig::from_resolved(&resolved)?;
     let engine = Engine::spawn_configured(
         &daemon,
@@ -3778,13 +3837,23 @@ fn run_via_http(
 
     let mut tokens = None;
     let mut timings = serde_json::Value::Null;
-    stream_openai_chat(
+    let mut prefill =
+        prefill_progress::PrefillLine::new(std::io::stderr().is_terminal(), Instant::now());
+    let streamed = stream_openai_chat(
         endpoint,
         body,
         timeout,
         |event| {
             match event {
+                OpenAiSseEvent::PrefillProgress { done, total } => {
+                    if let Some(draw) = prefill.update(done, total, Instant::now()) {
+                        eprint!("{draw}");
+                    }
+                }
                 OpenAiSseEvent::Reasoning { text } | OpenAiSseEvent::Content { text } => {
+                    if let Some(erase) = prefill.clear() {
+                        eprint!("{erase}");
+                    }
                     print!("{text}");
                     std::io::stdout().flush()?;
                 }
@@ -3801,7 +3870,11 @@ fn run_via_http(
             Ok(())
         },
         || false,
-    )?;
+    );
+    if let Some(erase) = prefill.clear() {
+        eprint!("{erase}");
+    }
+    streamed?;
     println!();
     if stats {
         eprintln!("{}", format_run_stats(tokens, &timings));
@@ -3923,6 +3996,7 @@ fn chat_command(paths: &Paths, args: ChatArgs) -> Result<()> {
                     | OpenAiSseEvent::ToolCall { .. }
                     | OpenAiSseEvent::Finish { .. }
                     | OpenAiSseEvent::Usage { .. }
+                    | OpenAiSseEvent::PrefillProgress { .. }
                     | OpenAiSseEvent::Done => {}
                 }
                 Ok(())
@@ -5046,6 +5120,70 @@ pub(crate) fn load_params(
     Ok(params)
 }
 
+/// One-shot per-load overrides layered over the resolved config: the flags
+/// `hipfire run` and `hipfire fit` share, so a dry-run admission and a real
+/// load build their params through one sequence.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct LoadOverrides<'a> {
+    pub kv_mode: Option<&'a str>,
+    pub kv_backend: Option<&'a str>,
+    pub kv_k: Option<&'a str>,
+    pub kv_v: Option<&'a str>,
+    /// `--spec`; absent means the resolved `speculation.mode`.
+    pub speculation: Option<&'a str>,
+    pub head: Option<&'a str>,
+    /// A CLI `--model-draft` will be projected by the caller.
+    pub explicit_draft: bool,
+}
+
+/// The speculation selector one load applies: the one-shot `--spec` value,
+/// else the resolved `speculation.mode`.
+pub(crate) fn effective_speculation_selector(
+    resolved: &hipfire_config::ResolvedConfig,
+    speculation: Option<&str>,
+) -> Result<String> {
+    match speculation {
+        Some(selector) => Ok(selector.to_owned()),
+        None => config_string(resolved, "speculation.mode"),
+    }
+}
+
+/// `load_params` plus the one-shot overrides `hipfire run` applies before it
+/// hands the params to the daemon: `--kv-k`/`--kv-v` axes, the effective
+/// speculation selector, and the DFlash draft projection that selector
+/// leaves enabled (config-off + `--spec dflash` must still carry the draft).
+/// Registry sidecar resolution for the final selector stays with the caller
+/// ([`resolve_dflash_sidecar`], [`resolve_mtp_sidecar`]).
+pub(crate) fn load_params_with_overrides(
+    resolved: &hipfire_config::ResolvedConfig,
+    entry: Option<&ModelEntry>,
+    models_dir: &Path,
+    model_path: &Path,
+    max_tokens: u64,
+    tag: Option<&str>,
+    overrides: &LoadOverrides<'_>,
+) -> Result<serde_json::Value> {
+    let mut params = load_params(
+        resolved,
+        entry,
+        models_dir,
+        model_path,
+        max_tokens,
+        overrides.kv_mode,
+        overrides.kv_backend,
+        tag,
+        overrides.explicit_draft,
+        overrides.head,
+    )?;
+    apply_kv_axis_overrides(&mut params, overrides.kv_k, overrides.kv_v)?;
+    let selector = effective_speculation_selector(resolved, overrides.speculation)?;
+    apply_speculation_selector(&mut params, &selector)?;
+    // Final effective selector wins: re-project inherited draft only when DFlash
+    // remains enabled.
+    project_dflash_draft(&mut params, developer_dflash_draft(resolved));
+    Ok(params)
+}
+
 /// Load params for the non-chat `embed` verb.
 ///
 /// The encoder consumes the vision ladder and an authored sequence bound;
@@ -5108,15 +5246,63 @@ pub(crate) fn resolve_dflash_sidecar(
     model_path: &Path,
     tag: Option<&str>,
 ) -> Result<()> {
+    match locate_dflash_sidecar(params, entry, models_dir, model_path)? {
+        DflashSidecar::Unresolved => {}
+        DflashSidecar::Found(candidate) => {
+            params["draft"] = serde_json::json!(candidate.display().to_string());
+        }
+        DflashSidecar::NotPulled(file) => {
+            if params["dflash_mode"].as_str() == Some("on") {
+                bail!(dflash_draft_not_pulled(&file, tag));
+            }
+            eprintln!(
+                "[hipfire] DFlash draft {file} not pulled; no paired draft, speculation falls back — `hipfire pull {}`",
+                tag.unwrap_or("<model>")
+            );
+        }
+    }
+    Ok(())
+}
+
+/// What [`locate_dflash_sidecar`] found for the final DFlash mode.
+pub(crate) enum DflashSidecar {
+    /// Nothing to wire: the final mode is `off`, a draft is already
+    /// projected, or the artifact declares no sidecar under `auto`.
+    Unresolved,
+    /// The declared sidecar is on disk.
+    Found(PathBuf),
+    /// The registry declares this sidecar file but it is not pulled.
+    NotPulled(String),
+}
+
+/// The `on`-mode refusal for a declared DFlash draft that is not pulled, worded
+/// once for the load and for `hipfire fit`.
+pub(crate) fn dflash_draft_not_pulled(file: &str, tag: Option<&str>) -> String {
+    format!(
+        "DFlash draft {file} is not pulled; run `hipfire pull {}` or set developer.dflash_draft",
+        tag.unwrap_or("<model>")
+    )
+}
+
+/// The lookup half of [`resolve_dflash_sidecar`], with no side effects: where
+/// the registry DFlash draft is (or that it is declared but not pulled) for
+/// the params' final `dflash_mode`. Errs exactly where the load refuses a
+/// DFlash `on` that has no declared draft at all.
+pub(crate) fn locate_dflash_sidecar(
+    params: &serde_json::Value,
+    entry: Option<&ModelEntry>,
+    models_dir: &Path,
+    model_path: &Path,
+) -> Result<DflashSidecar> {
     if !matches!(params["dflash_mode"].as_str(), Some("auto" | "on")) {
-        return Ok(());
+        return Ok(DflashSidecar::Unresolved);
     }
     if params
         .get("draft")
         .and_then(serde_json::Value::as_str)
         .is_some_and(|draft| !draft.is_empty())
     {
-        return Ok(());
+        return Ok(DflashSidecar::Unresolved);
     }
     let Some(sidecar) = entry.and_then(|entry| entry.dflash.as_ref()) else {
         if params["dflash_mode"].as_str() == Some("on") && model_path.is_file() {
@@ -5125,7 +5311,7 @@ pub(crate) fn resolve_dflash_sidecar(
                 model_path.display()
             );
         }
-        return Ok(());
+        return Ok(DflashSidecar::Unresolved);
     };
     let beside_target: Vec<PathBuf> = trunk_locations(model_path)
         .iter()
@@ -5140,22 +5326,10 @@ pub(crate) fn resolve_dflash_sidecar(
         .chain(beside_target.iter().map(PathBuf::as_path))
         .map(|dir| dir.join(&sidecar.file))
         .find(|candidate| candidate.is_file());
-    if let Some(candidate) = candidate {
-        params["draft"] = serde_json::json!(candidate.display().to_string());
-        return Ok(());
-    }
-    let tag = tag.unwrap_or("<model>");
-    if params["dflash_mode"].as_str() == Some("on") {
-        bail!(
-            "DFlash draft {} is not pulled; run `hipfire pull {tag}` or set developer.dflash_draft",
-            sidecar.file
-        );
-    }
-    eprintln!(
-        "[hipfire] DFlash draft {} not pulled; no paired draft, speculation falls back — `hipfire pull {tag}`",
-        sidecar.file
-    );
-    Ok(())
+    Ok(match candidate {
+        Some(candidate) => DflashSidecar::Found(candidate),
+        None => DflashSidecar::NotPulled(sidecar.file.clone()),
+    })
 }
 
 /// Resolve the Qwen MTP head sidecar into `params["mtp"]`.
@@ -7317,7 +7491,7 @@ fn open_bench_engine(
         // Do not hash a payload twice after a verified pull.
         path = find_model_path(paths, &registry, &args.model);
     }
-    let path = path.ok_or_else(|| anyhow!("model not found: {}", args.model))?;
+    let path = path.ok_or_else(|| model_not_found_error(paths, &registry, &args.model))?;
     let resolved = resolved_for_model(paths, &args.model, tag.as_deref(), entry.as_ref())?;
     ple::ensure_ple_sidecar(
         entry.as_ref(),
@@ -7338,7 +7512,7 @@ fn open_bench_engine(
     });
     let model_limit = run_need.and_then(|_| bench_declared_context(&path));
     let mut max_seq = plan_bench_max_seq(args.max_seq, run_need, model_limit, &args.model)?;
-    let daemon = find_daemon(paths).ok_or_else(|| anyhow!("daemon binary not found"))?;
+    let daemon = find_daemon(paths).ok_or_else(|| daemon_not_found_error(paths))?;
     let environment = BTreeMap::new();
     let mut process_config = hipfire_config::ProcessConfig::from_resolved(&resolved)?;
     if args.redline {
@@ -8119,7 +8293,7 @@ fn profile_command(paths: &Paths, args: ProfileArgs) -> Result<()> {
     } else {
         let (_, resolved) = resolved_global(paths, true)?;
         let process_config = hipfire_config::ProcessConfig::from_resolved(&resolved)?;
-        let daemon = find_daemon(paths).ok_or_else(|| anyhow!("daemon binary not found"))?;
+        let daemon = find_daemon(paths).ok_or_else(|| daemon_not_found_error(paths))?;
         let mut engine =
             Engine::spawn_configured(&daemon, &BTreeMap::new(), &process_config, None)?;
         engine.ping()?;
@@ -9294,7 +9468,7 @@ fn sidecar_command(paths: &Paths, args: SidecarArgs) -> Result<()> {
     }
     let registry = load_registry(&paths.registry).registry;
     let model = find_model_path(paths, &registry, &args.model)
-        .ok_or_else(|| anyhow!("model not found: {}", args.model))?;
+        .ok_or_else(|| model_not_found_error(paths, &registry, &args.model))?;
     let output = args
         .output
         .unwrap_or_else(|| PathBuf::from(format!("{}.triattn.bin", model.display())));
@@ -9852,6 +10026,21 @@ fn command_version(command: &str, argument: &str) -> Option<String> {
         .filter(|line| !line.is_empty())
 }
 
+/// The refusal for a missing daemon binary: the build command and the install
+/// path [`find_daemon_in`] probes for the daemon (its other candidates are the
+/// running executable's directory and the source-tree `target/`).
+pub(crate) fn daemon_not_found_error(paths: &Paths) -> anyhow::Error {
+    let installed = paths
+        .root
+        .join("bin")
+        .join(daemon_bin_names(cfg!(windows))[0]);
+    anyhow!(
+        "daemon binary not found; build `cargo build --release -p hipfire-daemon` (expected at \
+         {}, or set HIPFIRE_DAEMON_BIN)",
+        installed.display()
+    )
+}
+
 pub(crate) fn find_daemon(paths: &Paths) -> Option<PathBuf> {
     if let Some(path) = env::var_os("HIPFIRE_DAEMON_BIN").map(PathBuf::from) {
         if path.is_file() {
@@ -10097,6 +10286,25 @@ fn model_suggestions(registry: &RegistryV1, input: &str) -> String {
     if input.contains(std::path::MAIN_SEPARATOR) {
         return String::new();
     }
+    let mut message = String::new();
+    let close = close_model_tags(registry, input);
+    if !close.is_empty() {
+        message.push_str(&format!("\n  did you mean: {}?", close.join(", ")));
+    }
+    message.push_str("\n  see: hipfire list -r");
+    message
+}
+
+pub(crate) fn unknown_model_error(registry: &RegistryV1, input: &str) -> anyhow::Error {
+    anyhow!(
+        "unknown model '{input}'{}",
+        model_suggestions(registry, input)
+    )
+}
+
+/// Tags and aliases close to `input` (case-insensitive edit distance), nearest
+/// first, at most three.
+fn close_model_tags<'r>(registry: &'r RegistryV1, input: &str) -> Vec<&'r str> {
     let needle = input.to_lowercase();
     let limit = (needle.chars().count() / 4).max(2);
     let mut close = registry
@@ -10108,22 +10316,70 @@ fn model_suggestions(registry: &RegistryV1, input: &str) -> String {
         .collect::<Vec<_>>();
     close.sort_unstable();
     close.dedup_by(|a, b| a.1 == b.1);
-    let mut message = String::new();
-    if !close.is_empty() {
-        let tags = close
-            .iter()
-            .take(3)
-            .map(|(_, tag)| *tag)
-            .collect::<Vec<_>>();
-        message.push_str(&format!("\n  did you mean: {}?", tags.join(", ")));
-    }
-    message.push_str("\n  see: hipfire list -r");
-    message
+    close.into_iter().take(3).map(|(_, tag)| tag).collect()
 }
 
-pub(crate) fn unknown_model_error(registry: &RegistryV1, input: &str) -> anyhow::Error {
+/// Whether a model argument names a file rather than a registry tag: it has a
+/// path separator or ends in a model extension.
+fn looks_like_model_path(input: &str) -> bool {
+    const EXTENSIONS: &[&str] = &[
+        ".hfq",
+        ".hf4",
+        ".mq4",
+        ".mq3",
+        ".mq6",
+        ".mq8",
+        ".mq4r",
+        ".mq4-xt",
+        ".gguf",
+        ".safetensors",
+    ];
+    let lower = input.to_ascii_lowercase();
+    input.contains('/')
+        || input.contains('\\')
+        || EXTENSIONS
+            .iter()
+            .any(|extension| lower.ends_with(extension))
+}
+
+/// The refusal for a model argument that resolved to no local file, naming the
+/// expected file and the exact next command.
+///
+/// - a registry (or retired) entry: the file expected in the models dir, and
+///   `hipfire pull <tag>` when the entry is downloadable, else where to place it;
+/// - a path: the missing path and how to name a registry tag instead;
+/// - anything else: an unknown tag, with the registry's did-you-mean list and
+///   the pull command for the closest tag.
+pub(crate) fn model_not_found_error(
+    paths: &Paths,
+    registry: &RegistryV1,
+    input: &str,
+) -> anyhow::Error {
+    let card = model_card(paths, registry, input);
+    if let Some((tag, entry)) = card.pair() {
+        let expected = paths.models.join(&entry.file);
+        let fix = if card.pullable().is_some_and(|entry| !entry.repo.is_empty()) {
+            format!("fetch it: hipfire pull {tag}")
+        } else {
+            format!("place {} in {}", entry.file, paths.models.display())
+        };
+        return anyhow!(
+            "model not found: {tag} — expected {}, which is not on disk.\n  {fix}",
+            expected.display()
+        );
+    }
+    if looks_like_model_path(input) {
+        return anyhow!(
+            "model not found: {input} (no such file)\n  check the path, or use a registry tag: \
+             hipfire list -r"
+        );
+    }
+    let then = close_model_tags(registry, input)
+        .first()
+        .map(|tag| format!("\n  then: hipfire pull {tag}"))
+        .unwrap_or_default();
     anyhow!(
-        "unknown model '{input}'{}",
+        "model not found: {input}{}{then}",
         model_suggestions(registry, input)
     )
 }
@@ -12486,6 +12742,61 @@ effort = "high"
     }
 
     #[test]
+    fn config_explain_without_key_lists_every_setting_source_and_env_audit() {
+        let paths = settings_fixture("cfg-explain-all", None, None, Some(GFX1201));
+        // Fixture names are assembled at runtime so check-lifecycle.py does not
+        // read the typo / secret fixtures as variables the CLI reads.
+        let env_name = |suffix: &str| format!("HIPFIRE_{suffix}");
+        let env = hipfire_config::env_audit::audit_env([
+            (env_name("KVMODE"), "q8".to_owned()),
+            (env_name("DFLASH_CTX_CAP"), "1".to_owned()),
+            (env_name("API_KEY"), "hunter2".to_owned()),
+        ]);
+        let mut out = Vec::new();
+        config_view::explain_all_global_to(&paths, false, &env, &mut out).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.starts_with("Effective configuration (config.toml: "),
+            "{text}"
+        );
+        let kv = text
+            .lines()
+            .find(|line| line.trim_start().starts_with("memory.kv_cache "))
+            .unwrap_or_else(|| panic!("{text}"));
+        assert!(kv.ends_with("default · gfx1201"), "{kv}");
+        assert!(text.contains("\nenvironment\n"), "{text}");
+        assert!(
+            text.contains("UNKNOWN: not a hipfire variable (typo? did you mean HIPFIRE_KV_MODE)"),
+            "{text}"
+        );
+        assert!(
+            text.contains("DEPRECATED since 0.4.0, removed in 0.5.0: unset it"),
+            "{text}"
+        );
+        assert!(
+            text.contains("(set)") && !text.contains("hunter2"),
+            "{text}"
+        );
+        assert!(
+            text.ends_with("explain one key: hipfire config explain <key>\n"),
+            "{text}"
+        );
+
+        let mut out = Vec::new();
+        config_view::explain_all_global_to(&paths, true, &env, &mut out).unwrap();
+        let doc: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        let settings = doc["settings"].as_array().unwrap();
+        let kv = settings
+            .iter()
+            .find(|row| row["key"] == "memory.kv_cache")
+            .unwrap();
+        assert_eq!(kv["source"]["kind"], "default-arch");
+        assert_eq!(kv["source"]["label"], "default · gfx1201");
+        assert_eq!(doc["env"].as_array().unwrap().len(), 3);
+        let _ = fs::remove_dir_all(&paths.root);
+    }
+
+    #[test]
     pub(crate) fn resolved_for_model_tag_policy_is_overridable_by_user() {
         let paths = test_paths("registry-tag-policy-override");
         fs::create_dir_all(&paths.root).unwrap();
@@ -14209,6 +14520,89 @@ effort = "high"
         assert!(!message.contains("did you mean"), "{message}");
         assert!(message.contains("see: hipfire list -r"), "{message}");
         assert_eq!(edit_distance("kitten", "sitting"), 3);
+    }
+
+    #[test]
+    fn model_not_found_names_the_expected_file_and_the_pull_command() {
+        let paths = test_paths("model-not-found-tag");
+        let registry = rm_test_registry(&[("qwen3.5:4b", "qwen3.5-4b.mq4", None)]);
+        let message = model_not_found_error(&paths, &registry, "qwen3.5:4b").to_string();
+        let expected = format!(
+            "model not found: qwen3.5:4b — expected {}, which is not on disk.\n  fetch it: hipfire pull qwen3.5:4b",
+            paths.models.join("qwen3.5-4b.mq4").display()
+        );
+        assert_eq!(message, expected);
+        // The bare file name resolves to the same entry, so the tag is named.
+        let message = model_not_found_error(&paths, &registry, "qwen3.5-4b.mq4").to_string();
+        assert_eq!(message, expected);
+    }
+
+    #[test]
+    fn model_not_found_for_a_local_only_entry_says_where_to_place_it() {
+        let paths = test_paths("model-not-found-local-only");
+        let mut registry = rm_test_registry(&[("local:tune", "local-tune.mq4", None)]);
+        registry.models.get_mut("local:tune").unwrap().repo = String::new();
+        let message = model_not_found_error(&paths, &registry, "local:tune").to_string();
+        let expected = format!(
+            "model not found: local:tune — expected {}, which is not on disk.\n  place local-tune.mq4 in {}",
+            paths.models.join("local-tune.mq4").display(),
+            paths.models.display()
+        );
+        assert_eq!(message, expected);
+        assert!(!message.contains("hipfire pull"), "{message}");
+    }
+
+    #[test]
+    fn model_not_found_for_a_path_points_at_the_registry_tags() {
+        let paths = test_paths("model-not-found-path");
+        let registry = rm_test_registry(&[("qwen3.5:4b", "qwen3.5-4b.mq4", None)]);
+        for input in ["/nonexistent/dir/model.hfq", "no-separator.hfq"] {
+            let message = model_not_found_error(&paths, &registry, input).to_string();
+            assert_eq!(
+                message,
+                format!(
+                    "model not found: {input} (no such file)\n  check the path, or use a registry tag: hipfire list -r"
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn model_not_found_for_an_unknown_tag_keeps_the_suggestions_and_adds_the_pull() {
+        let paths = test_paths("model-not-found-unknown");
+        let registry = rm_test_registry(&[
+            ("qwen3.5:4b", "qwen3.5-4b.mq4", None),
+            ("qwen3.5:9b", "qwen3.5-9b.mq4", None),
+        ]);
+        let message = model_not_found_error(&paths, &registry, "qwen3.5:4bb").to_string();
+        assert!(
+            message.starts_with("model not found: qwen3.5:4bb"),
+            "{message}"
+        );
+        assert!(message.contains("did you mean: qwen3.5:4b"), "{message}");
+        assert!(message.contains("see: hipfire list -r"), "{message}");
+        assert!(
+            message.ends_with("then: hipfire pull qwen3.5:4b"),
+            "{message}"
+        );
+        let message = model_not_found_error(&paths, &registry, "llama3:8b").to_string();
+        assert!(!message.contains("did you mean"), "{message}");
+        assert!(!message.contains("then:"), "{message}");
+        assert!(message.ends_with("see: hipfire list -r"), "{message}");
+    }
+
+    #[test]
+    fn daemon_not_found_names_the_build_command_and_the_install_path() {
+        let paths = test_paths("daemon-not-found");
+        let message = daemon_not_found_error(&paths).to_string();
+        assert!(
+            message.contains("build `cargo build --release -p hipfire-daemon`"),
+            "{message}"
+        );
+        assert!(
+            message.contains(&paths.root.join("bin").display().to_string()),
+            "{message}"
+        );
     }
 
     #[test]
@@ -17448,6 +17842,7 @@ effort = "high"
                     OpenAiSseEvent::Finish { reason, .. } => cap.finish = Some(reason),
                     OpenAiSseEvent::Usage { usage } => cap.usage = Some(usage),
                     OpenAiSseEvent::Done => cap.saw_done = true,
+                    OpenAiSseEvent::PrefillProgress { .. } => {}
                 }
                 Ok(())
             },
@@ -21093,6 +21488,60 @@ effort = "high"
             assert_eq!(got, 400, "max_tokens=0 stream={stream}");
             assert!(String::from_utf8_lossy(&raw).contains("max_tokens"));
         }
+    }
+
+    /// Daemon prefill progress precedes the first token, i.e. the commit: it
+    /// must not commit the stream early (an error right after it is still a
+    /// JSON error with its real status) and must not leak into a committed
+    /// body that has not yet needed a keepalive.
+    #[cfg(unix)]
+    #[test]
+    fn prefill_progress_does_not_commit_or_corrupt_responses() {
+        let harness = Task11HttpHarness::spawn("prefill-progress");
+        let port = harness.port();
+        for stream in [false, true] {
+            let (status, head, body) = raw_chat_post(
+                port,
+                &harness.base_body("t43-prefill-progress-error", stream),
+            );
+            assert_eq!(status, 400, "stream={stream}: {head}");
+            assert!(head.contains("content-type: application/json"), "{head}");
+            let err: serde_json::Value = serde_json::from_slice(&body)
+                .unwrap_or_else(|e| panic!("one JSON error body ({e}): {body:?}"));
+            assert!(
+                err.pointer("/error/message")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|m| m.contains("validation failed after prefill")),
+                "{err}"
+            );
+        }
+
+        let (status, _, body) =
+            raw_chat_post(port, &harness.base_body("t43-prefill-progress", false));
+        assert_eq!(status, 200);
+        let reply: serde_json::Value = serde_json::from_slice(&body).expect("one JSON body");
+        assert_eq!(
+            reply.pointer("/choices/0/message/content"),
+            Some(&serde_json::json!("hello from fake daemon"))
+        );
+
+        let (status, _, body) =
+            raw_chat_post(port, &harness.base_body("t43-prefill-progress", true));
+        assert_eq!(status, 200);
+        let text = String::from_utf8_lossy(&body);
+        assert!(
+            !text.contains(": prefill"),
+            "progress predates commit: {text}"
+        );
+        let payloads = sse_payloads(&body);
+        assert!(
+            payloads[1].contains("hello from fake daemon"),
+            "{payloads:?}"
+        );
+        assert_eq!(payloads.last().map(String::as_str), Some("[DONE]"));
+        let cap = capture_stream(port, harness.base_body("t43-prefill-progress", true))
+            .expect("stream parses");
+        assert_eq!(cap.content, "hello from fake daemon");
     }
 
     /// A stream that fails after it committed ends with an OpenAI error event

@@ -1714,6 +1714,23 @@ fn launch_gemv<'a>(
             )
         }
         (GemvInput::Raw(x), Some(residual)) => {
+            // GGUF-native weights: the mmvq accumulate export adds `W·x` into
+            // the residual stream in the same launch (no scratch, no add).
+            if w.dtype.is_ggml() {
+                return gemv.run(
+                    ctx,
+                    gpu,
+                    &GemvParams {
+                        w,
+                        x,
+                        y: residual,
+                        variant: GemvVariant::WithResidual,
+                        residual: None,
+                        gate: None,
+                        up: None,
+                    },
+                );
+            }
             // A row-restricted raw-residual step would need a row-offset scratch and
             // a row-offset accumulate for the non-fused fallback below; refuse rather
             // than launch a whole-tensor add into a row view. (The pass-back's gate

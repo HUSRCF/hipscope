@@ -364,8 +364,7 @@ impl Node for LaneProj {
             "weights": "MQ4G256V2 (8 groups x 136 B per row), Small scales, seeded",
             "x": "f32 [lanes][2048], seeded random in [-2, 2)",
             "y": "f32 [lanes][m_s] per segment (overwritten)",
-            "timing_pool": {"sets": sets, "bytes_per_set": self.set_bytes(),
-                "total_bytes": sets * self.set_bytes(), "dispatch_i_uses_set": "i % sets"},
+            "timing_pool": crate::cold::pool_json(sets, self.set_bytes()),
         })
     }
     fn incumbent(&self) -> Result<Incumbent> {

@@ -345,7 +345,23 @@ fn main() {
     // HFQ header is authoritative for file models; for safetensors dirs we
     // probe SafetensorsSource. This is byte-identical to calib_sweep's
     // `arch = arg("--arch").unwrap_or(hfq.arch_id)` dispatch.
-    let arch_id: u32 = if args.model.is_dir() {
+    // GGUF-native model (`HIPFIRE_GGUF_NATIVE=1`; refuses with `load refused:` when
+    // the switch is off): the file is parsed, admitted per tensor and its bpw
+    // census / G3 badge logged before any GPU weight upload.
+    let gguf_model = if args.model.extension().is_some_and(|e| e == "gguf") {
+        Some(
+            hipfire_loader::gguf_native::GgufNativeModel::open(&args.model).unwrap_or_else(|e| {
+                eprintln!("{e}");
+                std::process::exit(1)
+            }),
+        )
+    } else {
+        None
+    };
+    let arch_id: u32 = if let Some(m) = &gguf_model {
+        eprintln!("eval_hipfire: detected arch_id={} (GGUF)", m.arch_id);
+        m.arch_id
+    } else if args.model.is_dir() {
         let src = hipfire_runtime::safetensors_source::SafetensorsSource::open(&args.model)
             .unwrap_or_else(|e| {
                 eprintln!("safetensors open {}: {e}", args.model.display());
@@ -709,7 +725,11 @@ fn main() {
 
         // Auto-route safetensors directories (ParoQuant / AWQ / HF native) — mirrors
         // daemon.rs:1500-1504. HFQ files take the canonical HFQ path below.
-        let (config, weights) = if args.model.is_dir() {
+        let (config, weights) = if let Some(m) = &gguf_model {
+            eprintln!("  loading via GGUF-native source arch_id={arch_id}");
+            let weights = m.load_qwen35_weights(&mut gpu).expect("load GGUF weights");
+            (m.hparams.config.clone(), weights)
+        } else if args.model.is_dir() {
             use hipfire_runtime::safetensors_source::SafetensorsSource;
             let source = SafetensorsSource::open(&args.model).expect("safetensors open");
             let config = qwen35::config_from_safetensors(&source).expect("config_from_safetensors");

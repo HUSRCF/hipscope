@@ -358,6 +358,9 @@ pub struct ScratchState {
     /// Dedicated F32 temporary for the unfused GEMV-residual alias fallback.
     /// Lazily allocated and grown on demand; no other scratch path uses it.
     pub gemv_residual_tmp: Option<GpuTensor>,
+    /// GGUF-native route scratch (q8_1 activation row, prefill dequantisation
+    /// region); see [`crate::ggml_ops`].
+    pub ggml: crate::ggml_ops::GgmlScratch,
     /// Int8 activation scratch `(xq, dx)` of the opt-in exact-gfx1100
     /// small-batch verify GEMV (`gemv_q8x.rs`), allocated on first use.
     pub q8x_act: Option<(GpuTensor, GpuTensor)>,

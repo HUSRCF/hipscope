@@ -1409,6 +1409,13 @@ pub fn generate_vl(
                 break;
             }
             start = end;
+            crate::common::emit_prefill_progress(
+                stdout,
+                id,
+                Some(active_attempt_id()),
+                end,
+                prompt_tokens.len(),
+            );
         }
         // Drop the scope before decode (and before any terminal below).
         let released = guard.release(gpu);

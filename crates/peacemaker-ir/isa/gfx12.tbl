@@ -81,6 +81,7 @@ v_add_f32_e32	vop2	0x3	VDST:32,SRC0:32,VSRC1:32	VDST	SRC0,VSRC1	-	-	v_add_f32_e3
 v_sub_f32_e32	vop2	0x4	VDST:32,SRC0:32,VSRC1:32	VDST	SRC0,VSRC1	-	-	v_sub_f32_e32 v174, v209, v173	095D5BD1	-
 v_mul_f32_e32	vop2	0x8	VDST:32,SRC0:32,VSRC1:32	VDST	SRC0,VSRC1	-	-	v_mul_f32_e32 v194, s2, v3	11840602	-
 v_mul_u32_u24_e32	vop2	0xb	VDST:32,SRC0:32,VSRC1:32,literal@last	VDST	SRC0,VSRC1	-	-	v_mul_u32_u24_e32 v8, 0x408, v8	161010FF 00000408	-
+v_mul_hi_u32_u24_e32	vop2	0xc	VDST:32,SRC0:32,VSRC1:32,literal@last	VDST	SRC0,VSRC1	-	-	v_mul_hi_u32_u24_e32 v2, 36, v12	180418A4	-
 v_min_i32_e32	vop2	0x11	VDST:32,SRC0:32,VSRC1:32	VDST	SRC0,VSRC1	-	-	v_min_i32_e32 v8, s15, v8	2210100F	-
 v_max_i32_e32	vop2	0x12	VDST:32,SRC0:32,VSRC1:32	VDST	SRC0,VSRC1	-	-	v_max_i32_e32 v9, 0, v9	24121280	-
 v_min_u32_e32	vop2	0x13	VDST:32,SRC0:32,VSRC1:32	VDST	SRC0,VSRC1	-	-	v_min_u32_e32 v11, s15, v11	2616160F	-
@@ -365,6 +366,7 @@ v_mul_i32_i24_e32	vop2	0x9	VDST:32,SRC0:32,VSRC1:32	VDST	SRC0,VSRC1	-	-	v_mul_i3
 v_perm_b32	vop3	0x244	VDST:32,SRC0:32,SRC1:32,SRC2:32,literal@last	VDST	SRC0,SRC1,SRC2	-	-	v_perm_b32 v25, v19, v21, 0x504010c	D6440019 03FE2B13 0504010C	neg:honored:0x7,abs:honored:0x7,omod:ignored:0x3:0x0/0x1/0x2/0x3
 v_pk_fma_f16	vop3p	0xe	VDST:32,SRC0:32,SRC1:32,SRC2:32	VDST	SRC0,SRC1,SRC2	-	-	v_pk_fma_f16 v12, v12, s3, s16	CC0E400C 1840070C	w0_extra:ignored:0x800000:0x0
 v_pk_mul_f16	vop3p	0x10	VDST:32,SRC0:32,SRC1:32	VDST	SRC0,SRC1	-	-	v_pk_mul_f16 v33, v12, v33	CC104021 1A02430C	w0_extra:ignored:0x800000:0x0,src2_unused:ignored:0x1ff:0x00/0x80/0x101
+v_pk_lshrrev_b16	vop3p	0x5	VDST:32,SRC0:32,SRC1:32	VDST	SRC0,SRC1	-	-	v_pk_lshrrev_b16 v20, 8, v20 op_sel:[1,0] op_sel_hi:[0,0]	CC054814 02022888	w0_extra:ignored:0x800000:0x0,src2_unused:ignored:0x1ff:0x00/0x80/0x101
 v_pk_add_f16	vop3p	0xf	VDST:32,SRC0:32,SRC1:32,literal@last	VDST	SRC0,SRC1	-	-	v_pk_add_f16 v64, 0xe480, v64 op_sel_hi:[0,1]	CC0F4040 120280FF 0000E480	w0_extra:ignored:0x800000:0x0,src2_unused:ignored:0x1ff:0x00/0x80/0x101
 v_rcp_iflag_f32_e32	vop1	0x2b	VDST:32,SRC0:32	VDST	SRC0	-	-	v_rcp_iflag_f32_e32 v1, v1	7E025701	w0_extra:ignored:0x10000:0x0
 v_rsq_f32_e32	vop1	0x2e	VDST:32,SRC0:32	VDST	SRC0	-	-	v_rsq_f32_e32 v0, v0	7E005D00	w0_extra:ignored:0x10000:0x0

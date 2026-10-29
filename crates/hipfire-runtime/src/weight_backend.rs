@@ -154,6 +154,7 @@ pub fn embedding_format_dtype(fmt: EmbeddingFormat) -> DType {
         EmbeddingFormat::HFQ4G128 => DType::HFQ4G128,
         EmbeddingFormat::Q8_0 => DType::Q8_0,
         EmbeddingFormat::F32 => DType::F32,
+        EmbeddingFormat::Ggml(dtype) => dtype,
         EmbeddingFormat::Q4K => panic!("embedding_format_dtype: Q4K not valid for tied lm_head"),
     }
 }

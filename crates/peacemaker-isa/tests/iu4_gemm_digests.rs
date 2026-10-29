@@ -132,8 +132,8 @@ fn iu4_gemm_emit_digests_pinned() {
 /// The shipped 27B gate/up export (`gemm_mq4g256v2_gate_up_silu_mmq_iu4_b1s`, `Tune::shipped_gate_up_slab`): the sha256 of
 /// its `emit(spec).s_text` and of the symbol's code in the committed `_b1s` module (see `native_identity.rs`).
 const PINNED_GATE_UP_SLAB_WINDOW: (&str, &str) = (
-    "k128-128x128x8-cacc1-slab-silu-wwindow",
-    "c0a0d9584718bbbbe4a3f64b8fbe2387110dd9702eee31ad717e94ebaee9f7ad",
+    "k128-128x128x8-cacc1-slab-silu-wwindow-fschain",
+    "baf26d529895ede82d7484ed851ced347fa777c28bc9c869d219bbf6a67fdacc",
 );
 
 fn gate_up_slab(tune: Tune) -> Spec {

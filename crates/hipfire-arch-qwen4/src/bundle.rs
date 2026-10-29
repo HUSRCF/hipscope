@@ -48,6 +48,7 @@ use std::time::Duration;
 
 #[path = "session_pair.rs"]
 mod session_pair;
+pub(crate) use session_pair::with_sp_identity;
 #[cfg(any(test, feature = "lab", feature = "reference-parity"))]
 pub(crate) use session_pair::SlowlinkFailPoint;
 #[cfg(any(test, feature = "lab", feature = "reference-parity"))]
@@ -1611,6 +1612,10 @@ impl Qwen4Bundle {
                 .unwrap_or_else(|| requested.min(1536)),
         };
         eprintln!("  qwen4 prefill chunk: {max_chunk} rows (requested {requested})");
+        hipfire_config::load_summary::note(
+            hipfire_config::load_summary::Facet::Prefill,
+            format!("chunk {max_chunk} rows"),
+        );
         let attempt = Qwen4GpuForward::new_inner(
             gpu,
             self,
@@ -4479,6 +4484,10 @@ impl Qwen4Bundle {
                 self.session_at_boundary(gpu, &prompt[..end])?;
             }
             pos = end;
+            // `prefill_progress`: rows this request computes (the restored
+            // `reused` prefix is in neither count). Silent outside the
+            // prompt phase and once `pos` reaches the end.
+            hipfire_runtime::prefill_progress::report(pos - reused, prompt.len() - reused);
         }
         self.slowlink_record_incumbent(reused, &windows);
         Ok(())

@@ -50,6 +50,9 @@ mod gemma4_ext;
 mod gemma4_ops;
 pub mod gemv;
 mod gemv_q8x;
+pub mod ggml_convert;
+pub mod ggml_mmvq;
+pub mod ggml_ops;
 #[cfg(test)]
 mod gpu_test;
 pub mod graph;

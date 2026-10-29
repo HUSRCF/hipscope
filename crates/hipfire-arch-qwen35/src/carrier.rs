@@ -696,17 +696,25 @@ fn plan_qwen35_gpu_stages(config: &Qwen35Config, ctx: &LoadCtx) -> Result<Qwen35
     )
     .map_err(|e| e.to_string())?;
     let mode = pair.k();
-    match pair {
-        kv_mode::KvPair::Native(_) => eprintln!(
-            "  KV cache: requested mode={mode_raw}, effective KV={}",
+    let effective = match pair {
+        kv_mode::KvPair::Native(_) => kv_mode::qwen_k_display_name(mode).to_string(),
+        kv_mode::KvPair::Split(_, v) => format!(
+            "K={} V={}",
             kv_mode::qwen_k_display_name(mode),
+            kv_mode::qwen_v_display_name(v),
         ),
+    };
+    match pair {
+        kv_mode::KvPair::Native(_) => {
+            eprintln!("  KV cache: requested mode={mode_raw}, effective KV={effective}")
+        }
         kv_mode::KvPair::Split(_, v) => eprintln!(
             "  KV cache: requested mode={mode_raw}, effective K={}, effective V={}",
             kv_mode::qwen_k_display_name(mode),
             kv_mode::qwen_v_display_name(v),
         ),
     }
+    hipfire_config::load_summary::note(hipfire_config::load_summary::Facet::Kv, effective);
 
     validate_native_kv_admission(mode, config, ctx, adaptive_req.is_some(), v_raw.is_some())?;
     validate_adaptive_cask_handoff(

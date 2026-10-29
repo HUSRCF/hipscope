@@ -666,6 +666,35 @@ fn for_gemv_prerotated_falls_back_to_plain_for_non_rotated() {
     );
 }
 
+/// GGUF block formats have no kernel yet: no gemv key, and the generic
+/// execution gate refuses them by name instead of reinterpreting the bytes.
+#[test]
+fn ggml_dtypes_have_no_kernel_and_are_refused_by_name() {
+    for dtype in [
+        DType::GgmlQ4K,
+        DType::GgmlQ5K,
+        DType::GgmlQ6K,
+        DType::GgmlQ8_0,
+        DType::GgmlIQ4XS,
+    ] {
+        assert!(
+            KernelKey::for_gemv(dtype, GemvVariant::Plain, false).is_err(),
+            "{dtype:?} must have no plain gemv key"
+        );
+        assert!(KernelKey::for_gemv_prerotated(dtype).is_err(), "{dtype:?}");
+        let err = crate::pipeline::batched::reject_typed_only_format(dtype)
+            .expect_err("the execution gate must refuse a ggml dtype");
+        let text = err.to_string();
+        assert!(
+            text.contains(dtype.ggml_name().unwrap()) && text.contains("no ggml kernel"),
+            "{text}"
+        );
+    }
+    // the legacy llama dtypes are untouched by the new gate.
+    assert!(crate::pipeline::batched::reject_typed_only_format(DType::Q4K).is_ok());
+    assert!(crate::pipeline::batched::reject_typed_only_format(DType::Q8_0).is_ok());
+}
+
 #[test]
 fn for_gemv_residual_maps_hfq_and_mq() {
     let cases = [
@@ -779,6 +808,11 @@ const ALL_DTYPES: &[DType] = &[
     DType::MQ2I4G128R128,
     DType::E8PI4G128R256,
     DType::E8PI4G128R128,
+    DType::GgmlQ4K,
+    DType::GgmlQ5K,
+    DType::GgmlQ6K,
+    DType::GgmlQ8_0,
+    DType::GgmlIQ4XS,
 ];
 
 /// Registered keys that are KNOWN to have no dispatch arm today. Each entry is

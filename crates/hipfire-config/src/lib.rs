@@ -15,10 +15,12 @@ pub mod effective;
 pub mod emu;
 pub mod emu_budget;
 pub mod emu_model;
+pub mod env_audit;
 pub mod evidence;
 pub mod host_memory;
 pub mod http_auth;
 pub mod intent;
+pub mod load_summary;
 pub mod rocm;
 pub mod secret;
 pub mod tuning;
@@ -4075,6 +4077,8 @@ const TYPED_BOOL_DEVELOPER_KEYS: &[&str] = &[
     "developer.qwen4_d2_default",
     "developer.qwen4_expert_cache",
     "developer.qwen4_mtp_head_d2",
+    "developer.qwen4_sp",
+    "developer.qwen4_sp_touched",
     "developer.moe_sym_iu4",
     "developer.qwen4_slowlink_prefill",
     "developer.gdn_qk_indexed",
@@ -7107,6 +7111,76 @@ mod tests {
                 Some(want),
                 "{raw}"
             );
+        }
+    }
+
+    #[test]
+    fn qwen4_sp_is_a_typed_bool_developer_key_unset_follows_the_arch_default() {
+        const KEY: &str = "developer.qwen4_sp";
+        const ENV: &str = "HIPFIRE_QWEN4_SP";
+        assert!(is_developer_key(KEY));
+        assert!(is_typed_bool_developer_key(KEY));
+        assert_eq!(developer_key_for_env(ENV).as_deref(), Some(KEY));
+        // Unset is None (the consumer applies the gfx1100 default); each spelling reads as a bool.
+        assert_eq!(typed_developer_bool_value(ENV, None), None);
+        for (raw, want) in [("1", true), ("true", true), ("0", false), ("false", false)] {
+            assert_eq!(
+                typed_developer_bool_value(ENV, Some(raw)),
+                Some(want),
+                "{raw}"
+            );
+            let mut layer = ConfigLayer::default();
+            layer.set_cli(KEY, raw).unwrap();
+            assert_eq!(layer.get(KEY), Some(&ConfigValue::Bool(want)), "{raw}");
+            layer.validate().unwrap();
+        }
+        // Garbage is rejected when the layer is built, never silently ignored.
+        for bad in ["", "2", "on", "off", "yes", "maybe"] {
+            let mut layer = ConfigLayer::default();
+            let error = layer.set_cli(KEY, bad).unwrap_err();
+            assert!(
+                matches!(&error, ConfigError::InvalidValue { key, .. } if key == KEY),
+                "{bad:?}: {error}"
+            );
+            assert!(layer.values.is_empty(), "{bad:?} must not be stored");
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "HIPFIRE_QWEN4_SP")]
+    fn qwen4_sp_panics_on_an_unparseable_snapshot_value() {
+        typed_developer_bool_value("HIPFIRE_QWEN4_SP", Some("garbage"));
+    }
+
+    #[test]
+    fn qwen4_sp_touched_is_a_typed_bool_developer_key_unset_follows_the_arch_default() {
+        const KEY: &str = "developer.qwen4_sp_touched";
+        const ENV: &str = "HIPFIRE_QWEN4_SP_TOUCHED";
+        assert!(is_developer_key(KEY));
+        assert!(is_typed_bool_developer_key(KEY));
+        assert_eq!(developer_key_for_env(ENV).as_deref(), Some(KEY));
+        assert_ne!(KEY, "developer.qwen4_sp");
+        // Unset is None: the consumer applies the gfx1100 default (not a config-level on/off).
+        assert_eq!(typed_developer_bool_value(ENV, None), None);
+        for (raw, want) in [("1", true), ("true", true), ("0", false), ("false", false)] {
+            assert_eq!(
+                typed_developer_bool_value(ENV, Some(raw)),
+                Some(want),
+                "{raw}"
+            );
+            let mut layer = ConfigLayer::default();
+            layer.set_cli(KEY, raw).unwrap();
+            assert_eq!(layer.get(KEY), Some(&ConfigValue::Bool(want)), "{raw}");
+            layer.validate().unwrap();
+        }
+        for bad in ["", "2", "on", "off", "yes", "maybe"] {
+            let mut layer = ConfigLayer::default();
+            let error = layer.set_cli(KEY, bad).unwrap_err();
+            assert!(
+                matches!(&error, ConfigError::InvalidValue { key, .. } if key == KEY),
+                "{bad:?}: {error}"
+            );
+            assert!(layer.values.is_empty(), "{bad:?} must not be stored");
         }
     }
 
@@ -10469,6 +10543,33 @@ pub mod memory {
     /// same load (non-EP), otherwise the head keeps the GPU route.
     pub fn qwen4_mtp_head_d2() -> Option<bool> {
         super::developer_typed_bool("HIPFIRE_QWEN4_MTP_HEAD_D2")
+    }
+
+    /// `developer.qwen4_sp` (env `HIPFIRE_QWEN4_SP`), a typed boolean read once
+    /// per Qwen4 load by the S1 short-prompt prefill hook (SP: stream the
+    /// top-k* experts, run the rest on the CPU, one canonical combine). `None`
+    /// (unset) follows the arch default, which the consumer resolves
+    /// (`slowlink_sp::hybrid_knob_for`): **on for exact gfx1100**, off elsewhere. An
+    /// explicit `false`/`0` is the kill switch; an explicit `true`/`1` asks for it on any arch
+    /// (every arch but gfx1100 declines it by name). SP additionally needs an admitted S1
+    /// profile, gfx1100 and the other load-time admission rules; a failed rule declines it by
+    /// name and, with `developer.qwen4_sp_touched` on, the touched-only mode runs instead.
+    pub fn qwen4_sp() -> Option<bool> {
+        super::developer_typed_bool("HIPFIRE_QWEN4_SP")
+    }
+
+    /// `developer.qwen4_sp_touched` (env `HIPFIRE_QWEN4_SP_TOUCHED`), a typed
+    /// boolean read once per Qwen4 load by the S1 short-prompt prefill hook's
+    /// touched-only mode (SP `TouchedOnly`: stream exactly the experts a layer
+    /// routes to, run S1's own per-panel pipeline over them, no CPU expert, byte-identical
+    /// to the stream-all sweep). `None` (unset) follows the arch default, which the
+    /// consumer resolves (`slowlink_sp::touched_knob_for`): **on for exact gfx1100**, off
+    /// elsewhere. An explicit `false`/`0` is the kill switch; an explicit `true`/`1` asks for it on
+    /// any arch (every arch but gfx1100 declines it by name: only gfx1100 is calibrated). It needs
+    /// an admitted S1 profile, gfx1100 and an aggregate window route; a failed rule declines it
+    /// by name. With `developer.qwen4_sp` also on, the hybrid SP mode wins.
+    pub fn qwen4_sp_touched() -> Option<bool> {
+        super::developer_typed_bool("HIPFIRE_QWEN4_SP_TOUCHED")
     }
 
     /// Developer kill switch `HIPFIRE_QWEN4_DIRECT_LOAD` for the discrete-GPU

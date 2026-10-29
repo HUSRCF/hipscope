@@ -69,6 +69,17 @@
 //! `identical_to_baseline`. Dense 128x128x8 ring-2 `wait after|window` only (`Spec::validate`
 //! refuses the rest with the reason).
 //!
+//! # `--base-shipped b1s|v64`
+//! Which SHIPPED export is the baseline (default `b1s`, the prefill export). `v64` selects the small-N export the
+//! DFlash verify launches for `n <= 128` rows (`iu4_gemm::verify64_tune`: window schedule, PairW fetches, dead-half
+//! skip; byte-identical outputs): dense slab 128x128x8 `set|add|silu` only (`--alayout slab`), and it excludes the
+//! `--base-<knob>` emitted baselines. The baseline's recorded knobs then name its real schedule. The emitted twin of
+//! that export is `--wait window --fetch pairw --idle skiphi` (code sha equal to the shipped export's).
+//!
+//! # `--pool` / `--flush-l2` / `--flush` (cold timing)
+//! Cold-cache timing with a rotating weight pool, see the doc comment of `pm_loop.rs`. The pool holds distinct seeded
+//! weight sets (`pool_seed`; gate and up for silu), set 0 being the correctness weights; sparse arms are refused.
+//!
 //! # Extra knobs
 //! `ref-rows`: `full` (default while `M*N*K <= 2e9` MACs) or `sample:<n>`
 //! (default `sample:192` beyond that): rows `0..64`, the last 64, and `n`
@@ -90,7 +101,7 @@
 use crate::common::{contains, dev_err, put_i32, put_ptr, sha256_hex};
 use crate::workload::{Arm, Knobs, Launch, Object, RefReport, Result, Workload};
 use peacemaker_isa::kernels::iu4_gemm::{
-    self, sparse24, ALayout, Epi, FoldOp, Mma, RingDepth, Spec, Tune,
+    self, sparse24, verify64_tune, ALayout, Epi, FoldOp, Mma, RingDepth, Spec, Tile, Tune,
 };
 use peacemaker_isa::Arch;
 use rayon::prelude::*;
@@ -106,6 +117,15 @@ const FULL_REF_MACS: u128 = 2_000_000_000;
 const SPARSE_GROUPS: usize = 32;
 const SPARSE_KEPT: usize = 2;
 const DEFAULT_SPARSE_SEED: u64 = 0x5eed_2404_a5a5_c3c3;
+/// Seeds of the gate and up weights of the correctness set (`Host::synth`); pool set `s >= 1`
+/// derives its seeds with [`pool_seed`].
+const GATE_SEED: u64 = 0x9e37_79b9_7f4a_7c15;
+const UP_SEED: u64 = 0xd1b5_4a32_d192_ed03;
+
+/// Seed of weight set `set` of the `--flush` timing pool (set 0 is the correctness set itself).
+pub fn pool_seed(base: u64, set: usize) -> u64 {
+    base ^ (set as u64).wrapping_mul(0xa076_1d64_78bd_642f)
+}
 
 /// xorshift64*.
 struct Rng(u64);
@@ -154,7 +174,7 @@ fn f16_val(b: u16) -> f32 {
     half::f16::from_bits(b).to_f32()
 }
 
-fn synth_weights(m: usize, k: usize, seed: u64) -> Vec<u8> {
+pub fn synth_weights(m: usize, k: usize, seed: u64) -> Vec<u8> {
     let gpr = k / 256;
     let mut rng = Rng::new(seed);
     let mut w = vec![0u8; m * gpr * GROUP_BYTES];
@@ -196,9 +216,9 @@ fn quantize_block(x: &[f32; 128]) -> [u8; REC] {
 
 impl Host {
     pub fn synth(m: usize, n: usize, k: usize, silu: bool) -> Self {
-        let w = synth_weights(m, k, 0x9e37_79b9_7f4a_7c15);
+        let w = synth_weights(m, k, GATE_SEED);
         let w_up = if silu {
-            synth_weights(m, k, 0xd1b5_4a32_d192_ed03)
+            synth_weights(m, k, UP_SEED)
         } else {
             Vec::new()
         };
@@ -517,6 +537,8 @@ struct Dev {
     xq_slab: hip_bridge::DeviceBuffer,
     /// Indexed by [`arm_index`].
     y: [hip_bridge::DeviceBuffer; 2],
+    /// `--flush` pool: weight sets `1..pool_sets()` (gate, up) next to the correctness set 0.
+    pool: Vec<(hip_bridge::DeviceBuffer, Option<hip_bridge::DeviceBuffer>)>,
 }
 
 fn arm_index(arm: Arm) -> usize {
@@ -549,6 +571,8 @@ pub struct Iu4 {
     sparse_seed: u64,
     /// `--rip`: the candidate arm is this source, not `iu4_gemm::emit`.
     rip: Option<RipSource>,
+    /// `--pool` / `--flush-l2` / `--flush`: cold-cache timing with the rotating weight pool (`Workload::set_cold`).
+    cold: crate::cold::ColdMode,
 }
 
 struct RipSource {
@@ -726,7 +750,7 @@ pub fn new_with_rip(
             base_emitted = true;
         }
     }
-    let base = if base_emitted {
+    let mut base = if base_emitted {
         base_strs.spec()?
     } else {
         // The shipped bundle: production tile, K128/cacc1, the candidate's layout and epilogue.
@@ -747,6 +771,28 @@ pub fn new_with_rip(
             ..Spec::control(cand.epi)
         }
     };
+    // `--base-shipped v64`: the baseline is the shipped small-N `_v64` export (`verify64_tune`), the
+    // object the 27B DFlash verify launches for n <= 128 rows; `b1s` (default) is the shipped
+    // `_b1s` export.
+    match knobs.take("base-shipped").as_deref() {
+        None | Some("b1s") => {}
+        Some(v @ "v64") => {
+            if base_emitted {
+                return Err(format!(
+                    "--base-shipped {v} selects a shipped export; it excludes the emitted-baseline knobs (--base-<knob>)"
+                ));
+            }
+            base = shipped_v64_spec(&cand)?;
+            base_strs = Strs {
+                wait: base.tune.wait.name().into(),
+                fetch: base.tune.fetch.name().into(),
+                idle: base.tune.idle.name().into(),
+                alayout: "slab".into(),
+                ..base_strs
+            };
+        }
+        Some(o) => return Err(format!("--base-shipped {o}: expected b1s|v64")),
+    }
     let sparse_seed = match knobs.take("sparse-seed") {
         Some(v) => v
             .parse::<u64>()
@@ -793,7 +839,32 @@ pub fn new_with_rip(
         reference: [OnceCell::new(), OnceCell::new()],
         sparse_seed,
         rip,
+        cold: crate::cold::ColdMode::Hot,
     }))
+}
+
+/// The shipped small-N export `<symbol>_b1s_v64` that matches the candidate's epilogue: the dense
+/// slab 128x128x8 module exports `set`, `add` and the gate/up SiLU in `_v64` form.
+fn shipped_v64_spec(cand: &Spec) -> Result<Spec> {
+    if cand.act != ALayout::Slab
+        || cand.tile != Tile::T128x128x8
+        || cand.mma != Mma::Dense
+        || !matches!(cand.epi, Epi::Set | Epi::Add | Epi::GateUpSilu)
+    {
+        return Err(format!(
+            "--base-shipped v64: the shipped `_v64` exports are the dense slab 128x128x8 set|add|silu \
+             kernels (got alayout {:?}, tile {:?}, mma {}, epi {})",
+            cand.act,
+            cand.tile,
+            cand.mma.name(),
+            cand.epi.name()
+        ));
+    }
+    Ok(Spec {
+        act: ALayout::Slab,
+        tune: verify64_tune(cand.epi, false),
+        ..Spec::control(cand.epi)
+    })
 }
 
 fn emit_elf(spec: Spec) -> Result<(Vec<u8>, String)> {
@@ -1039,6 +1110,27 @@ fn elem_diff(x: f32, y: f32) -> f64 {
     }
 }
 
+impl Iu4 {
+    /// Bytes of one weight set a dispatch streams (gate + up for the SiLU epilogue).
+    fn set_bytes(&self) -> usize {
+        self.m * (self.k / 256) * GROUP_BYTES * if self.cand.epi.is_silu() { 2 } else { 1 }
+    }
+
+    /// Weight buffers of pool set `set` (`0`: the correctness set).
+    fn set_weights(
+        dev: &Dev,
+        set: usize,
+    ) -> (&hip_bridge::DeviceBuffer, Option<&hip_bridge::DeviceBuffer>) {
+        match set {
+            0 => (&dev.w, dev.w_up.as_ref()),
+            s => {
+                let (w, up) = &dev.pool[s - 1];
+                (w, up.as_ref())
+            }
+        }
+    }
+}
+
 impl Workload for Iu4 {
     fn kernel(&self) -> &'static str {
         "iu4_gemm"
@@ -1047,8 +1139,12 @@ impl Workload for Iu4 {
         "gfx1201"
     }
     fn shape_json(&self) -> Value {
-        json!({"M": self.m, "N": self.n, "K": self.k,
-               "launch_rows": if self.cand.epi.is_silu() { 2 * self.m } else { self.m }})
+        let mut v = json!({"M": self.m, "N": self.n, "K": self.k,
+               "launch_rows": if self.cand.epi.is_silu() { 2 * self.m } else { self.m }});
+        // Cold-cache timing is part of the shape (a `pm-census noise` group never matches across
+        // modes); a hot run's shape keeps its bytes.
+        crate::cold::annotate_shape(&mut v, self.cold, self.pool_sets(), self.set_bytes());
+        v
     }
     fn record_extra(&self) -> Vec<(String, Value)> {
         if !self.sparse_active() {
@@ -1113,6 +1209,19 @@ impl Workload for Iu4 {
         for ((arm, _), image) in sparse.iter().zip(&images) {
             w_packed[*arm] = Some(up(image)?);
         }
+        // `--flush`: the timing pool, sets 1.. (set 0 is the correctness set above).
+        let mut pool = Vec::new();
+        if self.cold.pool() {
+            for s in 1..self.pool_sets() {
+                let w = up(&synth_weights(self.m, self.k, pool_seed(GATE_SEED, s)))?;
+                let w_up = if silu {
+                    Some(up(&synth_weights(self.m, self.k, pool_seed(UP_SEED, s)))?)
+                } else {
+                    None
+                };
+                pool.push((w, w_up));
+            }
+        }
         let dev = Dev {
             w: up(&host.w)?,
             w_packed,
@@ -1123,6 +1232,7 @@ impl Workload for Iu4 {
                 gpu.hip.malloc(out).map_err(dev_err)?,
                 gpu.hip.malloc(out).map_err(dev_err)?,
             ],
+            pool,
         };
         self.host = Some(host);
         self.dev = Some(dev);
@@ -1133,6 +1243,40 @@ impl Workload for Iu4 {
     }
 
     fn launch(&self, arm: Arm) -> Launch {
+        self.launch_set(arm, 0)
+    }
+
+    fn set_cold(&mut self, mode: crate::cold::ColdMode) -> Result<()> {
+        if mode.pool() && self.sparse_active() {
+            return Err(format!(
+                "{} does not support a 2:4 sparse arm (--mma/--base-mma): the packed image has no weight pool",
+                mode.flag()
+            ));
+        }
+        self.cold = mode;
+        Ok(())
+    }
+
+    fn null_object(&self) -> Result<Option<Object>> {
+        let e = iu4_gemm::emit(self.base)?;
+        crate::common::null_object(
+            &e.s_text,
+            self.base.arch,
+            &self.base.symbol(),
+            "the baseline spec's emit with the body replaced by s_endpgm (descriptor unchanged)",
+        )
+        .map(Some)
+    }
+
+    fn pool_sets(&self) -> usize {
+        if self.cold.pool() {
+            crate::cold::pool_sets(self.set_bytes())
+        } else {
+            1
+        }
+    }
+
+    fn launch_set(&self, arm: Arm, set: usize) -> Launch {
         let dev = self.dev.as_ref().expect("launch before setup");
         let spec = self.spec_of(arm);
         let ptr = |b: &hip_bridge::DeviceBuffer| b.as_ptr() as u64;
@@ -1147,8 +1291,9 @@ impl Workload for Iu4 {
             self.m
         };
         // A sparse arm reads its packed image, every other arm the (pruned) dense weights.
-        let w = dev.w_packed[arm_index(arm)].as_ref().unwrap_or(&dev.w);
-        let kernarg = match &dev.w_up {
+        let (w_set, up_set) = Self::set_weights(dev, set);
+        let w = dev.w_packed[arm_index(arm)].as_ref().unwrap_or(w_set);
+        let kernarg = match up_set {
             Some(up) => pack_silu(ptr(w), ptr(up), xq, y, self.m, self.k, self.n),
             None => pack_set_add(ptr(w), xq, y, self.m, self.k, self.n, spec.epi == Epi::Add),
         };
@@ -1812,6 +1957,226 @@ mod tests {
                 assert_eq!(v["ran"], true, "{epi} {ko} {wait}: {v}");
                 assert_eq!(v["bit_exact"], true, "{epi} {ko} {wait}: {v}");
             }
+        }
+    }
+
+    fn sym(w: &dyn Workload) -> String {
+        w.baseline().unwrap().launch_symbol
+    }
+
+    #[test]
+    fn base_shipped_v64_selects_the_shipped_small_n_export() {
+        for (epi, want) in [
+            ("add", "gemm_mq4g256v2_residual_mmq_iu4_full_add_b1s_v64"),
+            ("set", "gemm_mq4g256v2_residual_mmq_iu4_full_set_b1s_v64"),
+            ("silu", "gemm_mq4g256v2_gate_up_silu_mmq_iu4_b1s_v64"),
+        ] {
+            let mut k = knobs(&[("alayout", "slab"), ("epi", epi), ("base-shipped", "v64")]);
+            let w = new("M=5120,N=64,K=17408", &mut k).unwrap();
+            assert!(k.0.is_empty(), "base-shipped is consumed");
+            assert_eq!(sym(&*w), want, "{epi}");
+            let b = w.baseline().unwrap();
+            assert_eq!(
+                b.source["artifact"],
+                "kernels/gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1s.hxaco"
+            );
+        }
+        // Default and explicit `b1s`: the shipped `_b1s` export.
+        for kv in [vec![], vec![("base-shipped", "b1s")]] {
+            let mut kv = kv;
+            kv.extend([("alayout", "slab"), ("epi", "add")]);
+            let w = new("M=5120,N=64,K=17408", &mut knobs(&kv)).unwrap();
+            assert_eq!(sym(&*w), "gemm_mq4g256v2_residual_mmq_iu4_full_add_b1s");
+        }
+        // The record names the real schedule of the shipped `_v64` export.
+        let mut k = knobs(&[("alayout", "slab"), ("epi", "add"), ("base-shipped", "v64")]);
+        let w = new("M=5120,N=64,K=17408", &mut k).unwrap();
+        assert_eq!(
+            w.baseline().unwrap().desc["knobs"]["fetch"],
+            "pairw",
+            "{:?}",
+            w.baseline().unwrap().desc
+        );
+        assert_eq!(w.baseline().unwrap().desc["knobs"]["idle"], "skiphi");
+        assert_eq!(w.baseline().unwrap().desc["knobs"]["wait"], "window");
+    }
+
+    #[test]
+    fn base_shipped_refusals() {
+        let bad = |kv: &[(&str, &str)]| new("M=5120,N=64,K=17408", &mut knobs(kv)).err();
+        // Token layout has no `_v64` exports.
+        assert!(bad(&[("epi", "add"), ("base-shipped", "v64")])
+            .unwrap()
+            .contains("dense slab"));
+        assert!(
+            bad(&[("alayout", "slab"), ("epi", "add"), ("base-shipped", "v32")])
+                .unwrap()
+                .contains("expected b1s|v64")
+        );
+        // A shipped export excludes an emitted baseline.
+        assert!(bad(&[
+            ("alayout", "slab"),
+            ("epi", "add"),
+            ("base-shipped", "v64"),
+            ("base-fold", "k128"),
+        ])
+        .unwrap()
+        .contains("excludes"));
+        assert!(bad(&[
+            ("alayout", "slab"),
+            ("epi", "silu-bf16"),
+            ("base-shipped", "v64")
+        ])
+        .is_some());
+    }
+
+    #[test]
+    fn flush_pool_sizes_the_verify_shapes_past_the_last_level_cache() {
+        let pool = |shape: &str, epi: &str| {
+            let mut w = new(
+                shape,
+                &mut knobs(&[("alayout", "slab"), ("epi", epi), ("base-shipped", "v64")]),
+            )
+            .unwrap();
+            assert_eq!(w.pool_sets(), 1, "hot: no pool");
+            w.set_cold(crate::cold::ColdMode::Flush).unwrap();
+            (w.pool_sets(), w.shape_json())
+        };
+        // down (47.3 MB), gate_up (gate + up = 94.7 MB), out-proj (16.7 MB).
+        for (shape, epi, set_bytes, sets) in [
+            ("M=5120,N=64,K=17408", "add", 5120 * 68 * 136, 5),
+            ("M=17408,N=64,K=5120", "silu", 2 * 17408 * 20 * 136, 3),
+            ("M=5120,N=64,K=6144", "add", 5120 * 24 * 136, 13),
+        ] {
+            let (n, s) = pool(shape, epi);
+            assert_eq!(n, sets, "{shape}");
+            assert_eq!(s["flush"], true);
+            assert_eq!(s["timing_pool"]["sets"], sets);
+            assert_eq!(s["timing_pool"]["bytes_per_set"], set_bytes);
+            assert_eq!(s["timing_pool"]["total_bytes"], sets * set_bytes);
+            assert!(sets * set_bytes > crate::cold::POOL_BYTES);
+            assert_eq!(sets % 2, 1);
+        }
+    }
+
+    #[test]
+    fn hot_shape_keeps_its_bytes_and_cold_adds_only_flush_keys() {
+        let mut w = new("M=5120,N=64,K=17408", &mut knobs(&[("epi", "add")])).unwrap();
+        let hot = w.shape_json();
+        let mut keys: Vec<_> = hot.as_object().unwrap().keys().cloned().collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            ["K", "M", "N", "launch_rows"],
+            "a pm-census noise group keys on this"
+        );
+        w.set_cold(crate::cold::ColdMode::Flush).unwrap();
+        let cold = w.shape_json();
+        for k in ["K", "M", "N", "launch_rows"] {
+            assert_eq!(cold[k], hot[k]);
+        }
+        assert!(cold["flush"] == true && cold["timing_pool"].is_object());
+        // Back to hot: the keys go away again.
+        w.set_cold(crate::cold::ColdMode::Hot).unwrap();
+        assert_eq!(w.shape_json(), hot);
+    }
+
+    #[test]
+    fn flush_refuses_a_sparse_arm() {
+        let mut w = new("M=128,N=64,K=256", &mut knobs(&[("mma", "s24x64")])).unwrap();
+        assert!(w
+            .set_cold(crate::cold::ColdMode::Flush)
+            .unwrap_err()
+            .contains("2:4 sparse"));
+        let mut w = new("M=128,N=64,K=256", &mut knobs(&[("base-mma", "s24x32")])).unwrap();
+        assert!(w.set_cold(crate::cold::ColdMode::Flush).is_err());
+        assert!(new("M=128,N=64,K=256", &mut knobs(&[]))
+            .unwrap()
+            .set_cold(crate::cold::ColdMode::Flush)
+            .is_ok());
+    }
+
+    #[test]
+    fn pool_sets_are_distinct_seeded_weight_sets() {
+        use std::collections::BTreeSet;
+        assert_eq!(
+            pool_seed(GATE_SEED, 0),
+            GATE_SEED,
+            "set 0 is the correctness set"
+        );
+        let gate: BTreeSet<u64> = (0..crate::cold::MAX_SETS)
+            .map(|s| pool_seed(GATE_SEED, s))
+            .collect();
+        let up: BTreeSet<u64> = (0..crate::cold::MAX_SETS)
+            .map(|s| pool_seed(UP_SEED, s))
+            .collect();
+        assert_eq!(gate.len(), crate::cold::MAX_SETS);
+        assert_eq!(up.len(), crate::cold::MAX_SETS);
+        assert!(gate.is_disjoint(&up));
+        let w = |s: usize| synth_weights(4, 256, pool_seed(GATE_SEED, s));
+        assert_eq!(w(1), w(1), "deterministic");
+        assert_ne!(w(0), w(1));
+        assert_ne!(w(1), w(2));
+        // Set 0 of the pool is `Host::synth`'s weights.
+        assert_eq!(w(0), Host::synth(4, 1, 256, false).w);
+    }
+
+    #[test]
+    fn pool_only_and_l2_flush_modes_pool_like_flush_but_record_their_own_keys() {
+        use crate::cold::ColdMode::*;
+        let shape = |m| {
+            let mut w = new("M=5120,N=64,K=17408", &mut knobs(&[("epi", "add")])).unwrap();
+            w.set_cold(m).unwrap();
+            (w.pool_sets(), w.shape_json())
+        };
+        let (np, p) = shape(Pool);
+        let (nl, l) = shape(FlushL2);
+        let (nf, f) = shape(Flush);
+        assert_eq!((np, nl, nf), (5, 5, 5));
+        assert_eq!(
+            (p["flush"].clone(), l["flush"].clone(), f["flush"].clone()),
+            (json!(false), json!(false), json!(true))
+        );
+        assert!(
+            p.get("flush_l2").is_none() && l["flush_l2"] == true && f.get("flush_l2").is_none()
+        );
+        assert_eq!(p["timing_pool"], f["timing_pool"]);
+        // Sparse arms have no pool in any mode.
+        for m in [Pool, FlushL2, Flush] {
+            let mut w = new("M=128,N=64,K=256", &mut knobs(&[("mma", "s24x64")])).unwrap();
+            let e = w.set_cold(m).unwrap_err();
+            assert!(e.starts_with(m.flag()) && e.contains("2:4 sparse"), "{e}");
+        }
+    }
+
+    #[test]
+    fn null_object_keeps_the_descriptor_and_drops_the_body() {
+        let code = |o: &Object| {
+            let p = crate::lift(&o.bytes).unwrap();
+            let r = crate::resources(&p, std::slice::from_ref(&o.launch_symbol)).unwrap();
+            (
+                r[0]["code_bytes"].as_u64().unwrap(),
+                r[0]["vgprs"].as_u64().unwrap(),
+                r[0]["sgprs"].as_u64().unwrap(),
+                r[0]["kernarg_bytes"].as_u64().unwrap(),
+                r[0]["max_flat_workgroup_size"].as_u64().unwrap(),
+            )
+        };
+        for (epi, shape) in [
+            ("add", "M=5120,N=64,K=17408"),
+            ("silu", "M=17408,N=64,K=5120"),
+        ] {
+            let mut k = knobs(&[("alayout", "slab"), ("epi", epi), ("base-shipped", "v64")]);
+            let w = new(shape, &mut k).unwrap();
+            let (base, null) = (w.baseline().unwrap(), w.null_object().unwrap().unwrap());
+            assert_eq!(null.launch_symbol, base.launch_symbol);
+            let (b, n) = (code(&base), code(&null));
+            assert!(n.0 <= 8 && b.0 > 1000, "{epi}: code {} -> {}", b.0, n.0);
+            assert_eq!(
+                (n.1, n.2, n.3, n.4),
+                (b.1, b.2, b.3, b.4),
+                "{epi}: VGPRs, SGPRs, kernarg, workgroup size stay"
+            );
         }
     }
 }

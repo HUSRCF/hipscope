@@ -37,8 +37,8 @@ use crate::value::Value;
 use peacemaker_author::runtime::{Exit, Lend, RingId};
 use peacemaker_author::{Free, Published};
 use peacemaker_isa::kernels::iu4_gemm::{
-    self as iu4, blocks, ALayout, Cacc, Epi, Fold, FreeRings, FreeRings3, Gen, Lds, Lds3, MetaD,
-    MetaS, Mma, PayA, PayW, PayloadRole, RingDepth, Tile, Wg,
+    self as iu4, blocks, ALayout, Cacc, Epi, Fold, FoldSched, FreeRings, FreeRings3, Gen, Lds,
+    Lds3, MetaD, MetaS, Mma, PayA, PayW, PayloadRole, RingDepth, Tile, Wg,
 };
 use peacemaker_isa::kernels::qwen4_moe_sym as moe;
 use peacemaker_isa::Emitted;
@@ -88,6 +88,7 @@ pub(super) fn is_type(n: &str) -> bool {
             | "ALayout"
             | "Mma"
             | "RingDepth"
+            | "FoldSched"
             | "MoeKind"
             | "WeightCodec"
             | "Iu4Spec"
@@ -124,6 +125,7 @@ const ENUMS: &[(&str, &[&str])] = &[
     ("ALayout", &["Token", "Slab"]),
     ("Mma", &["Dense", "S24X64", "S24X32"]),
     ("RingDepth", &["Two", "Three"]),
+    ("FoldSched", &["Paired", "Chain"]),
     ("MoeKind", &["GateUp", "Down"]),
     ("WeightCodec", &["Mq4Sym", "Mq3I4", "E8pI4"]),
     ("PayloadRole", &["A", "W"]),
@@ -217,6 +219,13 @@ fn ring_depth_of<'a>(it: &Interp<'a>, v: &Value<'a>) -> Res<RingDepth> {
         o => Err(unknown("RingDepth", o)),
     }
 }
+fn fold_sched_of<'a>(it: &Interp<'a>, v: &Value<'a>) -> Res<FoldSched> {
+    match variant_of(it, v, "FoldSched")?.as_str() {
+        "Paired" => Ok(FoldSched::Paired),
+        "Chain" => Ok(FoldSched::Chain),
+        o => Err(unknown("FoldSched", o)),
+    }
+}
 fn kind_of<'a>(it: &Interp<'a>, v: &Value<'a>) -> Res<moe::Kind> {
     match variant_of(it, v, "MoeKind")?.as_str() {
         "GateUp" => Ok(moe::Kind::GateUp),
@@ -268,11 +277,16 @@ fn no_more(fs: &Fields, name: &str) -> Res<()> {
 fn iu4_spec_of<'a>(it: &Interp<'a>, v: &Value<'a>) -> Res<iu4::Spec> {
     let mut fs = fields_of(it, v, "Iu4Spec")?;
     let n = "Iu4Spec";
-    // `ring` (the payload rings' depth, `RingDepth::Two | Three`) is the one
-    // optional field: a spec that leaves it out is the shipped depth 2.
+    // `ring` (the payload rings' depth, `RingDepth::Two | Three`) and `fold_sched`
+    // (`FoldSched::Paired | Chain`) are the optional fields: a spec that leaves them out is
+    // the shipped depth 2 and paired fold.
     let ring = match fs.iter().position(|(f, _)| &**f == "ring") {
         Some(i) => ring_depth_of(it, &fs.remove(i).1)?,
         None => RingDepth::Two,
+    };
+    let fold_sched = match fs.iter().position(|(f, _)| &**f == "fold_sched") {
+        Some(i) => fold_sched_of(it, &fs.remove(i).1)?,
+        None => FoldSched::Paired,
     };
     let spec = iu4::Spec {
         fold: fold_of(it, &field(&mut fs, n, "fold")?)?,
@@ -284,6 +298,7 @@ fn iu4_spec_of<'a>(it: &Interp<'a>, v: &Value<'a>) -> Res<iu4::Spec> {
         mma: mma_of(it, &field(&mut fs, n, "mma")?)?,
         tune: iu4::Tune {
             ring,
+            fold_sched,
             ..iu4::Tune::default()
         },
     };
@@ -308,6 +323,10 @@ fn iu4_spec_value<'a>(s: iu4::Spec) -> Value<'a> {
             f("arch", nat(Nat::Arch(s.arch))),
             f("mma", enum_val("Mma", &format!("{:?}", s.mma))),
             f("ring", enum_val("RingDepth", &format!("{:?}", s.tune.ring))),
+            f(
+                "fold_sched",
+                enum_val("FoldSched", &format!("{:?}", s.tune.fold_sched)),
+            ),
         ],
     )
 }
