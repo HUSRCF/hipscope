@@ -1031,6 +1031,26 @@ name = "pm_loop"
 required-features = ["lab"]
 
 [[example]]
+name = "hip_loop"
+required-features = ["lab"]
+
+[[example]]
+name = "emu_race_gate"
+required-features = ["lab"]
+
+[[example]]
+name = "decode_audit_compile"
+required-features = ["lab"]
+
+[[example]]
+name = "lane_emu_check"
+required-features = ["lab"]
+
+[[example]]
+name = "lift_probe_compile"
+required-features = ["lab"]
+
+[[example]]
 name = "pm_xbatch_oracle"
 required-features = ["lab"]
 

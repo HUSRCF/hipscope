@@ -120,13 +120,13 @@
 //! candidate (or the device) could not compile/launch (record printed with `error`).
 //!
 //! ```text
-//! cargo build --release -p rdna-compute --example hip_loop
+//! cargo build --release -p rdna-compute --features lab --example hip_loop
 //! hip_loop --node mq6_res --shape qkv --cand copy_of_shipped.hip --offline
 //! hip_loop --node lane_proj --shape group=dn,lanes=8 --cand copy_of_shipped.hip --offline
 //! hip_loop --node lane_wo --emu --cand candidate.hip
 //! hip_loop --node lane_proj --shape group=fa,lanes=8 --cand candidate.hip --flush --time 100 --rounds 15
 //! ```
-//! GPU-free tests: `cargo test --release -p rdna-compute --example hip_loop`.
+//! GPU-free tests: `cargo test --release -p rdna-compute --features lab --example hip_loop`.
 
 #[path = "support/abba.rs"]
 mod abba;
