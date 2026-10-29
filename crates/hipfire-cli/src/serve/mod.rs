@@ -86,6 +86,11 @@ pub(crate) struct ServeMeta {
     /// on the standard route, where the daemon sends none; cleared with
     /// `current_model` so a model switch never shows the previous engine.
     pub(crate) engine_stats: Option<hipfire_runtime::serve::EngineStats>,
+    /// GPU-memory spill detector for the resident model, baselined right
+    /// after its load ack; `None` while nothing is resident or when the
+    /// card's amdgpu counters are unreadable. Lives here so a finished
+    /// request can check it without the runtime lock a load holds.
+    pub(crate) spill: Option<crate::spill::SpillMonitor>,
 }
 
 impl ServeMeta {
@@ -105,6 +110,7 @@ impl ServeMeta {
             n_ctx: 0,
             loaded: LoadedInfo::default(),
             engine_stats: None,
+            spill: None,
         }
     }
 }
@@ -2478,6 +2484,16 @@ impl ServeRuntime {
                 tag.unwrap_or_else(|| model.to_owned())
             };
             self.resident_model = Some(model.to_owned());
+            // Baseline the spill monitor now that the load (and any prewarm)
+            // is done, before taking the meta lock: it may ask the daemon
+            // which arch the card is.
+            let spill = crate::spill::attach_for_engine(
+                &self.engine,
+                self.spawner
+                    .process_config
+                    .legacy_value("HIPFIRE_DEVICES")
+                    .as_deref(),
+            );
             // The served facts land in `ServeMeta`, not `ServeRuntime`: this
             // method runs with the runtime lock held for the whole load, and
             // `/health` (100 ms readiness probes, the TUI's 450 ms poll,
@@ -2487,6 +2503,7 @@ impl ServeRuntime {
             meta.n_ctx = self.current_max_seq;
             meta.loaded = published;
             meta.engine_stats = None;
+            meta.spill = spill;
         }
         Ok(resolved)
     }
@@ -2553,6 +2570,7 @@ impl ServeRuntime {
         loaded.swap = configured_swap_json(&self.spawner.process_config, self.multi_slot_enabled);
         meta.loaded = loaded;
         meta.engine_stats = None;
+        meta.spill = None;
     }
 
     /// Replace a daemon that exited: reap it (freeing its GPU memory), then

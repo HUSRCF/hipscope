@@ -65,6 +65,7 @@ mod process_identity;
 mod pull_select;
 mod serve;
 mod setup;
+mod spill;
 use crate::serve::complete::next_attempt_id;
 use crate::serve::http::request_id;
 use crate::serve::{detach_serve, parse_host_port, parse_pid_record, ServePidRecord};
@@ -2877,6 +2878,10 @@ fn run_command(paths: &Paths, args: RunArgs) -> Result<()> {
         params["dspark_conf_threshold"] = serde_json::json!(value);
     }
     let loaded = engine.load(&model_path, params)?;
+    let mut spill = spill::attach_for_engine(
+        &engine,
+        process_config.legacy_value("HIPFIRE_DEVICES").as_deref(),
+    );
     if !args.json {
         eprintln!(
             "[{}] {}d {}L {} vocab",
@@ -2982,6 +2987,9 @@ fn run_command(paths: &Paths, args: RunArgs) -> Result<()> {
         }
         Ok(())
     })?;
+    if let Some(message) = spill.as_mut().and_then(spill::SpillMonitor::check) {
+        spill::emit(&message);
+    }
     if args.json {
         println!(
             "{}",
@@ -6601,6 +6609,7 @@ fn bench_command(paths: &Paths, args: BenchArgs) -> Result<()> {
     eprintln!("  prompt_chars: {prompt_chars}");
     print_bench_max_seq(&max_seq, &loaded);
     let power = bench_power_probe(devices_spec.as_deref(), &post_diag);
+    let mut spill = power.device().and_then(spill::SpillMonitor::attach);
     if args.matrix || args.redline {
         bench_matrix(
             &mut engine,
@@ -6632,6 +6641,10 @@ fn bench_command(paths: &Paths, args: BenchArgs) -> Result<()> {
             engine.generate(request, |_| Ok(()))?;
             Ok(())
         })?;
+        if let Some(message) = spill.as_mut().and_then(spill::SpillMonitor::check) {
+            spill::emit(&message);
+        }
+        let mut spill_runs = Vec::new();
         let mut decode = Vec::new();
         let mut prefill = Vec::new();
         let mut wall = Vec::new();
@@ -6650,6 +6663,13 @@ fn bench_command(paths: &Paths, args: BenchArgs) -> Result<()> {
                 args.reasoning_on,
             )?;
             power_runs.push(sampler.finish());
+            if let Some(monitor) = spill.as_mut() {
+                if let Some(message) = monitor.check() {
+                    eprintln!();
+                    spill::emit(&message);
+                }
+                spill_runs.push(monitor.report_json());
+            }
             // Every run uses the same prompt, so the daemon's tokenized
             // prompt length is run-invariant; keep the first report. The
             // done event reports the prompt as `prefill_tokens` (rows the
@@ -6720,6 +6740,7 @@ fn bench_command(paths: &Paths, args: BenchArgs) -> Result<()> {
                 "warnings": warnings,
                 "power_device": power.device_json(),
                 "power": bench_power::runs_json(&power_runs),
+                "spill": spill_runs,
                 "decode_tok_s": sample_stats(&decode),
                 "prefill_tok_s": sample_stats(&prefill),
                 "wall_tok_s": sample_stats(&wall),

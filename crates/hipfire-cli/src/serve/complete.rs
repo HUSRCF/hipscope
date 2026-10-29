@@ -2741,6 +2741,9 @@ pub(crate) fn complete_request_attempt(
         meta.engine_stats = serde_json::from_value(stats.clone()).ok();
     }
     meta.last_activity = Instant::now();
+    if let Some(message) = meta.spill.as_mut().and_then(|spill| spill.check()) {
+        crate::spill::emit(&message);
+    }
 
     if let Some(completion) = committed {
         return Ok(completion);
