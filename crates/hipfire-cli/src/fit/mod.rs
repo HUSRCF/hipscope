@@ -473,6 +473,9 @@ pub(crate) fn fit_command(paths: &crate::Paths, args: FitArgs) -> Result<()> {
         for gpu in &plan.gpus {
             if let Some(device) = machine.devices.iter_mut().find(|d| d.index == gpu.index) {
                 device.capacity = gpu.capacity().map(|tokens| tokens as u64);
+                device.capacity_shown = gpu
+                    .projection
+                    .map(|p| capacity::capped(p.card_cap, Some(p.model_ctx)).0 as u64);
             }
         }
     }
@@ -1201,7 +1204,7 @@ fn unchecked_context_finding(
                 gib(p.scratch as u64),
                 gib(p.page_rounding as u64),
             ),
-            (max_seq > p.card_cap).then(|| capacity::context_fix(p.card_cap, None)),
+            (max_seq > p.card_cap).then(|| capacity::context_fix(&p, None)),
         ),
         Err(error) => Finding::undetermined(
             "context",
@@ -1343,6 +1346,7 @@ fn render_text(report: &Report, verbose: bool) -> String {
     let mut out = String::new();
     let _ = writeln!(out, "hipfire fit {}", report.input);
     let _ = writeln!(out, "this machine");
+    let plan_window = report.plan.as_ref().and_then(|p| p.model_ctx);
     for device in &report.machine.devices {
         let free = device.free.map(gib).unwrap_or_else(|| "unknown".into());
         let total = device
@@ -1356,7 +1360,12 @@ fn render_text(report: &Report, verbose: bool) -> String {
         let cap_text = device
             .capacity
             .filter(|_| report.machine.devices.len() > 1)
-            .map(|tokens| format!("  capacity: {}", capacity::device_capacity_text(tokens)))
+            .map(|tokens| {
+                format!(
+                    "  capacity: {}",
+                    capacity::device_capacity_text(tokens, plan_window)
+                )
+            })
             .unwrap_or_default();
         let _ = writeln!(
             out,
@@ -1902,6 +1911,7 @@ mod tests {
             free: Some(31 << 30),
             link: None,
             capacity: None,
+            capacity_shown: None,
             env_selector: "0".into(),
             config_selector: "GPU-0".into(),
         }
@@ -2758,6 +2768,7 @@ mod tests {
         let mut gpu2 = device();
         gpu2.index = 2;
         gpu2.capacity = Some(1_600_000);
+        gpu2.capacity_shown = Some(262_144);
         gpu2.env_selector = "2".into();
         gpu2.config_selector = "GPU-0000000000000002".into();
         let gpus = vec![
@@ -2781,16 +2792,18 @@ mod tests {
             "  GPU0 gfx1201  2.0 GiB free of 32.0 GiB  capacity: weights don't fit  link:"
         ));
         assert!(text.contains(
-            "  GPU2 gfx1201  31.0 GiB free of 32.0 GiB  capacity: up to 1600000 tokens  link:"
+            "  GPU2 gfx1201  31.0 GiB free of 32.0 GiB  capacity: up to 262144 tokens (model limit; KV room for 1.60M)  link:"
         ));
         assert!(text.contains("  capacity   weights + prefill scratch exceed free memory (2.0 GiB free of 32.0 GiB; 30.0 GiB held by other processes or the desktop)"));
-        assert!(text.contains("  best GPU   GPU2 (32.0 GiB free): up to 1600000 tokens — select it with HIP_VISIBLE_DEVICES=2 (or `hipfire config set hardware.devices GPU-0000000000000002`)"));
+        assert!(text.contains("  best GPU   GPU2 (32.0 GiB free): up to 262144 tokens (model limit; KV room for 1.60M) — select it with HIP_VISIBLE_DEVICES=2 (or `hipfire config set hardware.devices GPU-0000000000000002`)"));
         assert!(text.contains("quant tiers (model fit only, on each tier's best GPU;"));
         assert!(text.contains("  example:mq4  20.0 GiB  FITS  up to 1600000 tokens on GPU2"));
         assert!(text.contains("largest tier that fits at 65536 tokens: example:mq4 (on GPU2)"));
         let value = json_report(&report).unwrap();
         assert_eq!(value["plan"]["best_device"]["index"], 2);
         assert_eq!(value["plan"]["best_device"]["capacity"], 1_600_000);
+        assert_eq!(value["plan"]["best_device"]["capacity_shown"], 262_144);
+        assert_eq!(value["machine"]["devices"][1]["capacity_shown"], 262_144);
         assert!(value["plan"]["best_device"]["free_bytes"]
             .as_u64()
             .is_some());

@@ -483,6 +483,7 @@ mod tests {
             free,
             link: None,
             capacity: None,
+            capacity_shown: None,
             env_selector: "0".into(),
             config_selector: "GPU-0".into(),
         }

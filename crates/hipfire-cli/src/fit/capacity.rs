@@ -61,7 +61,10 @@ impl GpuCapacity {
 pub(crate) struct BestDevice {
     pub index: usize,
     pub free_bytes: u64,
+    /// Raw KV room in tokens.
     pub capacity: u64,
+    /// `capacity` capped at the model's trained window.
+    pub capacity_shown: u64,
 }
 
 /// The GPU with the largest projected capacity; ties go to the lowest index.
@@ -90,6 +93,7 @@ pub(crate) fn best_device(best: &GpuCapacity) -> Option<BestDevice> {
         index: best.index,
         free_bytes: p.free as u64,
         capacity: p.card_cap as u64,
+        capacity_shown: capped(p.card_cap, Some(p.model_ctx)).0 as u64,
     })
 }
 
@@ -100,6 +104,42 @@ pub(crate) fn context_fits(p: &Qwen35CardProjection, requested: usize, automatic
         p.card_cap >= QWEN35_MIN_AUTO_CONTEXT
     } else {
         requested <= p.card_cap
+    }
+}
+
+/// A token count as `1.68M` / `683K` / `4096`.
+pub(crate) fn compact_count(n: usize) -> String {
+    if n >= 1_000_000 {
+        format!("{:.2}M", n as f64 / 1e6)
+    } else if n >= 10_000 {
+        format!("{}K", (n as f64 / 1e3).round() as usize)
+    } else {
+        n.to_string()
+    }
+}
+
+/// The capacity to display: the KV room capped at the model's trained window,
+/// with the note stating the raw room when the cap applied. The one formatter
+/// every capacity text goes through.
+pub(crate) fn capped(capacity: usize, window: Option<usize>) -> (usize, Option<String>) {
+    match window {
+        Some(window) if capacity > window => (
+            window,
+            Some(format!(
+                "model limit; KV room for {}",
+                compact_count(capacity)
+            )),
+        ),
+        _ => (capacity, None),
+    }
+}
+
+/// `262144 tokens (model limit; KV room for 1.68M)`, or `683000 tokens` when
+/// the room is within the window.
+pub(crate) fn tokens_phrase(capacity: usize, window: Option<usize>) -> String {
+    match capped(capacity, window) {
+        (shown, Some(note)) => format!("{shown} tokens ({note})"),
+        (shown, None) => format!("{shown} tokens"),
     }
 }
 
@@ -154,10 +194,10 @@ fn memory_fixes(better: Option<&GpuCapacity>) -> Vec<String> {
     let mut options = vec!["free GPU memory (e.g. stop other jobs using this GPU)".to_string()];
     if let Some((better, p)) = better.and_then(|b| Some((b, b.projection?))) {
         options.push(format!(
-            "use another GPU (best: GPU{}, {} free, up to {} tokens; see `best GPU`)",
+            "use another GPU (best: GPU{}, {} free, up to {}; see `best GPU`)",
             better.index,
             gib(p.free as u64),
-            p.card_cap
+            tokens_phrase(p.card_cap, Some(p.model_ctx))
         ));
     }
     options.push("pick a smaller tier".to_string());
@@ -165,8 +205,8 @@ fn memory_fixes(better: Option<&GpuCapacity>) -> Vec<String> {
 }
 
 /// The fix for a context the memory holds, but only below the requested one.
-fn lower_context_fix(card_cap: usize, better: Option<&GpuCapacity>) -> String {
-    let at_most = card_cap.max(QWEN35_MIN_AUTO_CONTEXT);
+fn lower_context_fix(p: &Qwen35CardProjection, better: Option<&GpuCapacity>) -> String {
+    let at_most = p.card_cap.min(p.model_ctx).max(QWEN35_MIN_AUTO_CONTEXT);
     let mut options = vec![format!(
         "lower --ctx to at most {at_most} (`hipfire config set memory.max_seq {at_most}`)"
     )];
@@ -176,9 +216,9 @@ fn lower_context_fix(card_cap: usize, better: Option<&GpuCapacity>) -> String {
 
 /// The fix for a context the projection does not hold: lower it when a useful
 /// context still fits, otherwise only memory, another GPU or a smaller tier help.
-pub(crate) fn context_fix(card_cap: usize, better: Option<&GpuCapacity>) -> String {
-    if card_cap >= USEFUL_CONTEXT_FLOOR {
-        lower_context_fix(card_cap, better)
+pub(crate) fn context_fix(p: &Qwen35CardProjection, better: Option<&GpuCapacity>) -> String {
+    if p.card_cap >= USEFUL_CONTEXT_FLOOR {
+        lower_context_fix(p, better)
     } else {
         or_list(&memory_fixes(better))
     }
@@ -196,16 +236,16 @@ pub(crate) fn context_finding(
     let charges = charges(&p);
     if context_fits(&p, requested, automatic) {
         return if automatic {
-            Finding::fits("context", format!("automatic context: min(trained window {}, card capacity measured after weights load); projected {} tokens ({charges})", p.model_ctx, p.card_cap))
+            Finding::fits("context", format!("automatic context: min(trained window {}, card capacity measured after weights load); projected {} ({charges})", p.model_ctx, tokens_phrase(p.card_cap, Some(p.model_ctx))))
         } else {
-            Finding::fits("context", format!("a {requested}-token context needs {requested} x {} bytes of KV; the projection leaves room for {} tokens ({charges})", p.bytes_per_token, p.card_cap))
+            Finding::fits("context", format!("a {requested}-token context needs {requested} x {} bytes of KV; the projection leaves room for {} ({charges})", p.bytes_per_token, tokens_phrase(p.card_cap, Some(p.model_ctx))))
         };
     }
     if p.card_cap >= USEFUL_CONTEXT_FLOOR {
         return Finding::fails(
             "context",
-            format!("a {requested}-token context needs {requested} x {} bytes of KV; the projection leaves room for {} tokens ({charges})", p.bytes_per_token, p.card_cap),
-            lower_context_fix(p.card_cap, better),
+            format!("a {requested}-token context needs {requested} x {} bytes of KV; the projection leaves room for {} ({charges})", p.bytes_per_token, tokens_phrase(p.card_cap, Some(p.model_ctx))),
+            lower_context_fix(&p, better),
         );
     }
     // Too little room for any useful context: the model does not fit this
@@ -267,7 +307,11 @@ pub(crate) fn capacity_lines(p: &Value, device: Option<&FitDevice>) -> Vec<Strin
         n("bytes_per_token")
     );
     if n("card_cap") > 0 {
-        return vec![format!("up to {} tokens ({estimate})", n("card_cap"))];
+        let window = p["model_ctx"].as_u64().map(|w| w as usize);
+        return vec![format!(
+            "up to {} ({estimate})",
+            tokens_phrase(n("card_cap") as usize, window)
+        )];
     }
     let needed = n("weights")
         .saturating_add(n("scratch"))
@@ -302,7 +346,7 @@ pub(crate) fn best_gpu_line(best: &GpuCapacity, pinned: bool) -> Option<String> 
     let room = if p.card_cap == 0 {
         "weights don't fit".to_string()
     } else {
-        format!("up to {} tokens", p.card_cap)
+        format!("up to {}", tokens_phrase(p.card_cap, Some(p.model_ctx)))
     };
     Some(format!(
         "GPU{} ({} free): {room} — {how}",
@@ -312,11 +356,11 @@ pub(crate) fn best_gpu_line(best: &GpuCapacity, pinned: bool) -> Option<String> 
 }
 
 /// A GPU's capacity for the `this machine` rows.
-pub(crate) fn device_capacity_text(capacity: u64) -> String {
+pub(crate) fn device_capacity_text(capacity: u64, window: Option<usize>) -> String {
     if capacity == 0 {
         "weights don't fit".into()
     } else {
-        format!("up to {capacity} tokens")
+        format!("up to {}", tokens_phrase(capacity as usize, window))
     }
 }
 
@@ -353,7 +397,9 @@ pub(crate) fn tier_on_best_gpu(
         } else {
             format!(" (below the requested {requested}-token context)")
         };
-        format!("up to {} tokens{on}{short}", p.card_cap)
+        let (shown, note) = capped(p.card_cap, Some(p.model_ctx));
+        let note = note.map(|n| format!(" ({n})")).unwrap_or_default();
+        format!("up to {shown} tokens{on}{note}{short}")
     };
     Some(TierCapacity {
         gpu: best.index,
@@ -382,6 +428,7 @@ mod tests {
             free: Some(free_gib << 30),
             link: None,
             capacity: None,
+            capacity_shown: None,
             env_selector: index.to_string(),
             config_selector: format!("GPU-{index:016x}"),
         }
@@ -497,7 +544,7 @@ mod tests {
             None,
         );
         assert!(floor.fix.unwrap().contains("lower --ctx to at most 4096 "));
-        assert!(lower_context_fix(100, None).contains("at most 512 "));
+        assert!(lower_context_fix(&with_cap(100), None).contains("at most 512 "));
     }
 
     #[test]
@@ -548,16 +595,80 @@ mod tests {
         let row = tier_on_best_gpu(&mixed, 8_192, false, true).unwrap();
         assert_eq!(row.gpu, 2);
         assert!(row.summary.starts_with("up to "), "{}", row.summary);
-        assert!(row.summary.ends_with(" tokens on GPU2"), "{}", row.summary);
+        assert!(
+            row.summary
+                .starts_with("up to 262144 tokens on GPU2 (model limit; KV room for 1.6"),
+            "{}",
+            row.summary
+        );
         assert_eq!(row.verdict, Verdict::Fits);
         let single = tier_on_best_gpu(&mixed[2..], 8_192, false, false).unwrap();
-        assert!(single.summary.ends_with(" tokens") && !single.summary.contains("GPU"));
+        assert!(
+            single
+                .summary
+                .starts_with("up to 262144 tokens (model limit; KV room for ")
+                && !single.summary.contains("GPU")
+        );
+        // Within the window the text is unchanged.
+        let mut small = gpu(2, 31);
+        small.projection = Some(with_cap(100_000));
+        let row = tier_on_best_gpu(&[small], 8_192, false, true).unwrap();
+        assert_eq!(row.summary, "up to 100000 tokens on GPU2");
         let over = tier_on_best_gpu(&mixed, 2_000_000, false, true).unwrap();
         assert_eq!(over.verdict, Verdict::DoesNotFit);
         assert!(over
             .summary
             .contains("below the requested 2000000-token context"));
         assert!(tier_on_best_gpu(&[], 8_192, false, true).is_none());
+    }
+
+    #[test]
+    fn displayed_capacity_is_capped_at_the_trained_window() {
+        let window = Some(262_144);
+        // Above the window: the window, with the raw room noted.
+        assert_eq!(
+            capped(1_680_000, window),
+            (262_144, Some("model limit; KV room for 1.68M".to_string()))
+        );
+        assert_eq!(
+            tokens_phrase(1_680_000, window),
+            "262144 tokens (model limit; KV room for 1.68M)"
+        );
+        assert_eq!(
+            tokens_phrase(683_000, Some(262_144)),
+            "262144 tokens (model limit; KV room for 683K)"
+        );
+        // At and below the window: today's text.
+        assert_eq!(capped(262_144, window), (262_144, None));
+        assert_eq!(tokens_phrase(262_144, window), "262144 tokens");
+        assert_eq!(tokens_phrase(200_000, window), "200000 tokens");
+        assert_eq!(tokens_phrase(4_829_496, None), "4829496 tokens");
+        assert_eq!(compact_count(4_829_496), "4.83M");
+        assert_eq!(compact_count(9_999), "9999");
+        // Every surface goes through it.
+        let p = with_cap(1_680_000);
+        let finding = context_finding(p, 8_192, false, &device(0, 20), None);
+        assert!(finding
+            .detail
+            .contains("room for 262144 tokens (model limit; KV room for 1.68M)"));
+        let best = GpuCapacity::new(&device(2, 31), Ok(p));
+        assert!(best_gpu_line(&best, false)
+            .unwrap()
+            .contains("up to 262144 tokens (model limit; KV room for 1.68M) —"));
+        assert_eq!(best_device(&best).unwrap().capacity, 1_680_000);
+        assert_eq!(best_device(&best).unwrap().capacity_shown, 262_144);
+        assert_eq!(
+            device_capacity_text(1_680_000, window),
+            "up to 262144 tokens (model limit; KV room for 1.68M)"
+        );
+        assert_eq!(device_capacity_text(200_000, window), "up to 200000 tokens");
+        let json = serde_json::json!({"free": 1, "weights": 1, "scratch": 1, "page_rounding": 1,
+            "bytes_per_token": 1, "card_cap": 1_680_000, "model_ctx": 262_144});
+        assert!(capacity_lines(&json, None)[0].starts_with(
+            "up to 262144 tokens (model limit; KV room for 1.68M) (pre-load estimate: "
+        ));
+        // A lowering fix never goes past the window.
+        assert!(lower_context_fix(&p, None).contains("at most 262144 "));
     }
 
     #[test]

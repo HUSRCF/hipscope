@@ -146,6 +146,9 @@ pub(crate) struct FitDevice {
     /// where no projection ran.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub capacity: Option<u64>,
+    /// `capacity` capped at the model's trained window (what the report shows).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capacity_shown: Option<u64>,
     /// `HIP_VISIBLE_DEVICES` value that selects this GPU (UUID, else ROCr
     /// ordinal). Report text only.
     #[serde(skip)]
