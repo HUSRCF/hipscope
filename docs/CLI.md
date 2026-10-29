@@ -879,9 +879,12 @@ Single-invocation knobs (non-exhaustive; full list in [env-vars.md](env-vars.md)
 |---|---|
 | Unknown command | `hipfire help` |
 | Unknown config key | `hipfire config set` prints valid keys; see [CONFIG.md](CONFIG.md) |
-| Model missing | `hipfire list` / `pull` |
+| Model missing (`model not found: ... expected <models>/<file>`) | `hipfire pull <tag>`; a local-only entry: place the named file in the models dir; a path: check it or use a tag from `hipfire list -r`; an unknown tag: the did-you-mean list, then `hipfire pull <closest>` |
+| Daemon missing (`daemon binary not found`) | `cargo build --release -p hipfire-daemon`, install it at `~/.hipfire/bin/daemon`, or set `HIPFIRE_DAEMON_BIN` |
+| Draft missing (`DFlash draft not found`) | Registry tag: `hipfire pull <tag>` and drop `--model-draft`; otherwise pass an existing `-md <path>` or run with `--spec off` |
+| Vision sidecar missing (`vision sidecar not found`) | Pass an existing `--vision <path>`, `hipfire pull <tag>` for the registry tower, or turn vision off: `HIPFIRE_VISION_MODE=off` / `hipfire config set vision.mode off` |
 | Serve already running | `hipfire stop` or `restart` |
-| Stale pid / port busy | `hipfire stop --force`; inspect `serve.log` |
+| Stale pid / port busy (`port N is in use by another process`) | `hipfire stop --force`; inspect `serve.log`; or pick another port: `hipfire serve [model] 127.0.0.1 <port>` (default: `hipfire config set serve.port <port>`) |
 | `update` on non-Linux | Re-run `install.ps1 -Branch/-Tag/-Commit` or use a source build |
 | `update` from a detached pin | Choose the next target explicitly, e.g. `hipfire update @beta` |
 | Need HTTP API detail | [SERVE.md](SERVE.md) |

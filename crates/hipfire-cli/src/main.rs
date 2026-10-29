@@ -2694,13 +2694,8 @@ fn run_command(paths: &Paths, args: RunArgs) -> Result<()> {
             model_path = find_model_path(paths, registry, &args.model);
         }
     }
-    let model_path = model_path.ok_or_else(|| {
-        anyhow!(
-            "model not found: {}{}",
-            args.model,
-            model_suggestions(registry, &args.model)
-        )
-    })?;
+    let model_path =
+        model_path.ok_or_else(|| model_not_found_error(paths, registry, &args.model))?;
     if let Some(image) = &args.image {
         if !image.is_file() {
             bail!("image not found: {}", image.display());
@@ -2708,12 +2703,31 @@ fn run_command(paths: &Paths, args: RunArgs) -> Result<()> {
     }
     if let Some(draft) = &args.model_draft {
         if !draft.is_file() {
-            bail!("DFlash draft not found: {}", draft.display());
+            let fix = match card.pullable().filter(|entry| entry.dflash.is_some()).and(card.tag()) {
+                Some(tag) => format!(
+                    "fetch the registry draft: hipfire pull {tag} (then drop --model-draft to use it)"
+                ),
+                None => "pass an existing draft with -md <path>, or run without it: --spec off"
+                    .to_owned(),
+            };
+            bail!("DFlash draft not found: {}\n  {fix}", draft.display());
         }
     }
     if let Some(vision) = &args.vision {
         if !vision.is_file() {
-            bail!("vision sidecar not found: {}", vision.display());
+            let pull = match card
+                .pullable()
+                .filter(|entry| entry.vision.is_some())
+                .and(card.tag())
+            {
+                Some(tag) => format!(", fetch the registry vision tower: hipfire pull {tag}"),
+                None => String::new(),
+            };
+            bail!(
+                "vision sidecar not found: {}\n  pass an existing --vision <path>{pull}, or disable \
+                 vision: HIPFIRE_VISION_MODE=off (hipfire config set vision.mode off)",
+                vision.display()
+            );
         }
     }
     if args
@@ -2791,9 +2805,7 @@ fn run_command(paths: &Paths, args: RunArgs) -> Result<()> {
         true,
     )?;
 
-    let daemon = find_daemon(paths).ok_or_else(|| {
-        anyhow!("daemon binary not found; build `cargo build --release -p hipfire-daemon`")
-    })?;
+    let daemon = find_daemon(paths).ok_or_else(|| daemon_not_found_error(paths))?;
     let process_config = hipfire_config::ProcessConfig::from_resolved(&resolved)?;
     let mut engine = Engine::spawn_configured(
         &daemon,
@@ -3281,13 +3293,11 @@ fn img_command(paths: &Paths, args: ImgArgs) -> Result<()> {
                 args.model
             )
         } else {
-            anyhow!("model not found: {}", args.model)
+            model_not_found_error(paths, registry, &args.model)
         }
     })?;
     let resolved = resolved_for_model(paths, &args.model, canonical.as_deref(), entry)?;
-    let daemon = find_daemon(paths).ok_or_else(|| {
-        anyhow!("daemon binary not found; build `cargo build --release -p hipfire-daemon`")
-    })?;
+    let daemon = find_daemon(paths).ok_or_else(|| daemon_not_found_error(paths))?;
     let process_config = hipfire_config::ProcessConfig::from_resolved(&resolved)?;
     let engine = Engine::spawn_configured(
         &daemon,
@@ -3481,13 +3491,11 @@ fn embed_command(paths: &Paths, args: EmbedArgs) -> Result<()> {
             std::fs::canonicalize(&direct).unwrap_or(direct)
         } else {
             find_model_path(paths, registry, &args.model)
-                .ok_or_else(|| anyhow!("model not found: {}", args.model))?
+                .ok_or_else(|| model_not_found_error(paths, registry, &args.model))?
         }
     };
     let resolved = resolved_for_model(paths, &args.model, None, None)?;
-    let daemon = find_daemon(paths).ok_or_else(|| {
-        anyhow!("daemon binary not found; build `cargo build --release -p hipfire-daemon`")
-    })?;
+    let daemon = find_daemon(paths).ok_or_else(|| daemon_not_found_error(paths))?;
     let process_config = hipfire_config::ProcessConfig::from_resolved(&resolved)?;
     let engine = Engine::spawn_configured(
         &daemon,
@@ -7317,7 +7325,7 @@ fn open_bench_engine(
         // Do not hash a payload twice after a verified pull.
         path = find_model_path(paths, &registry, &args.model);
     }
-    let path = path.ok_or_else(|| anyhow!("model not found: {}", args.model))?;
+    let path = path.ok_or_else(|| model_not_found_error(paths, &registry, &args.model))?;
     let resolved = resolved_for_model(paths, &args.model, tag.as_deref(), entry.as_ref())?;
     ple::ensure_ple_sidecar(
         entry.as_ref(),
@@ -7338,7 +7346,7 @@ fn open_bench_engine(
     });
     let model_limit = run_need.and_then(|_| bench_declared_context(&path));
     let mut max_seq = plan_bench_max_seq(args.max_seq, run_need, model_limit, &args.model)?;
-    let daemon = find_daemon(paths).ok_or_else(|| anyhow!("daemon binary not found"))?;
+    let daemon = find_daemon(paths).ok_or_else(|| daemon_not_found_error(paths))?;
     let environment = BTreeMap::new();
     let mut process_config = hipfire_config::ProcessConfig::from_resolved(&resolved)?;
     if args.redline {
@@ -8119,7 +8127,7 @@ fn profile_command(paths: &Paths, args: ProfileArgs) -> Result<()> {
     } else {
         let (_, resolved) = resolved_global(paths, true)?;
         let process_config = hipfire_config::ProcessConfig::from_resolved(&resolved)?;
-        let daemon = find_daemon(paths).ok_or_else(|| anyhow!("daemon binary not found"))?;
+        let daemon = find_daemon(paths).ok_or_else(|| daemon_not_found_error(paths))?;
         let mut engine =
             Engine::spawn_configured(&daemon, &BTreeMap::new(), &process_config, None)?;
         engine.ping()?;
@@ -9294,7 +9302,7 @@ fn sidecar_command(paths: &Paths, args: SidecarArgs) -> Result<()> {
     }
     let registry = load_registry(&paths.registry).registry;
     let model = find_model_path(paths, &registry, &args.model)
-        .ok_or_else(|| anyhow!("model not found: {}", args.model))?;
+        .ok_or_else(|| model_not_found_error(paths, &registry, &args.model))?;
     let output = args
         .output
         .unwrap_or_else(|| PathBuf::from(format!("{}.triattn.bin", model.display())));
@@ -9852,6 +9860,21 @@ fn command_version(command: &str, argument: &str) -> Option<String> {
         .filter(|line| !line.is_empty())
 }
 
+/// The refusal for a missing daemon binary: the build command and the install
+/// path [`find_daemon_in`] probes for the daemon (its other candidates are the
+/// running executable's directory and the source-tree `target/`).
+pub(crate) fn daemon_not_found_error(paths: &Paths) -> anyhow::Error {
+    let installed = paths
+        .root
+        .join("bin")
+        .join(daemon_bin_names(cfg!(windows))[0]);
+    anyhow!(
+        "daemon binary not found; build `cargo build --release -p hipfire-daemon` (expected at \
+         {}, or set HIPFIRE_DAEMON_BIN)",
+        installed.display()
+    )
+}
+
 pub(crate) fn find_daemon(paths: &Paths) -> Option<PathBuf> {
     if let Some(path) = env::var_os("HIPFIRE_DAEMON_BIN").map(PathBuf::from) {
         if path.is_file() {
@@ -10097,6 +10120,25 @@ fn model_suggestions(registry: &RegistryV1, input: &str) -> String {
     if input.contains(std::path::MAIN_SEPARATOR) {
         return String::new();
     }
+    let mut message = String::new();
+    let close = close_model_tags(registry, input);
+    if !close.is_empty() {
+        message.push_str(&format!("\n  did you mean: {}?", close.join(", ")));
+    }
+    message.push_str("\n  see: hipfire list -r");
+    message
+}
+
+pub(crate) fn unknown_model_error(registry: &RegistryV1, input: &str) -> anyhow::Error {
+    anyhow!(
+        "unknown model '{input}'{}",
+        model_suggestions(registry, input)
+    )
+}
+
+/// Tags and aliases close to `input` (case-insensitive edit distance), nearest
+/// first, at most three.
+fn close_model_tags<'r>(registry: &'r RegistryV1, input: &str) -> Vec<&'r str> {
     let needle = input.to_lowercase();
     let limit = (needle.chars().count() / 4).max(2);
     let mut close = registry
@@ -10108,22 +10150,70 @@ fn model_suggestions(registry: &RegistryV1, input: &str) -> String {
         .collect::<Vec<_>>();
     close.sort_unstable();
     close.dedup_by(|a, b| a.1 == b.1);
-    let mut message = String::new();
-    if !close.is_empty() {
-        let tags = close
-            .iter()
-            .take(3)
-            .map(|(_, tag)| *tag)
-            .collect::<Vec<_>>();
-        message.push_str(&format!("\n  did you mean: {}?", tags.join(", ")));
-    }
-    message.push_str("\n  see: hipfire list -r");
-    message
+    close.into_iter().take(3).map(|(_, tag)| tag).collect()
 }
 
-pub(crate) fn unknown_model_error(registry: &RegistryV1, input: &str) -> anyhow::Error {
+/// Whether a model argument names a file rather than a registry tag: it has a
+/// path separator or ends in a model extension.
+fn looks_like_model_path(input: &str) -> bool {
+    const EXTENSIONS: &[&str] = &[
+        ".hfq",
+        ".hf4",
+        ".mq4",
+        ".mq3",
+        ".mq6",
+        ".mq8",
+        ".mq4r",
+        ".mq4-xt",
+        ".gguf",
+        ".safetensors",
+    ];
+    let lower = input.to_ascii_lowercase();
+    input.contains('/')
+        || input.contains('\\')
+        || EXTENSIONS
+            .iter()
+            .any(|extension| lower.ends_with(extension))
+}
+
+/// The refusal for a model argument that resolved to no local file, naming the
+/// expected file and the exact next command.
+///
+/// - a registry (or retired) entry: the file expected in the models dir, and
+///   `hipfire pull <tag>` when the entry is downloadable, else where to place it;
+/// - a path: the missing path and how to name a registry tag instead;
+/// - anything else: an unknown tag, with the registry's did-you-mean list and
+///   the pull command for the closest tag.
+pub(crate) fn model_not_found_error(
+    paths: &Paths,
+    registry: &RegistryV1,
+    input: &str,
+) -> anyhow::Error {
+    let card = model_card(paths, registry, input);
+    if let Some((tag, entry)) = card.pair() {
+        let expected = paths.models.join(&entry.file);
+        let fix = if card.pullable().is_some_and(|entry| !entry.repo.is_empty()) {
+            format!("fetch it: hipfire pull {tag}")
+        } else {
+            format!("place {} in {}", entry.file, paths.models.display())
+        };
+        return anyhow!(
+            "model not found: {tag} — expected {}, which is not on disk.\n  {fix}",
+            expected.display()
+        );
+    }
+    if looks_like_model_path(input) {
+        return anyhow!(
+            "model not found: {input} (no such file)\n  check the path, or use a registry tag: \
+             hipfire list -r"
+        );
+    }
+    let then = close_model_tags(registry, input)
+        .first()
+        .map(|tag| format!("\n  then: hipfire pull {tag}"))
+        .unwrap_or_default();
     anyhow!(
-        "unknown model '{input}'{}",
+        "model not found: {input}{}{then}",
         model_suggestions(registry, input)
     )
 }
@@ -14209,6 +14299,89 @@ effort = "high"
         assert!(!message.contains("did you mean"), "{message}");
         assert!(message.contains("see: hipfire list -r"), "{message}");
         assert_eq!(edit_distance("kitten", "sitting"), 3);
+    }
+
+    #[test]
+    fn model_not_found_names_the_expected_file_and_the_pull_command() {
+        let paths = test_paths("model-not-found-tag");
+        let registry = rm_test_registry(&[("qwen3.5:4b", "qwen3.5-4b.mq4", None)]);
+        let message = model_not_found_error(&paths, &registry, "qwen3.5:4b").to_string();
+        let expected = format!(
+            "model not found: qwen3.5:4b — expected {}, which is not on disk.\n  fetch it: hipfire pull qwen3.5:4b",
+            paths.models.join("qwen3.5-4b.mq4").display()
+        );
+        assert_eq!(message, expected);
+        // The bare file name resolves to the same entry, so the tag is named.
+        let message = model_not_found_error(&paths, &registry, "qwen3.5-4b.mq4").to_string();
+        assert_eq!(message, expected);
+    }
+
+    #[test]
+    fn model_not_found_for_a_local_only_entry_says_where_to_place_it() {
+        let paths = test_paths("model-not-found-local-only");
+        let mut registry = rm_test_registry(&[("local:tune", "local-tune.mq4", None)]);
+        registry.models.get_mut("local:tune").unwrap().repo = String::new();
+        let message = model_not_found_error(&paths, &registry, "local:tune").to_string();
+        let expected = format!(
+            "model not found: local:tune — expected {}, which is not on disk.\n  place local-tune.mq4 in {}",
+            paths.models.join("local-tune.mq4").display(),
+            paths.models.display()
+        );
+        assert_eq!(message, expected);
+        assert!(!message.contains("hipfire pull"), "{message}");
+    }
+
+    #[test]
+    fn model_not_found_for_a_path_points_at_the_registry_tags() {
+        let paths = test_paths("model-not-found-path");
+        let registry = rm_test_registry(&[("qwen3.5:4b", "qwen3.5-4b.mq4", None)]);
+        for input in ["/nonexistent/dir/model.hfq", "no-separator.hfq"] {
+            let message = model_not_found_error(&paths, &registry, input).to_string();
+            assert_eq!(
+                message,
+                format!(
+                    "model not found: {input} (no such file)\n  check the path, or use a registry tag: hipfire list -r"
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn model_not_found_for_an_unknown_tag_keeps_the_suggestions_and_adds_the_pull() {
+        let paths = test_paths("model-not-found-unknown");
+        let registry = rm_test_registry(&[
+            ("qwen3.5:4b", "qwen3.5-4b.mq4", None),
+            ("qwen3.5:9b", "qwen3.5-9b.mq4", None),
+        ]);
+        let message = model_not_found_error(&paths, &registry, "qwen3.5:4bb").to_string();
+        assert!(
+            message.starts_with("model not found: qwen3.5:4bb"),
+            "{message}"
+        );
+        assert!(message.contains("did you mean: qwen3.5:4b"), "{message}");
+        assert!(message.contains("see: hipfire list -r"), "{message}");
+        assert!(
+            message.ends_with("then: hipfire pull qwen3.5:4b"),
+            "{message}"
+        );
+        let message = model_not_found_error(&paths, &registry, "llama3:8b").to_string();
+        assert!(!message.contains("did you mean"), "{message}");
+        assert!(!message.contains("then:"), "{message}");
+        assert!(message.ends_with("see: hipfire list -r"), "{message}");
+    }
+
+    #[test]
+    fn daemon_not_found_names_the_build_command_and_the_install_path() {
+        let paths = test_paths("daemon-not-found");
+        let message = daemon_not_found_error(&paths).to_string();
+        assert!(
+            message.contains("build `cargo build --release -p hipfire-daemon`"),
+            "{message}"
+        );
+        assert!(
+            message.contains(&paths.root.join("bin").display().to_string()),
+            "{message}"
+        );
     }
 
     #[test]

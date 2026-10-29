@@ -149,7 +149,11 @@ pub trait Carrier: Send + Sync {
         _state: &'m mut Option<Box<dyn hipfire_runtime::arch_model::ArchModel>>,
         _model_path: &str,
     ) -> Result<Box<dyn SpecTargetGuard + 'm>, String> {
-        Err(format!("{}: spec-decode target unsupported", self.name()))
+        Err(format!(
+            "{}: spec-decode target unsupported; load without speculation: --spec off \
+             (speculation.mode = \"off\")",
+            self.name()
+        ))
     }
 
     /// Construct this model's per-token spec-decode emitter from the
@@ -160,7 +164,11 @@ pub trait Carrier: Send + Sync {
         &self,
         _ctx: SpecEmitCtx<'a>,
     ) -> Result<Box<dyn SpecEmit + 'a>, String> {
-        Err(format!("{}: spec emitter unsupported", self.name()))
+        Err(format!(
+            "{}: spec emitter unsupported; load without speculation: --spec off \
+             (speculation.mode = \"off\")",
+            self.name()
+        ))
     }
 
     // ── GenDispatch (wave2) — arch-erased generation/bench hooks ──────────

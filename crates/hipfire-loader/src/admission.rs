@@ -515,6 +515,10 @@ pub fn qwen4_request_admission(
 /// (R9700). Every rank must be the SAME one of them (homogeneous).
 pub const QWEN4_EP_ARCHS: [&str; 2] = ["gfx1100", "gfx1201"];
 
+/// The refusal for a safetensors directory handed to a Flash-Next (qwen4) load.
+pub(crate) const QWEN4_SAFETENSORS_REFUSAL: &str = "qwen4: safetensors is a conversion input, \
+     not an executable HFQ artifact; quantize it first: hipfire quantize <dir>";
+
 /// Under the developer-only logical emulation (`HIPFIRE_EMULATE_GPUS`) the
 /// ranks also run aliased on gfx1151 (Strix Halo has one GPU): that proves
 /// byte parity and lifecycle on one device, never a physical EP admission.
@@ -948,9 +952,7 @@ pub fn admit_qwen4_source(
 ) -> Result<Qwen4SourceAdmission, String> {
     qwen4_request_admission(effective_mesh, modality, native_mtp)?;
     let ModelSource::Hfq(hfq) = source else {
-        return Err(
-            "qwen4: safetensors is a conversion input, not an executable HFQ artifact".into(),
-        );
+        return Err(QWEN4_SAFETENSORS_REFUSAL.into());
     };
     let receipt = hipfire_arch_qwen4::admit_hfqm_artifact_on(hfq, Some(gpu_arch))
         .map_err(|error| error.to_string())?;

@@ -675,9 +675,7 @@ impl Carrier for Qwen4Carrier {
         _kv_backend: KvBackend,
     ) -> Result<(), String> {
         if is_dir {
-            return Err(
-                "qwen4: safetensors is a conversion input, not an executable HFQ artifact".into(),
-            );
+            return Err(crate::admission::QWEN4_SAFETENSORS_REFUSAL.into());
         }
         if pp == 0 || pp > QWEN4_PP_MAX {
             return Err(format!(
@@ -1956,9 +1954,7 @@ fn plan_qwen4_ep(
         );
     }
     let ModelSource::Hfq(hfq) = src else {
-        return Err(
-            "qwen4: safetensors is a conversion input, not an executable HFQ artifact".into(),
-        );
+        return Err(crate::admission::QWEN4_SAFETENSORS_REFUSAL.into());
     };
     let receipt = hipfire_arch_qwen4::admit_hfqm_artifact_on(hfq, Some(&gpu.arch))
         .map_err(|error| error.to_string())?;
@@ -2758,9 +2754,7 @@ pub fn qwen4_ep_vram_layers(
     batch: &hipfire_runtime::loader_api::BatchLoadRequest,
 ) -> Result<hipfire_arch_qwen4::expert_residency::EpVramPlan, String> {
     let ModelSource::Hfq(hfq) = src else {
-        return Err(
-            "qwen4: safetensors is a conversion input, not an executable HFQ artifact".into(),
-        );
+        return Err(crate::admission::QWEN4_SAFETENSORS_REFUSAL.into());
     };
     // Logical emulation (`HIPFIRE_EMULATE_GPUS`) aliases every rank onto one
     // device, so a UMA APU (gfx1151) runs it with the per-alias VRAM split.
@@ -4192,9 +4186,7 @@ fn load_qwen4_rank_scoped(
         kv_mode: shared.kv_mode.as_str(),
     };
     let ModelSource::Hfq(mut hfq) = src else {
-        return Err(
-            "qwen4: safetensors is a conversion input, not an executable HFQ artifact".into(),
-        );
+        return Err(crate::admission::QWEN4_SAFETENSORS_REFUSAL.into());
     };
     // The PLE rows source (`memory.ple_format`).  Admission already
     // resolved and attached a sidecar on this source; resolving again is
@@ -7488,9 +7480,7 @@ fn load_qwen4_pp_bundle(
     }
     let (scopes, edge_bytes, chunk_rows) = {
         let ModelSource::Hfq(hfq) = &src else {
-            return Err(
-                "qwen4: safetensors is a conversion input, not an executable HFQ artifact".into(),
-            );
+            return Err(crate::admission::QWEN4_SAFETENSORS_REFUSAL.into());
         };
         let receipt = q4::admit_hfqm_artifact_on(hfq, Some(&daemon.arch))
             .map_err(|error| error.to_string())?;
