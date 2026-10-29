@@ -8033,6 +8033,10 @@ mod tests {
     ) -> crate::slowlink_sp::SpLoadFacts<'static> {
         crate::slowlink_sp::SpLoadFacts {
             knob,
+            touched_knob: false,
+            force_all: false,
+            pages: 18,
+            window_rows: profile.window_rows,
             s1_route: Some(profile.geometry.route),
             arch: "gfx1100",
             n_exp: 512,

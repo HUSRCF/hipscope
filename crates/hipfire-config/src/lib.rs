@@ -4077,6 +4077,7 @@ const TYPED_BOOL_DEVELOPER_KEYS: &[&str] = &[
     "developer.qwen4_d2_default",
     "developer.qwen4_mtp_head_d2",
     "developer.qwen4_sp",
+    "developer.qwen4_sp_touched",
     "developer.moe_sym_iu4",
     "developer.qwen4_slowlink_prefill",
     "developer.gdn_qk_indexed",
@@ -7148,6 +7149,37 @@ mod tests {
     #[should_panic(expected = "HIPFIRE_QWEN4_SP")]
     fn qwen4_sp_panics_on_an_unparseable_snapshot_value() {
         typed_developer_bool_value("HIPFIRE_QWEN4_SP", Some("garbage"));
+    }
+
+    #[test]
+    fn qwen4_sp_touched_is_a_typed_bool_developer_key_default_off() {
+        const KEY: &str = "developer.qwen4_sp_touched";
+        const ENV: &str = "HIPFIRE_QWEN4_SP_TOUCHED";
+        assert!(is_developer_key(KEY));
+        assert!(is_typed_bool_developer_key(KEY));
+        assert_eq!(developer_key_for_env(ENV).as_deref(), Some(KEY));
+        assert_ne!(KEY, "developer.qwen4_sp");
+        assert_eq!(typed_developer_bool_value(ENV, None), None);
+        for (raw, want) in [("1", true), ("true", true), ("0", false), ("false", false)] {
+            assert_eq!(
+                typed_developer_bool_value(ENV, Some(raw)),
+                Some(want),
+                "{raw}"
+            );
+            let mut layer = ConfigLayer::default();
+            layer.set_cli(KEY, raw).unwrap();
+            assert_eq!(layer.get(KEY), Some(&ConfigValue::Bool(want)), "{raw}");
+            layer.validate().unwrap();
+        }
+        for bad in ["", "2", "on", "off", "yes", "maybe"] {
+            let mut layer = ConfigLayer::default();
+            let error = layer.set_cli(KEY, bad).unwrap_err();
+            assert!(
+                matches!(&error, ConfigError::InvalidValue { key, .. } if key == KEY),
+                "{bad:?}: {error}"
+            );
+            assert!(layer.values.is_empty(), "{bad:?} must not be stored");
+        }
     }
 
     const MOE_SYM_IU4_KEY: &str = "developer.moe_sym_iu4";
@@ -10519,6 +10551,19 @@ pub mod memory {
     /// other load-time admission rules; any failed rule declines it by name.
     pub fn qwen4_sp() -> bool {
         super::developer_typed_bool("HIPFIRE_QWEN4_SP").unwrap_or(false)
+    }
+
+    /// `developer.qwen4_sp_touched` (env `HIPFIRE_QWEN4_SP_TOUCHED`), a typed
+    /// boolean read once per Qwen4 load by the S1 short-prompt prefill hook's
+    /// touched-only mode (SP `TouchedOnly`: stream exactly the experts a layer
+    /// routes to, run S1's own per-panel pipeline over them, no CPU expert, byte-identical
+    /// to the stream-all sweep). Default **off** until its card gates close (it is
+    /// intended to become the gfx1100 default): only an explicit `true`/`1` arms
+    /// it. It needs an admitted S1 profile, gfx1100 and the `Aggregate` window
+    /// route; a failed rule declines it by name. With `developer.qwen4_sp` also
+    /// on, the hybrid SP mode wins.
+    pub fn qwen4_sp_touched() -> bool {
+        super::developer_typed_bool("HIPFIRE_QWEN4_SP_TOUCHED").unwrap_or(false)
     }
 
     /// Developer kill switch `HIPFIRE_QWEN4_DIRECT_LOAD` for the discrete-GPU

@@ -17,18 +17,25 @@
 //! * **selection** ([`sp_window_verdicts`]): one pre-mutation verdict per
 //!   window;
 //! * **execution** ([`Run::sp_host_layer`]): the per-layer protocol of §3.
+//!
+//! The touched-only mode ([`SpMode::TouchedOnly`], `developer.qwen4_sp_touched`) is
+//! the same selection and request range with none of the hybrid machinery: no CPU
+//! arm, no owner, no K2-ized tail ([`Run::touched_host_layer`]).
 
 use super::*;
 use crate::gpu_forward::panel_stage::{RingSchedule, SpSchedule};
 use crate::slowlink_admission::qualify_request_sp;
 use crate::slowlink_sp::{
-    admit_sp, qualify_sp_window, SpBypass, SpDecline, SpEventBackend, SpLoadFacts, SpProfile,
-    SpProtocol, SpProtocolError, SP_MAX_ROWS,
+    admit_sp, qualify_sp_window, sp_mode_for, SpBypass, SpDecline, SpEventBackend, SpLoadFacts,
+    SpMode, SpProfile, SpProtocol, SpProtocolError, SP_MAX_ROWS,
 };
 use hipfire_dispatch::cpu_exec::{
     cpu_quant_for, moe_cpu_grouped_rows_bf16, CpuMoeExpert, SpCpuExpert, SpCpuScratch, SpCpuStats,
 };
-use hipfire_dispatch::pipeline::sp_layer::{exact_counts, plan_sp_layer, SpLayerPlan, SpLimits};
+use hipfire_dispatch::pipeline::sp_layer::{
+    exact_counts, plan_sp_layer, touched_binding_ranges, touched_experts, touched_groups,
+    SpLayerPlan, SpLimits,
+};
 use hipfire_dispatch::sp_plan::SplitCost;
 use rayon::prelude::*;
 
@@ -47,6 +54,9 @@ fn proto_err(error: SpProtocolError) -> Qwen4GpuForwardError {
 
 /// Where the layer's experts go. Production is always [`Self::Auto`]; the lab
 /// knob `HIPFIRE_QWEN4_SP_FORCE_K` selects the other two (V2a / V2b gates).
+/// [`Self::All`] (k = U) selects the touched-only mode at load
+/// ([`sp_mode_for`]), never the hybrid planner; the hybrid planner keeps it as a
+/// cost model ([`sp_layer_cost`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[cfg_attr(not(any(test, feature = "lab")), allow(dead_code))]
 pub(crate) enum SpPlacement {
@@ -210,9 +220,37 @@ pub(crate) fn sp_window_layout(
     Ok(layout)
 }
 
-/// What the load admitted: the plan [`SpRuntime::bind`] needs, or the sticky
-/// named decline.
-pub(crate) type SpOutcome = Result<SpBindPlan, SpDecline>;
+/// What the load admitted: the plan the armed mode needs, or the sticky named
+/// decline.
+pub(crate) type SpOutcome = Result<SpBind, SpDecline>;
+
+/// The armed mode's bind plan.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum SpBind {
+    /// Bind the hybrid owners ([`SpRuntime::bind`]).
+    Hybrid(SpBindPlan),
+    /// Bind nothing: the touched-only state ([`TouchedRuntime`]) allocates no device
+    /// or pinned memory.
+    TouchedOnly(TouchedBindPlan),
+}
+
+impl SpBind {
+    /// The admitted profile (its `mode` names the variant).
+    pub(crate) fn profile(&self) -> SpProfile {
+        match self {
+            Self::Hybrid(plan) => plan.profile,
+            Self::TouchedOnly(plan) => plan.profile,
+        }
+    }
+}
+
+/// Everything [`TouchedRuntime::new`] needs.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct TouchedBindPlan {
+    pub(crate) profile: SpProfile,
+    pub(crate) pages: usize,
+    pub(crate) trace: bool,
+}
 
 /// Everything [`SpRuntime::bind`] needs.
 #[derive(Clone, Copy, Debug)]
@@ -228,61 +266,88 @@ pub(crate) struct SpBindPlan {
     pub(crate) trace: bool,
 }
 
-/// Decide SP at load (knob on), after S1's own runtime plan passed and before
+/// Decide SP at load (a knob on), after S1's own runtime plan passed and before
 /// any owner is bound. Reads only; allocates nothing. The outer `Err` is a lab
 /// placement typo (a named load failure, never a silent default).
+///
+/// The hybrid-only facts (the CPU quants, the splice pool, the SP-layout fit, the
+/// pinned budget, the prefix cache) are gathered only when the knobs select the
+/// hybrid mode; touched-only never reads them.
 pub(crate) fn sp_load_decision(
     forward: &Qwen4GpuForward,
     gpu: &Gpu,
     profile: &SlowlinkProfile,
     pages: usize,
 ) -> Result<SpOutcome, String> {
-    let knob = true;
     let placement = lab_placement()?;
-    let dtypes = uniform_cpu_dtypes(forward.band_layers().flat_map(|layer| {
-        forward
-            .moe
-            .get(layer)
-            .and_then(Option::as_ref)
-            .filter(|runtime| runtime.s1_host_mapped())
-            .into_iter()
-            .flat_map(|runtime| {
-                (0..runtime.s1_num_experts()).filter_map(|id| runtime.s1_expert_dtypes(id))
-            })
-    }));
+    let hybrid_knob = hipfire_config::memory::qwen4_sp();
+    let touched_knob = hipfire_config::memory::qwen4_sp_touched();
+    let force_all = placement == SpPlacement::All;
+    let mode = sp_mode_for(hybrid_knob, touched_knob, force_all);
     let route = profile.geometry.route;
-    let workers = (gpu.arch == crate::slowlink_sp::SP_ARCH && route == dsp::WindowRoute::Aggregate)
-        .then(hipfire_dispatch::cpu_exec::splice_pool_threads);
-    let facts = SpLoadFacts {
-        knob,
+    let mut facts = SpLoadFacts {
+        knob: hybrid_knob,
+        touched_knob,
+        force_all,
+        pages,
+        window_rows: profile.window_rows,
         s1_route: Some(route),
         arch: &gpu.arch,
         n_exp: profile.geometry.num_experts,
-        cpu_gate_up_quant: dtypes.is_some(),
-        cpu_down_quant: dtypes.is_some(),
-        splice_workers: workers,
-        region_fit_rows: sp_region_fit_rows(profile),
+        cpu_gate_up_quant: false,
+        cpu_down_quant: false,
+        splice_workers: None,
+        region_fit_rows: 0,
         hidden: profile.geometry.hidden,
-        pinned_budget_bytes: sp_pinned_budget(
+        pinned_budget_bytes: 0,
+        prefix_cache: false,
+    };
+    let mut dtypes = None;
+    if mode == Some(SpMode::Hybrid) {
+        dtypes = uniform_cpu_dtypes(forward.band_layers().flat_map(|layer| {
+            forward
+                .moe
+                .get(layer)
+                .and_then(Option::as_ref)
+                .filter(|runtime| runtime.s1_host_mapped())
+                .into_iter()
+                .flat_map(|runtime| {
+                    (0..runtime.s1_num_experts()).filter_map(|id| runtime.s1_expert_dtypes(id))
+                })
+        }));
+        facts.cpu_gate_up_quant = dtypes.is_some();
+        facts.cpu_down_quant = dtypes.is_some();
+        facts.splice_workers = (gpu.arch == crate::slowlink_sp::SP_ARCH
+            && route == dsp::WindowRoute::Aggregate)
+            .then(hipfire_dispatch::cpu_exec::splice_pool_threads);
+        facts.region_fit_rows = sp_region_fit_rows(profile);
+        facts.pinned_budget_bytes = sp_pinned_budget(
             rdna_compute::kv_slots::mem_available_bytes(),
             crate::expert_residency::ttm_pool_estimate_on(gpu),
             profile.host_pinned_bytes(),
-        ),
-        prefix_cache: serve_prefix_cache(),
-    };
-    Ok(admit_sp(&facts).map(|sp| {
-        // `admit_sp` returned Ok, so `dtypes` is Some.
-        let (gate_up, down) = dtypes.unwrap_or((DType::MQ4G256V2, DType::MQ4G128V2));
-        SpBindPlan {
+        );
+        facts.prefix_cache = serve_prefix_cache();
+    }
+    Ok(admit_sp(&facts).map(|sp| match sp.mode {
+        SpMode::TouchedOnly => SpBind::TouchedOnly(TouchedBindPlan {
             profile: sp,
-            gate_up,
-            down,
-            hidden: profile.geometry.hidden,
-            mi: profile.geometry.moe_intermediate,
-            n_exp: profile.geometry.num_experts,
             pages,
-            placement,
             trace: lab_trace(),
+        }),
+        SpMode::Hybrid => {
+            // `admit_sp` returned a hybrid profile, so `dtypes` is Some.
+            let (gate_up, down) = dtypes.unwrap_or((DType::MQ4G256V2, DType::MQ4G128V2));
+            SpBind::Hybrid(SpBindPlan {
+                profile: sp,
+                gate_up,
+                down,
+                hidden: profile.geometry.hidden,
+                mi: profile.geometry.moe_intermediate,
+                n_exp: profile.geometry.num_experts,
+                pages,
+                placement,
+                trace: lab_trace(),
+            })
         }
     }))
 }
@@ -564,6 +629,7 @@ pub(crate) fn sp_receipt_json(summary: &SpSummary, windows: &[SpWindowEntry]) ->
     Some(json!({
         "knob": true,
         "armed": armed,
+        "mode": summary.admitted.map(|sp| sp.mode.label()),
         "decline": summary.decline.as_ref().map(ToString::to_string),
         "decline_reason": summary.decline.as_ref().map(|decline| decline.label()),
         "unavailable": summary.unavailable,
@@ -843,11 +909,77 @@ impl SpRuntime {
     }
 }
 
+// ── touched-only state ────────────────────────────────────────────────
+
+/// Everything the touched-only mode keeps after load. It binds nothing: the sweep
+/// is S1's own, on S1's ring, route region and streams; this is only the per-window
+/// accounting, the receipt reports and the sticky failure.
+pub(crate) struct TouchedRuntime {
+    pub(crate) profile: SpProfile,
+    pages: usize,
+    trace: bool,
+    /// A touched-only window is open: [`Run::host_layer`] takes the touched path.
+    in_window: bool,
+    /// The window in flight.
+    acc: SpWindowReport,
+    /// Streamed payload bytes the window's layer schedules submitted.
+    submitted: u64,
+    /// Every executed window's report, by window index; cleared per request.
+    reports: Vec<(usize, SpWindowReport)>,
+    /// Why the mode was disabled (the sticky `sp_unavailable`).
+    failure: Option<String>,
+}
+
+impl TouchedRuntime {
+    pub(crate) fn new(plan: &TouchedBindPlan) -> Self {
+        Self {
+            profile: plan.profile,
+            pages: plan.pages,
+            trace: plan.trace,
+            in_window: false,
+            acc: SpWindowReport::default(),
+            submitted: 0,
+            reports: Vec::new(),
+            failure: None,
+        }
+    }
+
+    /// Whether a failed window disabled the mode for the process.
+    pub(crate) fn unavailable(&self) -> Option<&str> {
+        self.failure.as_deref()
+    }
+
+    /// Every executed window's report, by window index.
+    pub(crate) fn reports(&self) -> &[(usize, SpWindowReport)] {
+        &self.reports
+    }
+
+    /// Forget the previous request's window reports.
+    pub(crate) fn begin_request(&mut self) {
+        self.reports.clear();
+    }
+
+    pub(crate) fn in_window(&self) -> bool {
+        self.in_window
+    }
+
+    fn begin_window(&mut self) -> Result<(), String> {
+        if self.in_window {
+            return Err("a touched-only window began inside another".to_string());
+        }
+        self.in_window = true;
+        self.acc = SpWindowReport::default();
+        self.submitted = 0;
+        Ok(())
+    }
+}
+
 // ── the layer flow ────────────────────────────────────────────────────
 
 /// One layer's trace record (lab `HIPFIRE_QWEN4_SP_TRACE`).
 #[derive(Clone, Debug)]
 struct LayerTrace {
+    mode: SpMode,
     layer: usize,
     rows: usize,
     k: usize,
@@ -868,6 +1000,7 @@ impl LayerTrace {
     fn line(&self) -> String {
         json!({
             "sp_layer": self.layer,
+            "mode": self.mode.label(),
             "rows": self.rows,
             "k": self.k,
             "u": self.active,
@@ -1374,6 +1507,7 @@ impl Run<'_, '_> {
         sp.acc.cpu_slots += cpu_slots as u64;
         if sp.trace {
             let trace = LayerTrace {
+                mode: SpMode::Hybrid,
                 layer,
                 rows,
                 k: plan.split.k,
@@ -1403,6 +1537,240 @@ impl Run<'_, '_> {
     }
 }
 
+// ── TouchedOnly: S1's per-panel pipeline over a selective schedule ────
+
+impl Run<'_, '_> {
+    /// Touched-only runs this window: the load armed the mode, no failure disabled
+    /// it and the pre-mutation verdict qualified the window.
+    pub(super) fn touched_window_on(&self, w: &WinCtx<'_>) -> bool {
+        self.rt.touched.is_some()
+            && self
+                .sp_verdicts
+                .get(w.window.index)
+                .is_some_and(|verdict| verdict.is_ok())
+    }
+
+    /// A touched-only window is open ([`TouchedRuntime::in_window`]).
+    pub(super) fn touched_in_window(&self) -> bool {
+        self.rt
+            .touched
+            .as_ref()
+            .is_some_and(TouchedRuntime::in_window)
+    }
+
+    /// Window entry of a touched-only window: the ring starts the window with zero
+    /// enqueues (a [`SpSchedule`]: every layer's groups are planned once its route
+    /// exists), exactly as an SP window.
+    pub(super) fn touched_begin_window(&mut self) -> R<()> {
+        let touched = self
+            .rt
+            .touched
+            .as_mut()
+            .ok_or_else(|| invalid("slow-link touched-only state is not bound"))?;
+        touched.begin_window().map_err(invalid)?;
+        let mut schedule = SpSchedule::new(&self.rt.schedule);
+        self.rt.ring.prime(&*self.gpu, &mut schedule)?;
+        Ok(())
+    }
+
+    /// Window exit (after the ring drain and the timeline): the submitted payload
+    /// must equal the sum of the layers' planned groups' layouts.
+    pub(super) fn touched_end_window(&mut self, stats: &PanelStats, window: usize) -> R<()> {
+        let touched = self
+            .rt
+            .touched
+            .as_mut()
+            .ok_or_else(|| invalid("slow-link touched-only state is not bound"))?;
+        if stats.submitted_payload_bytes != touched.submitted {
+            return Err(invalid(format!(
+                "slow-link touched-only window submitted {} payload bytes, its planned groups are {}",
+                stats.submitted_payload_bytes, touched.submitted
+            )));
+        }
+        touched.in_window = false;
+        touched.acc.streamed_bytes = touched.submitted;
+        let report = touched.acc;
+        touched.reports.push((window, report));
+        Ok(())
+    }
+
+    /// The touched-only part of a failed window's cleanup, after the ring drain:
+    /// close the window and disable the mode for the process (S1 stream-all keeps
+    /// running).
+    pub(super) fn touched_abort(&mut self, error: &str) {
+        let Some(touched) = self.rt.touched.as_mut() else {
+            return;
+        };
+        if touched.in_window {
+            touched.in_window = false;
+            touched
+                .failure
+                .get_or_insert_with(|| format!("sp_unavailable: a window failed: {error}"));
+        }
+    }
+
+    /// One host layer of a touched-only window: **S1's own layer, with a selective
+    /// weight schedule.**
+    ///
+    /// The tiles' prefixes and route preparation, the one count barrier, the panels
+    /// ([`dsp::execute_panel`]: the K2 GEMMs, the ordered per-panel combine through the
+    /// [`dsp::OrderedCombineCursor`], and the K1 / one-row decode / F32-tail cohort tiles
+    /// masked to the panel's binding) and every tile's tail are the stream-all sweep's
+    /// ([`Self::sweep_panels`], [`sweep_panel_groups`]). The one difference is *which
+    /// experts a binding holds*: instead of the layer's fixed 32-expert page-order groups,
+    /// the bindings are the layer's **touched** experts ([`touched_experts`]: those with a K2
+    /// grouped row or a cohort slot), chunked ascending into groups of at most 32, and the
+    /// ring streams exactly those groups ([`SpSchedule`]: all enqueued at once after the
+    /// barrier, nothing prefetched).
+    ///
+    /// **Why the result is byte-identical to the stream-all sweep.**
+    ///
+    /// 1. *Numerics of one expert are binding-independent.* An expert's K2 rows are the
+    ///    same grouped rows (the stable scatter is the barrier's, untouched) through the
+    ///    same GEMM kernels on the same weight bytes; a panel's rows never mix experts'
+    ///    arithmetic, and S1 already runs panels of any row split inside an expert (the
+    ///    within-expert partition canary). An F32-tail tile's rows run the incumbent's own
+    ///    tail stages over ids masked to the binding; the tile keeps its S1 class (no K2-ized
+    ///    tail: the storage is S1's, not the SP layout, so [`dsp::sp_tile_class`] is S1's).
+    /// 2. *The combine is partition-invariant.* The ordered per-panel combine applies each
+    ///    token's slots in ascending expert id across panels (each panel owns an expert id
+    ///    range of invalid-row slots, the ranges partition `[0, n_exp)` in panel order) and
+    ///    adds no trailing product, and the F32-tail cohort accumulates in place binding by
+    ///    binding in ascending expert order ("the in-place chain over bindings is the
+    ///    one-launch combine", `slowlink_f32_tail_panel`). Both are functions of the ids
+    ///    alone for ANY ascending partition of the experts into bindings: S1's 32-expert
+    ///    groups and the touched groups are two such partitions (the CPU model
+    ///    `slowlink_combine_touched_only_panels_equal_stream_all_panels` proves the equality
+    ///    for both, bit for bit).
+    /// 3. *No expert's rows or cohort slots are dropped.* A binding is `[first, last + 1)`
+    ///    of its group ([`touched_binding_ranges`]), tight, ascending and disjoint. Every
+    ///    expert holding a K2 row or a cohort slot is touched by construction, so it is in
+    ///    exactly one group; an expert strictly between two groups (or before the first, or
+    ///    after the last) is untouched, i.e. has no K2 row and no cohort slot, so the id-range
+    ///    masks `[bind_lo, bind_hi)` of the cohort tiles select the same slots as S1's wider
+    ///    ranges would, and the weight tables of those experts are never read. This is the
+    ///    property the hybrid mode lacks (a CPU expert inside a streamed group's range), and
+    ///    why this mode, which has no CPU expert, can keep the cohort on S1's own path.
+    /// 4. *Everything else is S1's:* the layout (K1 and tail rows included), the route
+    ///    preparation, the anchor tile, the tails, the shared expert and HyperWrite.
+    pub(super) fn touched_host_layer(
+        &mut self,
+        w: &WinCtx<'_>,
+        layer: usize,
+        routes: &mut dsp::PromptRouteStorage,
+        txn: &mut PromptTxn,
+        report: &mut WindowReport,
+    ) -> R<()> {
+        let geo = self.geo;
+        routes.reset_for_layer();
+        for (ti, tile) in w.tiles.iter().enumerate() {
+            if layer == geo.band.start {
+                self.embed_tile(w, ti)?;
+            }
+            self.tile_layer(w, ti, layer, Some(&mut *routes))?;
+            self.cut_if(txn, tile, layer)?;
+        }
+        let route_plan = dsp::finish_route_plan(&mut *self.gpu, routes, dsp::PanelLimits::S1)
+            .map_err(dsp_err("route plan"))?;
+        report.route_barrier_ms += route_plan.barrier.sync_ms;
+        let phase = Instant::now();
+        let touched = self
+            .rt
+            .touched
+            .as_ref()
+            .ok_or_else(|| invalid("slow-link touched-only state is not bound"))?;
+        let (pages, trace) = (touched.pages, touched.trace);
+        // A layer that routes nothing streams one held expert so S1's zero-row panel
+        // keeps a binding.
+        let fallback = self
+            .rt
+            .schedule
+            .layer_groups(layer)
+            .and_then(|groups| groups.first())
+            .and_then(|group| group.experts.first())
+            .and_then(|&expert| u16::try_from(expert).ok());
+        let groups = touched_groups(
+            &route_plan,
+            dsp::PanelLimits::S1.experts_per_slot,
+            pages,
+            fallback,
+        )
+        .map_err(dsp_err("touched groups"))?;
+        let ranges = touched_binding_ranges(&groups);
+        let mut schedule = SpSchedule::new(&self.rt.schedule);
+        schedule.plan_layer(layer, &groups)?;
+        self.rt.ring.enter_layer(&*self.gpu, &mut schedule, layer)?;
+        let layer_stream_bytes = schedule.submitted_bytes();
+        let planned: Vec<ExpertGroupPlan> = schedule
+            .planned_groups(layer)
+            .ok_or_else(|| invalid(format!("touched layer {layer} has no planned groups")))?
+            .to_vec();
+        self.credit_touched_bytes(layer, &route_plan, report);
+        #[cfg(any(test, feature = "lab", feature = "reference-parity"))]
+        let inject = self
+            .bundle
+            .slowlink_take_injection(SlowlinkFailPoint::DuringPanel);
+        #[cfg(not(any(test, feature = "lab", feature = "reference-parity")))]
+        let inject = false;
+        sweep_panel_groups(
+            &*self.forward,
+            &*self.bundle,
+            &mut *self.gpu,
+            &self.rt.streams,
+            &mut self.rt.ring,
+            &mut schedule,
+            PanelSweep {
+                geo,
+                profile: self.profile,
+                w,
+                layer,
+                routes,
+                route_plan: &route_plan,
+                groups: &planned,
+                ranges: &ranges,
+                inject,
+            },
+        )?;
+        let touched_count = touched_experts(&route_plan).len();
+        let touched = self
+            .rt
+            .touched
+            .as_mut()
+            .ok_or_else(|| invalid("slow-link touched-only state is not bound"))?;
+        touched.submitted += layer_stream_bytes;
+        touched.acc.layers += 1;
+        touched.acc.streamed_experts += groups.iter().map(Vec::len).sum::<usize>() as u64;
+        if trace {
+            // The hybrid trace's shape: k = U, no CPU slot, no returned row.
+            let line = LayerTrace {
+                mode: SpMode::TouchedOnly,
+                layer,
+                rows: w.window.rows,
+                k: touched_count,
+                active: touched_count,
+                groups: groups.len(),
+                cpu_slots: 0,
+                cpu_experts: 0,
+                stream_bytes: layer_stream_bytes,
+                y_bytes: 0,
+                predicted_ms: 0.0,
+                plan_ms: 0.0,
+                cpu_ms: 0.0,
+                phase_ms: phase.elapsed().as_secs_f64() * 1e3,
+                cpu: SpCpuStats::default(),
+            };
+            eprintln!("{}", line.line());
+        }
+        for ti in 0..w.tiles.len() {
+            self.tile_tail(w, ti, layer, routes)?;
+            if layer == geo.last_layer {
+                self.tile_output(w, ti)?;
+            }
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::slowlink_prompt::{plan_for_profile, product_profile_on};
@@ -1415,6 +1783,7 @@ mod tests {
 
     fn sp_profile() -> SpProfile {
         SpProfile {
+            mode: SpMode::Hybrid,
             sp_max_rows: SP_MAX_ROWS,
             s_cap: 5 * SP_MAX_ROWS,
             workers: 16,
@@ -1602,29 +1971,27 @@ mod tests {
         let (v, plan) = verdicts(769, &[]);
         assert_eq!(v, vec![Err(SpBypass::OneRowTile { tile: 1 })]);
         assert_eq!(sp_floor_verdict(plan.tile_rows, 769, &v), Ok(()));
-        // A short last window of a multi-window request is SP's; the long one is not.
-        let (v, plan) = verdicts(16_896 + 300, &[]);
-        assert_eq!(plan.windows.len(), 2);
-        assert_eq!(
-            v,
-            vec![
-                Err(SpBypass::TooManyRows {
-                    rows: 16_896,
-                    maximum: SP_MAX_ROWS
-                }),
-                Ok(())
-            ]
-        );
-        assert_eq!(sp_floor_verdict(plan.tile_rows, plan.rows, &v), Ok(()));
-        // A last window of one row is below the SP minimum (a decode row).
-        let (v, _) = verdicts(16_896 + 1, &[]);
-        assert_eq!(
-            v[1],
-            Err(SpBypass::TooFewRows {
-                rows: 1,
-                minimum: SP_MIN_ROWS
-            })
-        );
+        // S1 levels a multi-window request's rows across the greedy window count (no short
+        // tail sweep), so such a request has no window of SP's size: 16,896 + 300 rows is two
+        // windows of 9,216 and 7,980 rows, and 16,896 + 1 two of 9,216 and 7,681; every window
+        // is past the cap and stays on the stream-all sweep.
+        for (rows, expect) in [(16_896 + 300, [9_216, 7_980]), (16_896 + 1, [9_216, 7_681])] {
+            let (v, plan) = verdicts(rows, &[]);
+            let sizes: Vec<usize> = plan.windows.iter().map(|window| window.rows).collect();
+            assert_eq!(sizes, expect, "rows {rows}");
+            assert_eq!(
+                v,
+                expect
+                    .iter()
+                    .map(|&rows| Err(SpBypass::TooManyRows {
+                        rows,
+                        maximum: SP_MAX_ROWS
+                    }))
+                    .collect::<Vec<_>>(),
+                "rows {rows}"
+            );
+            assert_eq!(sp_floor_verdict(plan.tile_rows, plan.rows, &v), Ok(()));
+        }
         // An interior session cut leaves the window to the stream-all sweep ...
         let (v, _) = verdicts(1000, &[500]);
         assert_eq!(v, vec![Err(SpBypass::InteriorCuts { cuts: 1 })]);
@@ -2047,5 +2414,241 @@ mod tests {
         stripped.as_object_mut().unwrap().remove("sp");
         assert_eq!(stripped, base, "every other key is unchanged");
         let _ = profile;
+    }
+
+    // ── touched-only mode ─────────────────────────────────────────────
+
+    fn touched_profile() -> SpProfile {
+        SpProfile {
+            mode: SpMode::TouchedOnly,
+            sp_max_rows: SP_MAX_ROWS,
+            s_cap: 0,
+            workers: 0,
+            pinned_bytes: 0,
+        }
+    }
+
+    /// The window selection is the SP selection: the two modes differ in how a layer runs,
+    /// never in which windows and requests they take.
+    #[test]
+    fn touched_only_window_and_request_selection_is_the_sp_selection() {
+        let (hybrid, touched) = (sp_profile(), touched_profile());
+        for (rows, cuts) in [
+            (5, vec![]),
+            (300, vec![]),
+            (768, vec![]),
+            (769, vec![]),
+            (1024, vec![]),
+            (2304, vec![]),
+            (5376, vec![]),
+            (5377, vec![]),
+            (1000, vec![500]),
+            (16_896 + 300, vec![]),
+        ] {
+            let plan = plan_agg(rows, &cuts);
+            for capture in [
+                CaptureKind::None,
+                CaptureKind::Bounded,
+                CaptureKind::AllRows,
+            ] {
+                assert_eq!(
+                    sp_window_verdicts(Some(&touched), &plan, capture),
+                    sp_window_verdicts(Some(&hybrid), &plan, capture),
+                    "rows {rows} cuts {cuts:?} {capture:?}"
+                );
+            }
+        }
+        let profile = product_profile_on(AGG);
+        for rows in [1, 4, 5, 300, 768, 769, 1537, 5377, 16_897] {
+            for cuts in [0, 1] {
+                for capture in [CaptureKind::None, CaptureKind::AllRows] {
+                    assert_eq!(
+                        sp_request_verdict(
+                            SlowlinkMode::Auto,
+                            &profile,
+                            Some(&touched),
+                            shape(rows, capture),
+                            cuts
+                        ),
+                        sp_request_verdict(
+                            SlowlinkMode::Auto,
+                            &profile,
+                            Some(&hybrid),
+                            shape(rows, capture),
+                            cuts
+                        ),
+                        "rows {rows} cuts {cuts} {capture:?}"
+                    );
+                }
+            }
+        }
+        // The opened range: 5..=768 rows is SP's single tile, with tail tiles included.
+        for rows in [5, 100, 300, 511, 512, 768] {
+            assert_eq!(
+                sp_request_verdict(
+                    SlowlinkMode::Auto,
+                    &profile,
+                    Some(&touched),
+                    shape(rows, CaptureKind::None),
+                    0
+                ),
+                Ok(()),
+                "rows {rows}"
+            );
+        }
+    }
+
+    /// Under touched-only every tile keeps its S1 class and the window keeps S1's layout, so
+    /// an F32-tail tile stays a cohort tile (the exact S1 F32-tail path); only the hybrid
+    /// mode K2-izes it onto the SP layout.
+    #[test]
+    fn touched_only_tail_tiles_classify_and_lay_out_as_s1() {
+        use dsp::{sp_tile_class, TileClass, TileKind};
+        let touched = SpMode::TouchedOnly.sp_route_layout();
+        let hybrid = SpMode::Hybrid.sp_route_layout();
+        let s1_table = [
+            (TileKind::SlabK2, TileClass::K2),
+            (TileKind::AggregateWmma, TileClass::K2),
+            (TileKind::AggregateIu4, TileClass::K2),
+            (TileKind::SlabK1Tail, TileClass::K1),
+            (TileKind::Decode, TileClass::K1),
+            (TileKind::AggregateF32Tail, TileClass::Tail),
+        ];
+        for (kind, class) in s1_table {
+            assert_eq!(sp_tile_class(kind, false).unwrap(), class, "{kind:?}");
+            assert_eq!(sp_tile_class(kind, touched).unwrap(), class, "{kind:?}");
+        }
+        assert_eq!(
+            sp_tile_class(TileKind::AggregateF32Tail, hybrid).unwrap(),
+            TileClass::K2,
+            "the hybrid mode K2-izes the tail tile"
+        );
+
+        // 1024 rows = a 768-row WMMA tile and a 256-row F32-tail tile.
+        let profile = product_profile_on(AGG);
+        let plan = plan_agg(1024, &[]);
+        let window = &plan.windows[0];
+        let cohorts: Vec<TileCohort> = plan
+            .window_tiles(window)
+            .iter()
+            .map(|tile| tile_cohort(AGG, tile.routing.route_rows, 8))
+            .collect();
+        assert_eq!(cohorts, vec![TileCohort::K2, TileCohort::F32Tail]);
+        assert_eq!((window.k1_rows, window.tail_rows), (0, 256));
+        // The window is admitted by both modes (a tail tile no longer bypasses).
+        for sp in [sp_profile(), touched_profile()] {
+            assert_eq!(
+                sp_window_verdicts(Some(&sp), &plan, CaptureKind::None),
+                vec![Ok(())]
+            );
+        }
+        // Touched-only's route storage is S1's own: the cohort rows are reserved, no SP rows.
+        let s1 =
+            window_route_layout(&profile, window.rows, window.k1_rows, window.tail_rows).unwrap();
+        assert_eq!(s1.dims().tail_rows, 256);
+        assert!(!s1.has_sp());
+        // The hybrid layout carries no cohort rows and the hybrid table instead.
+        let sp = sp_window_layout(&profile, window.rows).unwrap();
+        assert_eq!((sp.dims().k1_rows, sp.dims().tail_rows), (0, 0));
+        assert!(sp.has_sp());
+    }
+
+    #[test]
+    fn touched_only_runtime_tracks_one_window_and_the_request_reports() {
+        let plan = TouchedBindPlan {
+            profile: touched_profile(),
+            pages: 18,
+            trace: false,
+        };
+        let mut touched = TouchedRuntime::new(&plan);
+        assert!(!touched.in_window());
+        assert_eq!(touched.unavailable(), None);
+        touched.begin_window().unwrap();
+        assert!(touched.in_window());
+        assert!(
+            touched.begin_window().is_err(),
+            "a window cannot begin inside another"
+        );
+        touched.in_window = false;
+        touched.reports.push((0, SpWindowReport::default()));
+        assert_eq!(touched.reports().len(), 1);
+        touched.begin_request();
+        assert!(touched.reports().is_empty());
+    }
+
+    #[test]
+    fn touched_only_receipt_names_its_mode_and_has_no_cpu_work() {
+        let armed = SpSummary {
+            knob: true,
+            admitted: Some(touched_profile()),
+            ..SpSummary::default()
+        };
+        let ran = SpWindowEntry {
+            rows: 1024,
+            verdict: Ok(()),
+            report: SpWindowReport {
+                layers: 40,
+                streamed_bytes: 123,
+                streamed_experts: 12_000,
+                cpu_experts: 0,
+                cpu_slots: 0,
+            },
+        };
+        let sp = sp_receipt_json(&armed, &[ran]).unwrap();
+        assert_eq!(sp["mode"], json!("touched_only"));
+        assert_eq!(sp["armed"], json!(true));
+        assert_eq!(sp["engaged_windows"], json!(1));
+        assert_eq!(sp["workers"], json!(0));
+        assert_eq!(sp["pinned_bytes"], json!(0));
+        assert_eq!(sp["windows"][0]["cpu_slots"], json!(0));
+        assert_eq!(sp["windows"][0]["cpu_experts"], json!(0));
+        let hybrid = SpSummary {
+            admitted: Some(sp_profile()),
+            ..armed.clone()
+        };
+        assert_eq!(
+            sp_receipt_json(&hybrid, &[]).unwrap()["mode"],
+            json!("hybrid")
+        );
+        // A declined load has no mode.
+        let declined = SpSummary {
+            knob: true,
+            decline: Some(SpDecline::KnobOff),
+            ..SpSummary::default()
+        };
+        assert_eq!(
+            sp_receipt_json(&declined, &[]).unwrap()["mode"],
+            Value::Null
+        );
+    }
+
+    #[test]
+    fn touched_only_trace_line_has_the_sp_trace_shape_with_k_equal_u_and_no_cpu() {
+        let line = LayerTrace {
+            mode: SpMode::TouchedOnly,
+            layer: 7,
+            rows: 1024,
+            k: 212,
+            active: 212,
+            groups: 7,
+            cpu_slots: 0,
+            cpu_experts: 0,
+            stream_bytes: 99,
+            y_bytes: 0,
+            predicted_ms: 0.0,
+            plan_ms: 0.0,
+            cpu_ms: 0.0,
+            phase_ms: 1.5,
+            cpu: SpCpuStats::default(),
+        }
+        .line();
+        let value: Value = serde_json::from_str(&line).unwrap();
+        // The keys the V2a scorer reads: one `sp_layer` line per host layer, k == u, no CPU.
+        assert_eq!(value["sp_layer"], json!(7));
+        assert_eq!(value["mode"], json!("touched_only"));
+        assert_eq!(value["k"], value["u"]);
+        assert_eq!(value["cpu_slots"], json!(0));
+        assert_eq!(value["cpu_experts"], json!(0));
+        assert_eq!(value["rows"], json!(1024));
     }
 }

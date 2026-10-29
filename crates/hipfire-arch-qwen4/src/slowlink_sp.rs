@@ -23,7 +23,11 @@ use std::fmt;
 
 /// Typed developer boolean `developer.qwen4_sp` (default off).
 pub const SP_ENV: &str = "HIPFIRE_QWEN4_SP";
-/// Lab-only: `all` (k = U), `cpu` (k = 0) or `auto` (the planner).
+/// Typed developer boolean `developer.qwen4_sp_touched` (default off): the
+/// touched-only SP mode ([`SpMode::TouchedOnly`]).
+pub const SP_TOUCHED_ENV: &str = "HIPFIRE_QWEN4_SP_TOUCHED";
+/// Lab-only: `all` (k = U, which selects [`SpMode::TouchedOnly`]), `cpu` (k = 0)
+/// or `auto` (the planner).
 #[cfg(feature = "lab")]
 pub const SP_FORCE_K_ENV: &str = "HIPFIRE_QWEN4_SP_FORCE_K";
 /// Lab-only: `1` prints one JSON line per SP layer.
@@ -121,6 +125,65 @@ pub fn sp_trace() -> bool {
     parse_sp_trace(hipfire_config::developer_var(SP_TRACE_ENV).ok().as_deref())
 }
 
+// ── mode ──────────────────────────────────────────────────────────────
+
+/// Which SP a load armed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SpMode {
+    /// The hybrid SP (`developer.qwen4_sp`): stream the top-k* experts, run the
+    /// rest on the CPU (E1), one canonical combine. Different numerics from
+    /// stream-all S1 by design (E1 rows, K2-ized F32-tail tiles).
+    Hybrid,
+    /// The touched-only SP (`developer.qwen4_sp_touched`): S1's exact per-panel
+    /// pipeline over a selective schedule that streams exactly the experts the
+    /// layer routes to (k = U), no CPU expert. Byte-identical to stream-all S1.
+    TouchedOnly,
+}
+
+impl SpMode {
+    /// Stable machine label of the mode (receipt `sp.mode`).
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Hybrid => "hybrid",
+            Self::TouchedOnly => "touched_only",
+        }
+    }
+
+    /// Whether the window runs on the SP route layout (hybrid row table, F32-tail
+    /// tiles K2-ized, no cohort rows) rather than S1's own: the storage's SP flag
+    /// ([`hipfire_dispatch::pipeline::slowlink_prefill::PromptRouteStorage::set_sp`]).
+    /// Touched-only keeps S1's layout, so every tile keeps S1's class.
+    pub fn sp_route_layout(self) -> bool {
+        self == Self::Hybrid
+    }
+}
+
+/// The mode the knobs ask for, decided before admission and before the first
+/// window (pure truth table):
+///
+/// | `qwen4_sp` | `qwen4_sp_touched` | placement forced k = U | mode |
+/// |---|---|---|---|
+/// | off | off | any | none |
+/// | off | on | any | touched-only |
+/// | on | off | no | hybrid |
+/// | on | off | yes | touched-only |
+/// | on | on | no | hybrid (hybrid wins) |
+/// | on | on | yes | touched-only |
+///
+/// A placement forced to k = U (lab `HIPFIRE_QWEN4_SP_FORCE_K=all`) is the
+/// touched-only placement by definition: streaming every touched expert with no
+/// CPU expert is exactly what the touched-only mode does, with the F32-tail
+/// tiles kept on S1's own path instead of K2-ized. It has no effect without a
+/// knob.
+pub fn sp_mode_for(hybrid_knob: bool, touched_knob: bool, force_all: bool) -> Option<SpMode> {
+    match (hybrid_knob, touched_knob) {
+        (false, false) => None,
+        (false, true) => Some(SpMode::TouchedOnly),
+        (true, _) if force_all => Some(SpMode::TouchedOnly),
+        (true, _) => Some(SpMode::Hybrid),
+    }
+}
+
 // ── load-time admission ───────────────────────────────────────────────
 
 /// Everything [`admit_sp`] reads, all decided by the caller before any SP
@@ -128,8 +191,19 @@ pub fn sp_trace() -> bool {
 /// neither change `resident_layers` nor the census.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SpLoadFacts<'a> {
-    /// `developer.qwen4_sp` (`hipfire_config::memory::qwen4_sp`).
+    /// `developer.qwen4_sp` (`hipfire_config::memory::qwen4_sp`): the hybrid mode.
     pub knob: bool,
+    /// `developer.qwen4_sp_touched` (`hipfire_config::memory::qwen4_sp_touched`):
+    /// the touched-only mode.
+    pub touched_knob: bool,
+    /// The placement is forced to k = U (lab `HIPFIRE_QWEN4_SP_FORCE_K=all`;
+    /// `false` outside the lab feature): see [`sp_mode_for`].
+    pub force_all: bool,
+    /// Pages of the S1 ring (a touched-only layer enqueues all its groups at once).
+    pub pages: usize,
+    /// Rows of the admitted S1 window: the touched-only mode runs the S1 route
+    /// layout, so its row cap is this, not the SP-layout fit.
+    pub window_rows: usize,
     /// The admitted S1 profile's window route; `None` when S1 was not admitted.
     pub s1_route: Option<WindowRoute>,
     /// `gpu.arch`.
@@ -143,7 +217,8 @@ pub struct SpLoadFacts<'a> {
     /// Workers of the splice pool; `None` (or 0) when it is unavailable.
     pub splice_workers: Option<usize>,
     /// Largest window rows whose SP layout (`with_sp_rows(..).total_bytes()`)
-    /// fits `census.route_storage` (about 5,593 on the product profile).
+    /// fits `census.route_storage` (about 5,593 on the product profile). Read by
+    /// the hybrid mode only.
     pub region_fit_rows: usize,
     /// Model hidden size.
     pub hidden: usize,
@@ -156,20 +231,25 @@ pub struct SpLoadFacts<'a> {
 /// The frozen SP profile of a load.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SpProfile {
-    /// `min(SP_MAX_ROWS, region fit)`.
+    /// The armed mode.
+    pub mode: SpMode,
+    /// `min(SP_MAX_ROWS, region fit)` (hybrid); `min(SP_MAX_ROWS, S1 window
+    /// rows)` (touched-only).
     pub sp_max_rows: usize,
-    /// CPU-row staging capacity in rows: `5 * sp_max_rows`.
+    /// CPU-row staging capacity in rows: `5 * sp_max_rows` (hybrid), 0
+    /// (touched-only: no CPU expert).
     pub s_cap: usize,
-    /// Splice-pool workers (`SplitCost.cpu_workers`).
+    /// Splice-pool workers (`SplitCost.cpu_workers`); 0 for touched-only.
     pub workers: usize,
-    /// Pinned host bytes the SP owners charge at `sp_max_rows`.
+    /// Pinned host bytes the SP owners charge at `sp_max_rows`; 0 for
+    /// touched-only (it binds no owner).
     pub pinned_bytes: u64,
 }
 
 /// A sticky, named reason SP is not armed on this load.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SpDecline {
-    /// `HIPFIRE_QWEN4_SP` is not `1`.
+    /// Neither `HIPFIRE_QWEN4_SP` nor `HIPFIRE_QWEN4_SP_TOUCHED` is `1`.
     KnobOff,
     /// No admitted S1 profile.
     NoS1Profile,
@@ -189,6 +269,9 @@ pub enum SpDecline {
     PinnedFit { need: Option<u64>, budget: u64 },
     /// `serve.prefix_cache` is on.
     PrefixCache,
+    /// The ring has fewer pages than the groups of a layer that touches every
+    /// expert (touched-only enqueues a layer's groups all at once).
+    Pages { pages: usize, need: usize },
 }
 
 impl SpDecline {
@@ -205,6 +288,7 @@ impl SpDecline {
             Self::RegionFit { .. } => "region fit",
             Self::PinnedFit { .. } => "pinned fit",
             Self::PrefixCache => "prefix cache",
+            Self::Pages { .. } => "pages",
         }
     }
 }
@@ -213,7 +297,7 @@ impl fmt::Display for SpDecline {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "sp: {}", self.label())?;
         match self {
-            Self::KnobOff => write!(f, " ({SP_ENV} is not 1)"),
+            Self::KnobOff => write!(f, " (neither {SP_ENV} nor {SP_TOUCHED_ENV} is 1)"),
             Self::NoS1Profile => write!(f, " (the slow-link prefill profile was not admitted)"),
             Self::ArchNotCalibrated { arch } => {
                 write!(f, " ({arch:?}; calibrated on {SP_ARCH:?} only)")
@@ -245,16 +329,28 @@ impl fmt::Display for SpDecline {
                 None => write!(f, " (the SP pinned bytes overflow; budget {budget})"),
             },
             Self::PrefixCache => write!(f, " (serve.prefix_cache is on)"),
+            Self::Pages { pages, need } => write!(
+                f,
+                " (the ring has {pages} pages; a layer touching every expert needs {need})"
+            ),
         }
     }
 }
 
 /// Load-time SP admission (§5.1). Checked in a fixed order; the first failing
 /// rule is the sticky reason. Pure.
+///
+/// The knobs pick the mode ([`sp_mode_for`]). Both modes need an admitted S1
+/// profile, gfx1100, the `Aggregate` window route and at least
+/// [`SP_MIN_REGION_ROWS`] rows. The hybrid mode also needs 512 experts, CPU
+/// quants, the splice pool, the pinned-host fit and `serve.prefix_cache` off.
+/// The touched-only mode needs none of those (it runs no CPU arithmetic, binds
+/// no owner and leaves the numerics of S1 untouched); it needs the ring to hold
+/// one page per group of a layer that touches every expert.
 pub(crate) fn admit_sp(facts: &SpLoadFacts<'_>) -> Result<SpProfile, SpDecline> {
-    if !facts.knob {
+    let Some(mode) = sp_mode_for(facts.knob, facts.touched_knob, facts.force_all) else {
         return Err(SpDecline::KnobOff);
-    }
+    };
     let Some(route) = facts.s1_route else {
         return Err(SpDecline::NoS1Profile);
     };
@@ -266,6 +362,13 @@ pub(crate) fn admit_sp(facts: &SpLoadFacts<'_>) -> Result<SpProfile, SpDecline> 
     if route != WindowRoute::Aggregate {
         return Err(SpDecline::Route { route });
     }
+    match mode {
+        SpMode::Hybrid => admit_hybrid(facts),
+        SpMode::TouchedOnly => admit_touched_only(facts),
+    }
+}
+
+fn admit_hybrid(facts: &SpLoadFacts<'_>) -> Result<SpProfile, SpDecline> {
     if facts.n_exp != SP_N_EXPERTS {
         return Err(SpDecline::ExpertCount { n_exp: facts.n_exp });
     }
@@ -293,6 +396,7 @@ pub(crate) fn admit_sp(facts: &SpLoadFacts<'_>) -> Result<SpProfile, SpDecline> 
                 return Err(SpDecline::PrefixCache);
             }
             Ok(SpProfile {
+                mode: SpMode::Hybrid,
                 sp_max_rows,
                 s_cap: sp_max_rows * SP_S_CAP_FACTOR,
                 workers,
@@ -304,6 +408,32 @@ pub(crate) fn admit_sp(facts: &SpLoadFacts<'_>) -> Result<SpProfile, SpDecline> 
             budget: facts.pinned_budget_bytes,
         }),
     }
+}
+
+/// Experts one S1 transport group (ring page) holds.
+const TOUCHED_EXPERTS_PER_PAGE: usize = 32;
+
+fn admit_touched_only(facts: &SpLoadFacts<'_>) -> Result<SpProfile, SpDecline> {
+    if facts.window_rows < SP_MIN_REGION_ROWS {
+        return Err(SpDecline::RegionFit {
+            fit_rows: facts.window_rows,
+            minimum: SP_MIN_REGION_ROWS,
+        });
+    }
+    let need = facts.n_exp.div_ceil(TOUCHED_EXPERTS_PER_PAGE);
+    if facts.pages < need {
+        return Err(SpDecline::Pages {
+            pages: facts.pages,
+            need,
+        });
+    }
+    Ok(SpProfile {
+        mode: SpMode::TouchedOnly,
+        sp_max_rows: SP_MAX_ROWS.min(facts.window_rows),
+        s_cap: 0,
+        workers: 0,
+        pinned_bytes: 0,
+    })
 }
 
 // ── per-window qualification ──────────────────────────────────────────
@@ -861,6 +991,18 @@ mod tests {
     }
 
     #[test]
+    fn sp_touched_knob_names_and_typed_developer_key() {
+        assert_eq!(SP_TOUCHED_ENV, "HIPFIRE_QWEN4_SP_TOUCHED");
+        assert!(hipfire_config::is_typed_bool_developer_key(
+            "developer.qwen4_sp_touched"
+        ));
+        assert_eq!(
+            hipfire_config::developer_key_for_env(SP_TOUCHED_ENV).as_deref(),
+            Some("developer.qwen4_sp_touched")
+        );
+    }
+
+    #[test]
     fn sp_min_rows_is_one_past_the_d2_split_rows() {
         assert_eq!(
             SP_MIN_ROWS,
@@ -889,6 +1031,10 @@ mod tests {
     fn facts() -> SpLoadFacts<'static> {
         SpLoadFacts {
             knob: true,
+            touched_knob: false,
+            force_all: false,
+            pages: 18,
+            window_rows: 16_896,
             s1_route: Some(WindowRoute::Aggregate),
             arch: "gfx1100",
             n_exp: 512,
@@ -905,6 +1051,7 @@ mod tests {
     #[test]
     fn admit_sp_truth_table() {
         let ok = admit_sp(&facts()).unwrap();
+        assert_eq!(ok.mode, SpMode::Hybrid);
         assert_eq!(ok.sp_max_rows, 5_376);
         assert_eq!(ok.s_cap, 26_880);
         assert_eq!(ok.workers, 16);
@@ -1092,6 +1239,172 @@ mod tests {
             .unwrap_err()
             .label(),
             "arch not calibrated"
+        );
+    }
+
+    #[test]
+    fn sp_mode_selection_truth_table() {
+        // (qwen4_sp, qwen4_sp_touched, forced k = U) -> mode
+        let table = [
+            (false, false, false, None),
+            (false, false, true, None),
+            (false, true, false, Some(SpMode::TouchedOnly)),
+            (false, true, true, Some(SpMode::TouchedOnly)),
+            (true, false, false, Some(SpMode::Hybrid)),
+            (true, false, true, Some(SpMode::TouchedOnly)),
+            // Both knobs on: the hybrid mode wins unless the placement is forced to k = U.
+            (true, true, false, Some(SpMode::Hybrid)),
+            (true, true, true, Some(SpMode::TouchedOnly)),
+        ];
+        for (hybrid, touched, force_all, want) in table {
+            assert_eq!(
+                sp_mode_for(hybrid, touched, force_all),
+                want,
+                "sp {hybrid} touched {touched} force_all {force_all}"
+            );
+            let admitted = admit_sp(&SpLoadFacts {
+                knob: hybrid,
+                touched_knob: touched,
+                force_all,
+                ..facts()
+            });
+            match want {
+                None => assert_eq!(admitted.unwrap_err(), SpDecline::KnobOff),
+                Some(mode) => assert_eq!(admitted.unwrap().mode, mode),
+            }
+        }
+        assert_eq!(SpMode::Hybrid.label(), "hybrid");
+        assert_eq!(SpMode::TouchedOnly.label(), "touched_only");
+        // Only the hybrid mode runs the SP route layout.
+        assert!(SpMode::Hybrid.sp_route_layout());
+        assert!(!SpMode::TouchedOnly.sp_route_layout());
+    }
+
+    fn touched_facts() -> SpLoadFacts<'static> {
+        SpLoadFacts {
+            knob: false,
+            touched_knob: true,
+            ..facts()
+        }
+    }
+
+    #[test]
+    fn admit_touched_only_needs_no_cpu_pinned_or_quant_facts() {
+        // Everything the hybrid mode needs for the CPU arm is absent: still armed.
+        let bare = SpLoadFacts {
+            n_exp: 256,
+            cpu_gate_up_quant: false,
+            cpu_down_quant: false,
+            splice_workers: None,
+            region_fit_rows: 0,
+            pinned_budget_bytes: 0,
+            prefix_cache: true,
+            pages: 8,
+            ..touched_facts()
+        };
+        let ok = admit_sp(&bare).unwrap();
+        assert_eq!(
+            ok,
+            SpProfile {
+                mode: SpMode::TouchedOnly,
+                sp_max_rows: SP_MAX_ROWS,
+                s_cap: 0,
+                workers: 0,
+                pinned_bytes: 0,
+            }
+        );
+        // The row cap is the S1 window's, clamped to SP's.
+        for (window_rows, want) in [
+            (16_896, SP_MAX_ROWS),
+            (3_072, 3_072),
+            (SP_MIN_REGION_ROWS, 2_048),
+        ] {
+            let profile = admit_sp(&SpLoadFacts {
+                window_rows,
+                ..touched_facts()
+            })
+            .unwrap();
+            assert_eq!(profile.sp_max_rows, want, "{window_rows}");
+        }
+        // The shared rules decline it by name, in the shared order.
+        let cases: Vec<(&str, SpLoadFacts<'static>, SpDecline)> = vec![
+            (
+                "no s1",
+                SpLoadFacts {
+                    s1_route: None,
+                    ..touched_facts()
+                },
+                SpDecline::NoS1Profile,
+            ),
+            (
+                "arch",
+                SpLoadFacts {
+                    arch: "gfx1151",
+                    ..touched_facts()
+                },
+                SpDecline::ArchNotCalibrated {
+                    arch: "gfx1151".into(),
+                },
+            ),
+            (
+                "route",
+                SpLoadFacts {
+                    s1_route: Some(WindowRoute::AggregateSymIu4),
+                    ..touched_facts()
+                },
+                SpDecline::Route {
+                    route: WindowRoute::AggregateSymIu4,
+                },
+            ),
+            (
+                "rows",
+                SpLoadFacts {
+                    window_rows: 2_047,
+                    ..touched_facts()
+                },
+                SpDecline::RegionFit {
+                    fit_rows: 2_047,
+                    minimum: 2_048,
+                },
+            ),
+            (
+                "pages",
+                SpLoadFacts {
+                    pages: 15,
+                    ..touched_facts()
+                },
+                SpDecline::Pages {
+                    pages: 15,
+                    need: 16,
+                },
+            ),
+        ];
+        for (name, input, want) in cases {
+            let got = admit_sp(&input).unwrap_err();
+            assert_eq!(got, want, "{name}");
+            assert!(got.to_string().starts_with("sp: "), "{name}: {got}");
+        }
+        // A ring of exactly the groups of an all-expert layer arms; 256 experts need 8 pages.
+        assert!(admit_sp(&SpLoadFacts {
+            pages: 16,
+            ..touched_facts()
+        })
+        .is_ok());
+        assert!(admit_sp(&SpLoadFacts {
+            pages: 8,
+            n_exp: 256,
+            ..touched_facts()
+        })
+        .is_ok());
+        // Hybrid wins with both knobs on: it keeps its own CPU requirements.
+        assert_eq!(
+            admit_sp(&SpLoadFacts {
+                knob: true,
+                splice_workers: None,
+                ..touched_facts()
+            })
+            .unwrap_err(),
+            SpDecline::SplicePool
         );
     }
 

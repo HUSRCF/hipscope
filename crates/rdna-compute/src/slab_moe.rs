@@ -4089,6 +4089,74 @@ pub mod slowlink_selftest {
         }
     }
 
+    /// Row cuts of a sweep whose groups hold `per_group` consecutive experts of `members`
+    /// (ascending expert ids), each group's contiguous grouped-row run chunked at `max_rows`
+    /// (the scheduler's `max_grouped_rows`): the panels of one binding per group.
+    fn group_cuts(c: &Case, members: &[usize], per_group: usize, max_rows: usize) -> Vec<usize> {
+        let mut cuts = vec![0usize];
+        for group in members.chunks(per_group) {
+            let (first, last) = (group[0], group[group.len() - 1]);
+            let (lo, hi) = (c.start[first], c.start[last + 1]);
+            let mut base = lo;
+            while base < hi {
+                base = (base + max_rows).min(hi);
+                cuts.push(base);
+            }
+        }
+        cuts.push(c.g);
+        cuts.sort();
+        cuts.dedup();
+        cuts
+    }
+
+    /// TouchedOnly: S1's per-panel ordered combine over the TOUCHED experts' groups (only the
+    /// experts holding a grouped row are bound; the untouched ones between them hold no row, so
+    /// no panel spans anything but touched rows) equals the canonical combine, and so equals
+    /// the stream-all combine over 32-expert page-order groups, bit for bit.
+    #[test]
+    fn slowlink_combine_touched_only_panels_equal_stream_all_panels() {
+        for seed in [0x70c4_ed1u64, 0xC0B1, 7, 0xFACE] {
+            let case = make_case(seed, 6);
+            let want = canonical(&case);
+            let touched: Vec<usize> = (0..case.n_exp)
+                .filter(|&e| case.start[e + 1] > case.start[e])
+                .collect();
+            let all: Vec<usize> = (0..case.n_exp).collect();
+            assert!(
+                !touched.is_empty() && touched.len() < case.n_exp,
+                "the fixture must leave experts untouched ({} of {})",
+                touched.len(),
+                case.n_exp
+            );
+            for per_group in [1usize, 7, 32] {
+                for max_rows in [16usize, 2048, usize::MAX / 2] {
+                    let sparse = group_cuts(&case, &touched, per_group, max_rows);
+                    let dense = group_cuts(&case, &all, per_group, max_rows);
+                    let sparse_out = run(&case, &sparse, true, true);
+                    let dense_out = run(&case, &dense, true, true);
+                    assert_eq!(
+                        diffs(&sparse_out, &want),
+                        0,
+                        "seed {seed:#x} touched groups of {per_group}, rows <= {max_rows}"
+                    );
+                    assert_eq!(
+                        diffs(&sparse_out, &dense_out),
+                        0,
+                        "seed {seed:#x} touched vs stream-all groups of {per_group}"
+                    );
+                    // The ownership ranges still partition [0, n_exp) in panel order.
+                    let ps = panels(&case, &sparse);
+                    let mut next = 0;
+                    for &(_, _, (lo, hi)) in &ps {
+                        assert_eq!(lo, next);
+                        next = hi;
+                    }
+                    assert_eq!(next, case.n_exp);
+                }
+            }
+        }
+    }
+
     #[test]
     fn slowlink_combine_each_valid_slot_is_applied_exactly_once() {
         for seed in [3u64, 0xFEED] {

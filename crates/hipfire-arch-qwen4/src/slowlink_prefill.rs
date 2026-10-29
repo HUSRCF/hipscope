@@ -84,10 +84,10 @@ use std::ops::Range;
 use std::time::Instant;
 
 mod sp;
-use crate::slowlink_sp::{SpBypass, SpDecline, SpProfile};
+use crate::slowlink_sp::{SpBypass, SpDecline, SpMode, SpProfile};
 use sp::{
     sp_floor_verdict, sp_load_decision, sp_receipt_json, sp_request_verdict, sp_window_verdicts,
-    SpBindPlan, SpRuntime, SpSummary, SpWindowEntry, SpWindowReport,
+    SpBind, SpBindPlan, SpRuntime, SpSummary, SpWindowEntry, SpWindowReport, TouchedRuntime,
 };
 
 type R<T> = Result<T, Qwen4GpuForwardError>;
@@ -1200,10 +1200,11 @@ impl SlowlinkSlot {
         }
     }
 
-    /// SP is admitted on this load: every session snapshot scope carries the
-    /// `sp-e1v1` identity token ([`crate::bundle::with_sp_identity`]).
+    /// The hybrid SP is admitted on this load: every session snapshot scope carries
+    /// the `sp-e1v1` identity token ([`crate::bundle::with_sp_identity`]). The
+    /// touched-only mode computes S1's own bytes, so it never changes the identity.
     pub(crate) fn sp_armed(&self) -> bool {
-        self.sp.admitted.is_some()
+        self.sp.admitted.is_some_and(|sp| sp.mode == SpMode::Hybrid)
     }
 
     /// `developer.qwen4_sp` was on at this load (the receipt carries an `sp`
@@ -1216,8 +1217,12 @@ impl SlowlinkSlot {
     /// disabled by a failed window.
     fn sp_profile(&self) -> Option<SpProfile> {
         let admitted = self.sp.admitted?;
-        let runtime = self.runtime.as_ref()?.sp.as_ref()?;
-        runtime.unavailable().is_none().then_some(admitted)
+        let runtime = self.runtime.as_ref()?;
+        match admitted.mode {
+            SpMode::Hybrid => runtime.sp.as_ref()?.unavailable().is_none(),
+            SpMode::TouchedOnly => runtime.touched.as_ref()?.unavailable().is_none(),
+        }
+        .then_some(admitted)
     }
 
     fn sp_summary(&self) -> SpSummary {
@@ -1228,8 +1233,7 @@ impl SlowlinkSlot {
             unavailable: self
                 .runtime
                 .as_ref()
-                .and_then(|runtime| runtime.sp.as_ref())
-                .and_then(SpRuntime::unavailable)
+                .and_then(SlowlinkRuntime::sp_unavailable)
                 .map(str::to_owned),
         }
     }
@@ -1265,12 +1269,32 @@ struct SlowlinkRuntime {
     host_layers: usize,
     resident_layers: usize,
     tile_scratch_bytes: u64,
-    /// The SP host owner ([`LoadOwner::SpHost`]); bound only when SP was
-    /// admitted at load.
+    /// The SP host owner ([`LoadOwner::SpHost`]); bound only when the hybrid SP
+    /// was admitted at load.
     sp: Option<SpRuntime>,
+    /// The touched-only SP state; present only when that mode was admitted at load.
+    /// It owns no device or pinned memory.
+    touched: Option<TouchedRuntime>,
 }
 
 impl SlowlinkRuntime {
+    /// Why the armed SP mode was disabled, when a window failed.
+    fn sp_unavailable(&self) -> Option<&str> {
+        self.sp
+            .as_ref()
+            .and_then(SpRuntime::unavailable)
+            .or_else(|| self.touched.as_ref().and_then(TouchedRuntime::unavailable))
+    }
+
+    /// Every executed SP window's report of the request, by window index.
+    fn sp_reports(&self) -> Vec<(usize, SpWindowReport)> {
+        match (&self.sp, &self.touched) {
+            (Some(sp), _) => sp.reports().to_vec(),
+            (None, Some(touched)) => touched.reports().to_vec(),
+            (None, None) => Vec::new(),
+        }
+    }
+
     fn free_gpu(self, gpu: &mut Gpu) -> R<()> {
         let Self {
             ring,
@@ -1765,6 +1789,7 @@ impl HipLoadBinder<'_> {
                     resident_layers: plan.resident_layers,
                     tile_scratch_bytes: forward.slowlink_tile_scratch_bytes(),
                     sp,
+                    touched: None,
                 })
             }
             _ => Err("a bound slow-link owner is missing".to_string()),
@@ -1840,7 +1865,7 @@ pub(crate) fn bind_at_load(
     if forward.slowlink.runtime.is_some() || forward.slowlink.unavailable.is_some() {
         return Ok(());
     }
-    let sp_knob = hipfire_config::memory::qwen4_sp();
+    let sp_knob = hipfire_config::memory::qwen4_sp() || hipfire_config::memory::qwen4_sp_touched();
     if sp_knob {
         forward.slowlink.sp.knob = true;
         forward.slowlink.sp.decline = Some(SpDecline::NoS1Profile);
@@ -1856,7 +1881,7 @@ pub(crate) fn bind_at_load(
             return Ok(());
         }
     };
-    let sp_plan = if sp_knob {
+    let sp_bind = if sp_knob {
         let pages = plan.spec.as_ref().map_or(0, |spec| spec.pages());
         match sp_load_decision(&*forward, &*gpu, &profile, pages)? {
             Ok(bind) => {
@@ -1870,6 +1895,10 @@ pub(crate) fn bind_at_load(
         }
     } else {
         None
+    };
+    let sp_plan = match sp_bind {
+        Some(SpBind::Hybrid(plan)) => Some(plan),
+        _ => None,
     };
     let runtime = {
         let mut binder = HipLoadBinder {
@@ -1891,8 +1920,12 @@ pub(crate) fn bind_at_load(
         }
         binder.into_runtime()?
     };
+    let mut runtime = runtime;
+    if let Some(SpBind::TouchedOnly(plan)) = sp_bind {
+        runtime.touched = Some(TouchedRuntime::new(&plan));
+    }
     forward.slowlink.runtime = Some(runtime);
-    forward.slowlink.sp.admitted = sp_plan.map(|bind| bind.profile);
+    forward.slowlink.sp.admitted = sp_bind.as_ref().map(SpBind::profile);
     Ok(())
 }
 
@@ -2219,6 +2252,224 @@ pub(crate) fn panels_by_group(
         }
     }
     Ok(out)
+}
+
+/// What one layer's panel walk reads besides the device, the ring and its schedule.
+struct PanelSweep<'s, 'w> {
+    geo: &'s RunGeo,
+    profile: &'s SlowlinkProfile,
+    w: &'s WinCtx<'w>,
+    layer: usize,
+    routes: &'s dsp::PromptRouteStorage,
+    route_plan: &'s dsp::LayerRoutePlan,
+    /// The layer's groups in ring order (one transport page each); group `i` binds
+    /// `ranges[i]`.
+    groups: &'s [ExpertGroupPlan],
+    /// Ascending, disjoint binding ranges, one per group, covering every expert that
+    /// holds a K2 row or a cohort slot.
+    ranges: &'s [(usize, usize)],
+    /// Lab fault injection: fail inside the first panel that reads a group.
+    inject: bool,
+}
+
+/// One host layer's panels over `groups`, in ascending binding order: each group's
+/// K2 GEMMs, its ordered combine and the cohort tiles (one-row decode, K1, F32 tail)
+/// against its binding ([`dsp::execute_panel`]), then the terminal combine
+/// ([`dsp::finish_combine`]). The S1 page-order sweep passes the layer's
+/// [`PanelSchedule`] groups and [`group_binding_ranges`]; the touched-only SP mode
+/// passes a [`SpSchedule`]'s groups and tight ranges over the experts the layer
+/// touches. The arithmetic is the one the walk always ran: only which experts a
+/// binding holds differs.
+fn sweep_panel_groups<S: RingSchedule>(
+    forward: &Qwen4GpuForward,
+    bundle: &Qwen4Bundle,
+    gpu: &mut Gpu,
+    streams: &GpuTensor,
+    ring_core: &mut ExpertPanelRing,
+    schedule: &mut S,
+    sweep: PanelSweep<'_, '_>,
+) -> R<()> {
+    let PanelSweep {
+        geo,
+        profile,
+        w,
+        layer,
+        routes,
+        route_plan,
+        groups,
+        ranges,
+        inject,
+    } = sweep;
+    #[cfg(not(any(test, feature = "lab", feature = "reference-parity")))]
+    let _ = inject;
+    let panels = route_plan
+        .schedule(ranges, dsp::PanelLimits::S1)
+        .map_err(dsp_err("panel schedule"))?;
+    let by_group = panels_by_group(panels.iter().map(|panel| panel.binding), groups.len())?;
+    let work: Vec<GroupWork> = groups
+        .iter()
+        .enumerate()
+        .map(|(index, group)| GroupWork {
+            group: group.group,
+            bound: by_group[index].start < by_group[index].end,
+        })
+        .collect();
+    #[cfg(any(test, feature = "lab", feature = "reference-parity"))]
+    let first_bound = work.iter().position(|group| group.bound);
+    // The panel scratch is anchored on a prefill tile of the window (on the
+    // aggregate route a WMMA tile when the window has one, else its first
+    // multi-row tile, which may itself be an F32-tail tile). Every cohort
+    // tile that runs its own original call registers its own operands
+    // exactly once: each one-row decode tile (the incumbent's decode call)
+    // and, on the aggregate route, each F32-tail tile. A window of decode
+    // tiles only has no prefill tile of its own: its anchor is a stand-in
+    // prefill tile of the admitted tile rows, used only to borrow the
+    // shared scratch views (it is never prepared and never registered, so
+    // no row reads or writes through it).
+    let SweepTiles {
+        anchor: anchor_tile,
+        cohort: cohort_tiles,
+    } = sweep_tiles(profile.geometry.route, w.tiles, geo.few_row_limit);
+    let anchor_real = anchor_tile.is_some();
+    let stand_in;
+    let anchor: &TilePlan = match anchor_tile {
+        Some(ti) => &w.tiles[ti],
+        None => {
+            let rows = profile.tile_rows;
+            stand_in = TilePlan {
+                index: 0,
+                window: w.window.index,
+                prompt_row: 0,
+                window_row: 0,
+                stream_offset: 0,
+                rows,
+                position: w.tiles[0].position,
+                routing: tile_routing(forward, &mut *gpu, rows),
+                ends_at_cut: None,
+                last_in_window: false,
+            };
+            &stand_in
+        }
+    };
+    let mut frame_tiles: Vec<&TilePlan> = vec![anchor];
+    frame_tiles.extend(cohort_tiles.iter().map(|&ti| &w.tiles[ti]));
+    // The K2 panels run under the anchor tile's ambient scope; each decode
+    // or K1 step enters its own tile's scope through the hook.
+    let (scopes, _) = forward.enter_tile_scopes(&mut *gpu, anchor.rows);
+    let result = with_tile_frames(
+        forward,
+        bundle,
+        &mut *gpu,
+        streams,
+        geo,
+        &frame_tiles,
+        layer,
+        |gpu, frames| {
+            // Each call is sealed and admitted under its own tile's scope
+            // (its routing rows), exactly as its route preparation was.
+            let mut sealed = Vec::with_capacity(frames.len());
+            for (tile, frame) in frame_tiles.iter().zip(frames) {
+                let (scopes, _) = forward.enter_tile_scopes(gpu, tile.rows);
+                let one = (|| -> R<_> {
+                    let Qwen4FfnBinding::Moe(moe) = &frame.description.ffn else {
+                        return Err(invalid("a host layer's FFN is not MoE"));
+                    };
+                    Ok(frame.env.seal_moe(frame.ctx, *moe, frame.scratch_desc)?)
+                })();
+                Qwen4GpuForward::leave_tile_scopes(gpu, scopes);
+                sealed.push(one?);
+            }
+            let mut calls = Vec::with_capacity(sealed.len());
+            for (tile, sealed) in frame_tiles.iter().zip(&sealed) {
+                let (scopes, _) = forward.enter_tile_scopes(gpu, tile.rows);
+                let call = dsp::PreparedChunkCall::new(
+                    &*gpu,
+                    sealed,
+                    tile.window_row,
+                    tile.position,
+                    profile.geometry.route,
+                );
+                Qwen4GpuForward::leave_tile_scopes(gpu, scopes);
+                calls.push(call.map_err(dsp_err("admission"))?);
+            }
+            let mut scratch = dsp::PanelScratch::new(&calls[0], dsp::PanelLimits::S1)
+                .map_err(dsp_err("panel scratch"))?;
+            // Each call registers once by its own actual kind, the anchor
+            // included when it is itself a tail tile; the stand-in never.
+            for (index, call) in calls.iter().enumerate() {
+                if index == 0 && !anchor_real {
+                    continue;
+                }
+                match call.tile_kind() {
+                    dsp::TileKind::Decode => scratch
+                        .add_decode_tile(call)
+                        .map_err(dsp_err("decode tile"))?,
+                    dsp::TileKind::AggregateF32Tail => scratch
+                        .add_tail_tile(call)
+                        .map_err(dsp_err("F32 tail tile"))?,
+                    _ if index == 0 => {}
+                    kind => {
+                        return Err(invalid(format!(
+                            "slow-link cohort tile at window row {} sealed as {kind:?}, not a \
+                             decode or F32-tail call",
+                            call.row0()
+                        )))
+                    }
+                }
+            }
+            let mut cursor = dsp::OrderedCombineCursor::start(gpu, routes, &panels)
+                .map_err(dsp_err("combine start"))?;
+            let mut hook = ForwardScopeHook {
+                forward,
+                tiles: w.tiles,
+                open: Vec::new(),
+            };
+            let mut ring = HipRing {
+                ring: &mut *ring_core,
+                schedule: &mut *schedule,
+            };
+            walk_layer_groups(&mut ring, gpu, layer, &work, &mut |gpu, index, parts| {
+                let parts =
+                    parts.ok_or_else(|| invalid("slow-link panel lease carries no binding"))?;
+                #[cfg(any(test, feature = "lab", feature = "reference-parity"))]
+                if inject && Some(index) == first_bound {
+                    return Err(invalid("injected slow-link failure during a panel"));
+                }
+                let group = &groups[index];
+                let (Some(&lo), Some(&last)) = (group.experts.first(), group.experts.last()) else {
+                    return Err(invalid("an empty expert group"));
+                };
+                let binding = dsp::ExpertPanelBinding {
+                    layer,
+                    epoch: parts.epoch,
+                    expert_lo: lo,
+                    expert_hi: last + 1,
+                    gate_up_table: parts.gate_up_table,
+                    down_table: parts.down_table,
+                    codec: dsp::PanelCodec::Mq4,
+                    source: dsp::BindingSource::Staged {
+                        slot: parts.ticket.slot as u32,
+                    },
+                };
+                for panel_index in by_group[index].clone() {
+                    let panel = &panels[panel_index];
+                    dsp::execute_panel(
+                        gpu,
+                        binding,
+                        route_plan.view(routes, panel),
+                        &mut scratch,
+                        &mut cursor,
+                        &mut hook,
+                    )
+                    .map_err(dsp_err("panel"))?;
+                }
+                Ok(())
+            })?;
+            dsp::finish_combine(gpu, routes, &mut cursor, &mut hook).map_err(dsp_err("combine"))
+        },
+    );
+    Qwen4GpuForward::leave_tile_scopes(&mut *gpu, scopes);
+    result
 }
 
 // ── abort bookkeeping ────────────────────────────────────────────────
@@ -2893,6 +3144,7 @@ impl Run<'_, '_> {
         if steps.sync_xfer {
             self.sp_abort(&error.to_string(), &mut extra);
         }
+        self.touched_abort(&error.to_string());
         if steps.abort_txn {
             if let Err(abort) = self.bundle.prompt_txn_abort(&mut *self.gpu, txn) {
                 extra.push(format!("transaction abort failed: {abort}"));
@@ -2946,6 +3198,9 @@ impl Run<'_, '_> {
         }
         let wall = Instant::now();
         let sp_on = self.sp_window_on(w);
+        let touched_on = self.touched_window_on(w);
+        // A selective window (SP or touched-only) primes with zero enqueues.
+        let sparse = sp_on || touched_on;
         let layout = self.window_layout(w, sp_on)?;
         let mut routes = dsp::PromptRouteStorage::from_region(&self.rt.route_region, &layout)
             .map_err(dsp_err("route storage"))?;
@@ -2956,17 +3211,19 @@ impl Run<'_, '_> {
         // those small uploads behind the prime's page copies on the shared copy engine, so the
         // prime waits until the last of them has enqueued its tiles; the remaining resident
         // layers still cover the prime's copies. A band that starts on a host layer (or has
-        // none) primes first, as before. An SP window primes with zero enqueues and its resident
-        // layers never pump the sweep schedule.
+        // none) primes first, as before. An SP or touched-only window primes with zero enqueues
+        // and its resident layers never pump the sweep schedule.
         let first_host = geo.band.clone().find(|&layer| self.rt.host_layer[layer]);
         let prime_after = first_host
-            .filter(|&host| !sp_on && host > geo.band.start)
+            .filter(|&host| !sparse && host > geo.band.start)
             .map(|host| match geo.ple_layer {
                 Some(ple) if ple > geo.band.start && ple < host => ple,
                 _ => geo.band.start,
             });
         if sp_on {
             self.sp_begin_window(&mut routes, progress)?;
+        } else if touched_on {
+            self.touched_begin_window()?;
         } else if prime_after.is_none() {
             self.rt.ring.prime(&*self.gpu, &mut self.rt.schedule)?;
         }
@@ -2975,7 +3232,7 @@ impl Run<'_, '_> {
             if self.rt.host_layer[layer] {
                 self.host_layer(w, layer, &mut routes, txn, &mut report)?;
             } else {
-                let primed = !sp_on && prime_after.is_none_or(|after| layer > after);
+                let primed = !sparse && prime_after.is_none_or(|after| layer > after);
                 self.resident_layer(w, layer, txn, primed)?;
             }
             self.rt.ring.mark_layer_end(&*self.gpu, layer)?;
@@ -3003,9 +3260,11 @@ impl Run<'_, '_> {
         }
         if sp_on {
             self.sp_end_window(&stats, w.window.index)?;
+        } else if touched_on {
+            self.touched_end_window(&stats, w.window.index)?;
         }
         let sweep = self.rt.schedule.sweep_bytes();
-        if !sp_on && stats.submitted_payload_bytes != sweep {
+        if !sparse && stats.submitted_payload_bytes != sweep {
             return Err(invalid(format!(
                 "slow-link window submitted {} payload bytes, one sweep is {sweep}",
                 stats.submitted_payload_bytes
@@ -3070,6 +3329,9 @@ impl Run<'_, '_> {
         if routes.sp() {
             return self.sp_host_layer(w, layer, routes, txn, report);
         }
+        if self.touched_in_window() {
+            return self.touched_host_layer(w, layer, routes, txn, report);
+        }
         self.rt
             .ring
             .enter_layer(&*self.gpu, &mut self.rt.schedule, layer)?;
@@ -3104,28 +3366,49 @@ impl Run<'_, '_> {
         route_plan: &dsp::LayerRoutePlan,
         report: &mut WindowReport,
     ) -> R<()> {
-        let geo = self.geo;
         let groups: Vec<ExpertGroupPlan> = self
             .rt
             .schedule
             .layer_groups(layer)
             .ok_or_else(|| invalid(format!("layer {layer} has no scheduled expert groups")))?
             .to_vec();
-        let ranges = group_binding_ranges(&groups, geo.num_experts);
-        let panels = route_plan
-            .schedule(&ranges, dsp::PanelLimits::S1)
-            .map_err(dsp_err("panel schedule"))?;
-        let by_group = panels_by_group(panels.iter().map(|panel| panel.binding), groups.len())?;
-        let work: Vec<GroupWork> = groups
-            .iter()
-            .enumerate()
-            .map(|(index, group)| GroupWork {
-                group: group.group,
-                bound: by_group[index].start < by_group[index].end,
-            })
-            .collect();
-        // Touched bytes: the experts any K2 row or the K1 cohort read, at the
-        // placement's own extents; never the prefetched remainder.
+        let ranges = group_binding_ranges(&groups, self.geo.num_experts);
+        self.credit_touched_bytes(layer, route_plan, report);
+        #[cfg(any(test, feature = "lab", feature = "reference-parity"))]
+        let inject = self
+            .bundle
+            .slowlink_take_injection(SlowlinkFailPoint::DuringPanel);
+        #[cfg(not(any(test, feature = "lab", feature = "reference-parity")))]
+        let inject = false;
+        sweep_panel_groups(
+            &*self.forward,
+            &*self.bundle,
+            &mut *self.gpu,
+            &self.rt.streams,
+            &mut self.rt.ring,
+            &mut self.rt.schedule,
+            PanelSweep {
+                geo: self.geo,
+                profile: self.profile,
+                w,
+                layer,
+                routes,
+                route_plan,
+                groups: &groups,
+                ranges: &ranges,
+                inject,
+            },
+        )
+    }
+
+    /// Touched bytes of a layer: the experts any K2 row or the K1 cohort read,
+    /// at the placement's own extents; never the prefetched remainder.
+    pub(super) fn credit_touched_bytes(
+        &self,
+        layer: usize,
+        route_plan: &dsp::LayerRoutePlan,
+        report: &mut WindowReport,
+    ) {
         let mut touched: Vec<usize> = route_plan
             .experts_with_rows()
             .chain(route_plan.k1_experts.iter().copied())
@@ -3139,167 +3422,6 @@ impl Run<'_, '_> {
                 .expert_extent_bytes(layer, expert)
                 .unwrap_or(0) as u64;
         }
-        #[cfg(any(test, feature = "lab", feature = "reference-parity"))]
-        let first_bound = work.iter().position(|group| group.bound);
-        #[cfg(any(test, feature = "lab", feature = "reference-parity"))]
-        let inject = self
-            .bundle
-            .slowlink_take_injection(SlowlinkFailPoint::DuringPanel);
-        // The panel scratch is anchored on a prefill tile of the window (on the
-        // aggregate route a WMMA tile when the window has one, else its first
-        // multi-row tile, which may itself be an F32-tail tile). Every cohort
-        // tile that runs its own original call registers its own operands
-        // exactly once: each one-row decode tile (the incumbent's decode call)
-        // and, on the aggregate route, each F32-tail tile. A window of decode
-        // tiles only has no prefill tile of its own: its anchor is a stand-in
-        // prefill tile of the admitted tile rows, used only to borrow the
-        // shared scratch views (it is never prepared and never registered, so
-        // no row reads or writes through it).
-        let SweepTiles {
-            anchor: anchor_tile,
-            cohort: cohort_tiles,
-        } = sweep_tiles(self.profile.geometry.route, w.tiles, geo.few_row_limit);
-        let anchor_real = anchor_tile.is_some();
-        let stand_in;
-        let anchor: &TilePlan = match anchor_tile {
-            Some(ti) => &w.tiles[ti],
-            None => {
-                let rows = self.profile.tile_rows;
-                stand_in = TilePlan {
-                    index: 0,
-                    window: w.window.index,
-                    prompt_row: 0,
-                    window_row: 0,
-                    stream_offset: 0,
-                    rows,
-                    position: w.tiles[0].position,
-                    routing: tile_routing(&*self.forward, &mut *self.gpu, rows),
-                    ends_at_cut: None,
-                    last_in_window: false,
-                };
-                &stand_in
-            }
-        };
-        let mut frame_tiles: Vec<&TilePlan> = vec![anchor];
-        frame_tiles.extend(cohort_tiles.iter().map(|&ti| &w.tiles[ti]));
-        // The K2 panels run under the anchor tile's ambient scope; each decode
-        // or K1 step enters its own tile's scope through the hook.
-        let (scopes, _) = self.forward.enter_tile_scopes(&mut *self.gpu, anchor.rows);
-        let result = with_tile_frames(
-            &*self.forward,
-            &*self.bundle,
-            &mut *self.gpu,
-            &self.rt.streams,
-            geo,
-            &frame_tiles,
-            layer,
-            |gpu, frames| {
-                // Each call is sealed and admitted under its own tile's scope
-                // (its routing rows), exactly as its route preparation was.
-                let mut sealed = Vec::with_capacity(frames.len());
-                for (tile, frame) in frame_tiles.iter().zip(frames) {
-                    let (scopes, _) = self.forward.enter_tile_scopes(gpu, tile.rows);
-                    let one = (|| -> R<_> {
-                        let Qwen4FfnBinding::Moe(moe) = &frame.description.ffn else {
-                            return Err(invalid("a host layer's FFN is not MoE"));
-                        };
-                        Ok(frame.env.seal_moe(frame.ctx, *moe, frame.scratch_desc)?)
-                    })();
-                    Qwen4GpuForward::leave_tile_scopes(gpu, scopes);
-                    sealed.push(one?);
-                }
-                let mut calls = Vec::with_capacity(sealed.len());
-                for (tile, sealed) in frame_tiles.iter().zip(&sealed) {
-                    let (scopes, _) = self.forward.enter_tile_scopes(gpu, tile.rows);
-                    let call = dsp::PreparedChunkCall::new(
-                        &*gpu,
-                        sealed,
-                        tile.window_row,
-                        tile.position,
-                        self.profile.geometry.route,
-                    );
-                    Qwen4GpuForward::leave_tile_scopes(gpu, scopes);
-                    calls.push(call.map_err(dsp_err("admission"))?);
-                }
-                let mut scratch = dsp::PanelScratch::new(&calls[0], dsp::PanelLimits::S1)
-                    .map_err(dsp_err("panel scratch"))?;
-                // Each call registers once by its own actual kind, the anchor
-                // included when it is itself a tail tile; the stand-in never.
-                for (index, call) in calls.iter().enumerate() {
-                    if index == 0 && !anchor_real {
-                        continue;
-                    }
-                    match call.tile_kind() {
-                        dsp::TileKind::Decode => scratch
-                            .add_decode_tile(call)
-                            .map_err(dsp_err("decode tile"))?,
-                        dsp::TileKind::AggregateF32Tail => scratch
-                            .add_tail_tile(call)
-                            .map_err(dsp_err("F32 tail tile"))?,
-                        _ if index == 0 => {}
-                        kind => {
-                            return Err(invalid(format!(
-                                "slow-link cohort tile at window row {} sealed as {kind:?}, not a \
-                                 decode or F32-tail call",
-                                call.row0()
-                            )))
-                        }
-                    }
-                }
-                let mut cursor = dsp::OrderedCombineCursor::start(gpu, routes, &panels)
-                    .map_err(dsp_err("combine start"))?;
-                let mut hook = ForwardScopeHook {
-                    forward: &*self.forward,
-                    tiles: w.tiles,
-                    open: Vec::new(),
-                };
-                let mut ring = HipRing {
-                    ring: &mut self.rt.ring,
-                    schedule: &mut self.rt.schedule,
-                };
-                walk_layer_groups(&mut ring, gpu, layer, &work, &mut |gpu, index, parts| {
-                    let parts =
-                        parts.ok_or_else(|| invalid("slow-link panel lease carries no binding"))?;
-                    #[cfg(any(test, feature = "lab", feature = "reference-parity"))]
-                    if inject && Some(index) == first_bound {
-                        return Err(invalid("injected slow-link failure during a panel"));
-                    }
-                    let group = &groups[index];
-                    let (Some(&lo), Some(&last)) = (group.experts.first(), group.experts.last())
-                    else {
-                        return Err(invalid("an empty expert group"));
-                    };
-                    let binding = dsp::ExpertPanelBinding {
-                        layer,
-                        epoch: parts.epoch,
-                        expert_lo: lo,
-                        expert_hi: last + 1,
-                        gate_up_table: parts.gate_up_table,
-                        down_table: parts.down_table,
-                        codec: dsp::PanelCodec::Mq4,
-                        source: dsp::BindingSource::Staged {
-                            slot: parts.ticket.slot as u32,
-                        },
-                    };
-                    for panel_index in by_group[index].clone() {
-                        let panel = &panels[panel_index];
-                        dsp::execute_panel(
-                            gpu,
-                            binding,
-                            route_plan.view(routes, panel),
-                            &mut scratch,
-                            &mut cursor,
-                            &mut hook,
-                        )
-                        .map_err(dsp_err("panel"))?;
-                    }
-                    Ok(())
-                })?;
-                dsp::finish_combine(gpu, routes, &mut cursor, &mut hook).map_err(dsp_err("combine"))
-            },
-        );
-        Qwen4GpuForward::leave_tile_scopes(&mut *self.gpu, scopes);
-        result
     }
 
     /// Tile `ti` of `layer`: PLE rows, the mixer prefix, the QSA cursor, and
@@ -3751,6 +3873,9 @@ pub(crate) fn try_run_prompt(
     if let Some(sp) = runtime.sp.as_mut() {
         sp.begin_request();
     }
+    if let Some(touched) = runtime.touched.as_mut() {
+        touched.begin_request();
+    }
     let (resident_layers, host_layers, tile_scratch_bytes) = (
         runtime.resident_layers,
         runtime.host_layers,
@@ -3798,8 +3923,7 @@ pub(crate) fn try_run_prompt(
                 .slowlink
                 .runtime
                 .as_ref()
-                .and_then(|runtime| runtime.sp.as_ref())
-                .map(|sp| sp.reports().to_vec())
+                .map(SlowlinkRuntime::sp_reports)
                 .unwrap_or_default();
             let sp_windows: Vec<SpWindowEntry> = plan
                 .windows

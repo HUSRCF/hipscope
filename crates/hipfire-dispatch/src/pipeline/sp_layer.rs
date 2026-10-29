@@ -333,6 +333,85 @@ fn assemble(
     })
 }
 
+// ───────────────────────────── TouchedOnly: selective S1 sweep ─────────────────────────────
+
+/// The experts a layer's panel sweep reads: every expert holding at least one K2 grouped row
+/// (`counts_padded > 0`, which is `exact > 0` because a padded count is the round-up of the
+/// exact one) or at least one cohort slot (`k1_experts`: the K1 short-tail / one-row decode /
+/// aggregate F32-tail tiles, whose ids never enter the K2 grouping). Ascending, unique.
+///
+/// Both sets come from the one count barrier ([`LayerRoutePlan::from_counts`]); no `sorted`
+/// readback and no per-token id reaches the host.
+pub fn touched_experts(plan: &LayerRoutePlan) -> Vec<u16> {
+    let mut touched: Vec<u16> = plan
+        .experts_with_rows()
+        .chain(plan.k1_experts.iter().copied())
+        .map(|e| e as u16)
+        .collect();
+    touched.sort_unstable();
+    touched.dedup();
+    touched
+}
+
+/// The transport groups of a TouchedOnly layer: [`touched_experts`] chunked ascending into
+/// groups of at most `experts_per_slot` (S1: 32), one ring page each.
+///
+/// `pages` is the ring's page count: the whole layer's groups are enqueued at once (the host
+/// never waits for a page), so more groups than pages is refused here, before any ring state is
+/// touched. A layer that routes no slot at all (every id unrouted) has no touched expert; it
+/// streams the single `fallback` expert (a held expert of the layer) so the panel schedule keeps
+/// its one zero-row panel (`None`: no fallback, an error).
+pub fn touched_groups(
+    plan: &LayerRoutePlan,
+    experts_per_slot: usize,
+    pages: usize,
+    fallback: Option<u16>,
+) -> Result<Vec<Vec<u16>>, DispatchError> {
+    if experts_per_slot == 0 {
+        return Err(bail("touched groups need experts_per_slot > 0"));
+    }
+    if plan.n_exp() > usize::from(u16::MAX) + 1 {
+        return Err(bail(format!(
+            "{} experts do not fit a u16 expert id",
+            plan.n_exp()
+        )));
+    }
+    let mut touched = touched_experts(plan);
+    if touched.is_empty() {
+        touched
+            .push(fallback.ok_or_else(|| {
+                bail("the layer routes no slot and no fallback expert was named")
+            })?);
+    }
+    let groups: Vec<Vec<u16>> = touched
+        .chunks(experts_per_slot)
+        .map(<[u16]>::to_vec)
+        .collect();
+    if groups.len() > pages {
+        return Err(bail(format!(
+            "{} touched groups need {} ring pages at once, the ring has {pages}",
+            groups.len(),
+            groups.len()
+        )));
+    }
+    Ok(groups)
+}
+
+/// The panel binding ranges of touched groups: `(first expert, last expert + 1)` of each
+/// group, ascending and disjoint. They are tight (they do not extend over the untouched
+/// experts between two groups), which is what the weight binding of a panel holds: a K1 or
+/// F32-tail cohort panel requires the binding to cover `[bind_lo, bind_hi)`. An expert between
+/// two groups has no K2 row and no cohort slot (it is untouched), so no row is dropped.
+pub fn touched_binding_ranges(groups: &[Vec<u16>]) -> Vec<(usize, usize)> {
+    groups
+        .iter()
+        .filter_map(|group| {
+            let (&lo, &last) = (group.first()?, group.last()?);
+            Some((usize::from(lo), usize::from(last) + 1))
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1046,5 +1125,171 @@ mod tests {
             engaged >= 24,
             "every window exercised a hybrid split ({engaged})"
         );
+    }
+
+    // ---------------- TouchedOnly: touched groups and the S1 panel schedule over them ----------------
+
+    use crate::pipeline::slowlink_prefill::PanelLimits;
+
+    /// A layer grouping of `ids` whose cohort (K1 / F32-tail tiles) routes to `cohort`.
+    fn with_cohort(ids: &[i32], n_exp: usize, cohort: &[usize]) -> LayerRoutePlan {
+        let g = group_reference(ids, n_exp, 0);
+        LayerRoutePlan::from_counts(
+            &g.plan
+                .counts_padded
+                .iter()
+                .map(|&c| c as i32)
+                .collect::<Vec<_>>(),
+            cohort.to_vec(),
+            BarrierCost::default(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn touched_experts_are_the_k2_and_cohort_experts_ascending() {
+        // K2 rows on 3, 7, 7, 200; the cohort routes to 7 (also K2), 5 and 511 (cohort only).
+        let mut ids = vec![-1i32; 40];
+        ids[0] = 200;
+        ids[1] = 3;
+        ids[2] = 7;
+        ids[15] = 7;
+        let plan = with_cohort(&ids, 512, &[5, 7, 511]);
+        assert_eq!(touched_experts(&plan), vec![3, 5, 7, 200, 511]);
+        // No cohort: only the K2 experts. No rows at all: nothing.
+        assert_eq!(
+            touched_experts(&with_cohort(&ids, 512, &[])),
+            vec![3, 7, 200]
+        );
+        assert!(touched_experts(&with_cohort(&[-1; 20], 512, &[])).is_empty());
+    }
+
+    #[test]
+    fn touched_groups_chunk_ascending_cover_everything_and_respect_the_ring() {
+        let mut rng = Rng(0x70c4_ed);
+        for rows in [5usize, 100, 768, 1536, 2304] {
+            for hot in [4usize, 64, 512] {
+                let ids = random_ids(&mut rng, rows, 512, hot, true);
+                let cohort: Vec<usize> = {
+                    let mut c: Vec<usize> = (0..rng.below(40)).map(|_| rng.below(512)).collect();
+                    c.sort_unstable();
+                    c.dedup();
+                    c
+                };
+                let plan = with_cohort(&ids, 512, &cohort);
+                let groups = touched_groups(&plan, 32, 18, Some(0)).unwrap();
+                let flat: Vec<usize> = groups.iter().flatten().map(|&e| usize::from(e)).collect();
+                // Every expert with K2 rows or cohort slots, ascending, once.
+                let mut want: Vec<usize> = plan
+                    .counts_padded
+                    .iter()
+                    .enumerate()
+                    .filter(|&(e, &c)| c > 0 || cohort.contains(&e))
+                    .map(|(e, _)| e)
+                    .collect();
+                if want.is_empty() {
+                    want.push(0);
+                }
+                assert_eq!(flat, want, "rows {rows} hot {hot}");
+                assert!(groups.iter().all(|g| (1..=32).contains(&g.len())));
+                assert!(
+                    groups.len() <= 16,
+                    "512 experts never need more than 16 groups"
+                );
+                // Every group but the last is full: the fewest pages.
+                assert!(groups[..groups.len() - 1].iter().all(|g| g.len() == 32));
+                // The ring bound: exactly at the pages passes, one fewer is refused.
+                assert!(touched_groups(&plan, 32, groups.len(), Some(0)).is_ok());
+                if groups.len() > 1 {
+                    let error = touched_groups(&plan, 32, groups.len() - 1, Some(0)).unwrap_err();
+                    assert!(error.to_string().contains("ring pages"), "{error}");
+                }
+            }
+        }
+        // No touched expert: the fallback streams alone; without one it is an error.
+        let none = with_cohort(&[-1; 20], 512, &[]);
+        assert_eq!(
+            touched_groups(&none, 32, 18, Some(9)).unwrap(),
+            vec![vec![9u16]]
+        );
+        assert!(touched_groups(&none, 32, 18, None).is_err());
+        assert!(touched_groups(&none, 0, 18, Some(9)).is_err());
+    }
+
+    #[test]
+    fn touched_panels_are_the_s1_schedule_over_tight_ascending_bindings() {
+        let mut rng = Rng(0xA11_70c4);
+        for rows in [5usize, 300, 768, 1024, 2304] {
+            for hot in [4usize, 40, 512] {
+                let ids = random_ids(&mut rng, rows, 512, hot, true);
+                let cohort: Vec<usize> = {
+                    let mut c: Vec<usize> =
+                        (0..1 + rng.below(30)).map(|_| rng.below(512)).collect();
+                    c.sort_unstable();
+                    c.dedup();
+                    c
+                };
+                let plan = with_cohort(&ids, 512, &cohort);
+                let groups = touched_groups(&plan, 32, 18, Some(0)).unwrap();
+                let ranges = touched_binding_ranges(&groups);
+                assert_eq!(ranges.len(), groups.len());
+                assert!(
+                    ranges.windows(2).all(|w| w[0].1 <= w[1].0),
+                    "disjoint ascending"
+                );
+                for (g, &(lo, hi)) in groups.iter().zip(&ranges) {
+                    assert_eq!(
+                        (lo, hi),
+                        (usize::from(g[0]), usize::from(g[g.len() - 1]) + 1)
+                    );
+                }
+                // `schedule` accepts the tight ranges (every routed expert lies in a binding).
+                let panels = plan.schedule(&ranges, PanelLimits::S1).unwrap();
+                // Rows: contiguous in ascending order and exactly the layer's padded rows.
+                let mut next = None;
+                let mut covered = 0usize;
+                for panel in panels.iter().filter(|p| p.rows > 0) {
+                    if let Some(expected) = next {
+                        assert_eq!(
+                            panel.row_base, expected,
+                            "rows are contiguous across untouched gaps"
+                        );
+                    }
+                    next = Some(panel.row_base + panel.rows);
+                    covered += panel.rows;
+                    // A panel's experts sit inside its (tight) binding, so the binding covers them.
+                    assert!(panel.bind_lo <= panel.expert_lo && panel.expert_hi <= panel.bind_hi);
+                    assert!(panel.rows <= PanelLimits::S1.max_grouped_rows);
+                }
+                assert_eq!(covered, plan.total_rows, "rows {rows} hot {hot}");
+                // Ownership of invalid-row slots partitions [0, n_exp) in panel order.
+                let mut own = 0usize;
+                for panel in &panels {
+                    assert_eq!(panel.own_lo, own);
+                    own = panel.own_hi;
+                }
+                assert_eq!(own, 512);
+                // The cohort runs once per binding that holds a cohort expert, on the binding's
+                // first panel, and the binding covers all of its range.
+                for (binding, &(lo, hi)) in ranges.iter().enumerate() {
+                    let holds = plan.k1_experts.iter().any(|&e| (lo..hi).contains(&e));
+                    let k1_panels = panels
+                        .iter()
+                        .filter(|p| p.binding == binding && p.k1)
+                        .count();
+                    assert_eq!(k1_panels, usize::from(holds), "binding {binding}");
+                }
+                // Every cohort expert is inside exactly one binding.
+                for &e in &plan.k1_experts {
+                    assert_eq!(
+                        ranges
+                            .iter()
+                            .filter(|&&(lo, hi)| (lo..hi).contains(&e))
+                            .count(),
+                        1
+                    );
+                }
+            }
+        }
     }
 }
