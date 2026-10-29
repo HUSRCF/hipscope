@@ -2223,7 +2223,7 @@ pub static FIELDS: &[ConfigField] = &[
         true,
         false,
         Some("HIPFIRE_MTP_NGRAM_COPY"),
-        "Native Qwen4 MTP n-gram copy lane (verbatim-copy matcher, adaptive take of up to the row-exact verify rows minus one, row-0 confirmation only until the copy source is established, kept on floor-retired requests). on/1 arms it wherever the native Qwen4 n-gram source is armed (triple 5/1/63); off/0 keeps the 5/3/3 pool with row-0 confirmation on every takeover; auto (default) is off on every GPU for now."
+        "Native Qwen4 MTP n-gram copy lane (verbatim-copy matcher, adaptive take of up to the row-exact verify rows minus one, row-0 confirmation only until the copy source is established, kept on floor-retired requests). on/1 arms it wherever the native Qwen4 n-gram source is armed (triple 5/1/63); off/0 keeps the 5/3/3 pool with row-0 confirmation on every takeover (kill switch); auto (default) arms it for native Qwen4 MTP (arch 16) on gfx1151 and gfx1201 and leaves every other GPU off."
     ),
     field!(
         "speculation.mtp_sampled",
@@ -5096,9 +5096,11 @@ pub fn ngram_mod_copy_triple() -> (usize, usize, usize) {
 /// Native Qwen4 MTP n-gram copy lane arming (`speculation.mtp_ngram_copy`,
 /// env override `HIPFIRE_MTP_NGRAM_COPY`). `on`/`1` arms it wherever the
 /// native Qwen4 n-gram source is armed ([`mtp_ngram_enabled_for_arch`]),
-/// `off`/`0` keeps the 5/3/3 pool with row-0 confirmation on every takeover,
-/// and `auto` (the schema default; an unset key also resolves to `auto`) is
-/// off on every GPU until a GPU's own receipts flip it.
+/// `off`/`0` keeps the 5/3/3 pool with row-0 confirmation on every takeover
+/// (the kill switch), and `auto` (the schema default; an unset key also
+/// resolves to `auto`) arms it for native Qwen4 MTP (`model_arch == 16`) on
+/// gfx1151 and gfx1201, the GPUs whose greedy-identity and timing receipts
+/// flipped it; every other GPU stays off until its own receipts say otherwise.
 pub fn mtp_ngram_copy_enabled_for_arch(model_arch: u32, gpu_arch: &str) -> bool {
     mtp_ngram_copy_enabled_for_arch_value(
         process_value("HIPFIRE_MTP_NGRAM_COPY").as_deref(),
@@ -5108,14 +5110,18 @@ pub fn mtp_ngram_copy_enabled_for_arch(model_arch: u32, gpu_arch: &str) -> bool 
 }
 fn mtp_ngram_copy_enabled_for_arch_value(
     value: Option<&str>,
-    _model_arch: u32,
-    _gpu_arch: &str,
+    model_arch: u32,
+    gpu_arch: &str,
 ) -> bool {
     match value {
         Some("1" | "on") => true,
         Some("0" | "off") => false,
-        _ => false,
+        _ => copy_lane_arch_admitted(model_arch, gpu_arch),
     }
+}
+/// Native Qwen4 MTP (model arch 16) on the GPUs the copy lane's `auto` arms.
+fn copy_lane_arch_admitted(model_arch: u32, gpu_arch: &str) -> bool {
+    model_arch == 16 && matches!(gpu_arch, "gfx1151" | "gfx1201")
 }
 /// Dense Qwen3.5-class DFlash2 verbatim-copy lookup arming
 /// (`speculation.dflash_lookup`, env override `HIPFIRE_DFLASH_LOOKUP`).
@@ -8094,8 +8100,8 @@ mod tests {
             (16, "gfx1100"),
             (5, "gfx1151"),
         ];
-        // auto/unset: off on every GPU until a GPU's receipts flip it.
-        let auto = [false; 4];
+        // auto/unset: native Qwen4 MTP (arch 16) on gfx1151 and gfx1201 only.
+        let auto = [true, true, false, false];
         for (raw, expect) in [
             (Some("on"), [true; 4]),
             (Some("1"), [true; 4]),

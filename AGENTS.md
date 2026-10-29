@@ -1057,8 +1057,10 @@ Caveats that are part of the fixture, not trivia:
   serves greedy and sampled requests, thinking on or off (Qwen4 and
   Qwen3.5/3.x). The Qwen4 proposal source is switched by
   `speculation.mtp_ngram_copy` / `HIPFIRE_MTP_NGRAM_COPY` (`on`/`off`/`auto`,
-  also `1`/`0`; default `auto`, which is **off on every GPU for now**; env
-  beats TOML beats default). **Off is beta's lane exactly.** On Qwen4 a pool
+  also `1`/`0`; default `auto`, which is **on for native Qwen4 MTP (arch 16)
+  on gfx1151 and gfx1201** and off on every other GPU; `off`/`0` is the kill
+  switch; env beats TOML beats default). **Off is the 5/3/3 pool lane
+  exactly.** On Qwen4 a pool
   hit (`MtpNgramContext`, the 5/3/3 pool; request-local, cleared and reseeded
   from the full prompt every request, so earlier requests never influence
   candidates, and cleared after five low-acceptance windows) takes the window

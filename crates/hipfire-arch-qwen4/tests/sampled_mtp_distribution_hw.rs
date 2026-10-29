@@ -105,9 +105,10 @@
 //! penalties), `HIPFIRE_SAMPLED_MTP_TRIALS` (>= 2000) cold trials per arm.
 //! These arms follow the product switch: `copy` is
 //! `hipfire_config::mtp_ngram_copy_enabled_for_arch` of the loaded GPU
-//! (`speculation.mtp_ngram_copy` / `HIPFIRE_MTP_NGRAM_COPY`, off by default:
-//! the native-MTP n-gram takeover; `HIPFIRE_MTP_NGRAM_COPY=on` runs them on
-//! the copy lane). The mode is recorded as `copy_lane` in every arm's config,
+//! (`speculation.mtp_ngram_copy` / `HIPFIRE_MTP_NGRAM_COPY`; `auto` is the
+//! copy lane on gfx1151 / gfx1201 and the native-MTP 5/3/3 takeover elsewhere;
+//! `HIPFIRE_MTP_NGRAM_COPY=off` runs them on the 5/3/3 pool, `on` on the copy
+//! lane). The mode is recorded as `copy_lane` in every arm's config,
 //! and the parent resolves it from each arm's receipt GPU, so ids of one mode
 //! are never reused as the other's:
 //!
