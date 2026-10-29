@@ -237,7 +237,11 @@ fn validate_dequant<'a>(
 }
 
 /// Launch a validated invocation.
-fn launch(gpu: &mut Gpu, symbol: &'static str, mut v: ValidatedInvocationV1<'_>) -> HipResult<()> {
+fn ggml_convert_launch(
+    gpu: &mut Gpu,
+    symbol: &'static str,
+    mut v: ValidatedInvocationV1<'_>,
+) -> HipResult<()> {
     gpu.bind_thread()?;
     gpu.ensure_embedded_kernel(MODULE, IMAGE, symbol)?;
     let mut ptrs = [std::ptr::null_mut::<c_void>(); MAX_FIELDS];
@@ -294,7 +298,7 @@ impl Gpu {
             kernel_abi::binding(out, abi::FORMAT_F16_FLAT),
             colmap,
         )?;
-        launch(self, symbol_of(e.dequant_f16), v)
+        ggml_convert_launch(self, symbol_of(e.dequant_f16), v)
     }
 
     /// [`Gpu::ggml_dequant_f16`] into the F32 tensor `out` (`m * k` elements). `bf16_round = true`
@@ -330,7 +334,7 @@ impl Gpu {
             kernel_abi::binding(out, abi::FORMAT_F32_FLAT),
             colmap,
         )?;
-        launch(self, symbol_of(e.dequant_f32), v)
+        ggml_convert_launch(self, symbol_of(e.dequant_f32), v)
     }
 
     /// Embedding lookup of ONE token: dequantise row `token` of the ggml table (`dim` elements per
@@ -366,7 +370,7 @@ impl Gpu {
                 dynamic_lds: 0,
             },
         )?;
-        launch(self, symbol_of(contract), v)
+        ggml_convert_launch(self, symbol_of(contract), v)
     }
 
     /// Batched embedding lookup: `token_ids` is a device tensor of `n` int32 token ids (raw words),
@@ -409,7 +413,7 @@ impl Gpu {
                 dynamic_lds: 0,
             },
         )?;
-        launch(self, symbol_of(contract), v)
+        ggml_convert_launch(self, symbol_of(contract), v)
     }
 
     /// In-place A8 emulation over the F32 activations `x` (`rows * k` elements, `k % 32 == 0`): every
@@ -441,7 +445,7 @@ impl Gpu {
                 dynamic_lds: 0,
             },
         )?;
-        launch(self, ROUNDTRIP_SYMBOL, v)
+        ggml_convert_launch(self, ROUNDTRIP_SYMBOL, v)
     }
 }
 

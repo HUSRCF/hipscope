@@ -246,7 +246,7 @@ fn validate_mmvq<'a>(
 }
 
 /// Launch a validated invocation of `symbol` from `object`.
-fn launch(
+fn ggml_mmvq_launch(
     gpu: &mut Gpu,
     object: Object,
     symbol: &'static str,
@@ -295,7 +295,7 @@ impl Gpu {
             kernel_abi::binding(x, s1::FORMAT_F32_ROWS_S01),
             kernel_abi::binding(q81, s1::FORMAT_Q8_1_MMVQ),
         )?;
-        launch(self, Object::S1, PRODUCER_SYMBOL, v)
+        ggml_mmvq_launch(self, Object::S1, PRODUCER_SYMBOL, v)
     }
 
     /// Single-row quantiser with a block permutation: `q81` block `j` (32 elements) is
@@ -324,7 +324,7 @@ impl Gpu {
             kernel_abi::binding(q81, s1::FORMAT_Q8_1_MMVQ),
             kernel_abi::binding(blk_map, s3::FORMAT_I32_BLK_MAP),
         )?;
-        launch(self, Object::Fused, GATHER_SYMBOL, v)
+        ggml_mmvq_launch(self, Object::Fused, GATHER_SYMBOL, v)
     }
 
     /// `y = W x` (`accumulate = false`) or `y += W x` (`accumulate = true`: `y[row] = y[row]
@@ -367,7 +367,7 @@ impl Gpu {
             kernel_abi::binding(q81, s1::FORMAT_Q8_1_MMVQ),
             kernel_abi::binding(y, s1::FORMAT_F32_M),
         )?;
-        launch(self, export.object, export.symbol, v)
+        ggml_mmvq_launch(self, export.object, export.symbol, v)
     }
 }
 
