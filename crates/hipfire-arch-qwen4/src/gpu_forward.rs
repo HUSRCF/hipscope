@@ -3356,8 +3356,8 @@ impl Qwen4MoeLayerRuntime {
     /// The BorrowPrefill runtime of a decode-share load for prefill capacity
     /// class `class`: the same layer built from the lease's class view (the
     /// donors that class can overwrite at their pinned host mirror, the rest
-    /// at their device bytes). Serves only prompt tiles of at least the
-    /// resident bank's rows; never arms a CPU splice or D2 split.
+    /// at their device bytes). Class zero also supplies the exact-cache
+    /// immutable core/host prefill view. Never arms a CPU splice or D2 split.
     pub(crate) fn from_moe_borrow(
         gpu: &mut Gpu,
         weights: &Qwen4Weights,
@@ -8367,6 +8367,32 @@ fn tile_moe_of<'a, T>(
     }
 }
 
+/// A dirty short prompt can read immutable core/host weights while the cache
+/// keeps its donor slots. A clean prompt or a staged-width tile retains the
+/// original Resident prefill route, including a long prompt's short clean tail.
+fn expert_cache_prefill_uses_host(dirty: bool, rows: usize, stage_min_rows: usize) -> bool {
+    dirty && rows > 0 && rows < stage_min_rows
+}
+
+/// The cache's immutable prompt tables are distinct from its mutable decode
+/// tables. Keep this selection shared by tile descriptors and program building.
+fn cache_tile_moe_of<'a, T>(
+    decode_active: bool,
+    host_prefill_active: bool,
+    resident: &'a [T],
+    decode: &'a [T],
+    host_prefill: &'a [T],
+) -> &'a [T] {
+    debug_assert!(!(decode_active && host_prefill_active));
+    if decode_active {
+        decode
+    } else if host_prefill_active {
+        host_prefill
+    } else {
+        resident
+    }
+}
+
 /// The BorrowPrefill class view a prompt tile reads: the epoch's dirty class,
 /// i.e. the largest class any tile of the current borrow epoch (this one
 /// included) ran on. `dirty_extent` is the loan's dirty byte prefix after this
@@ -8887,8 +8913,12 @@ pub struct Qwen4GpuForward {
     pub(crate) moe: Vec<Option<Qwen4MoeLayerRuntime>>,
     expert_cache: Option<crate::expert_cache::ExpertCache>,
     moe_cache: Vec<Option<Qwen4MoeLayerRuntime>>,
+    /// Frozen core-device/donor-host/cold-host views, without a mutable
+    /// residency capability or ownership of their borrowed pointer tables.
+    moe_cache_prefill: Vec<Option<Qwen4MoeLayerRuntime>>,
     cache_routes: Option<ExpertCacheRoutes>,
     cache_active: bool,
+    cache_host_prefill_active: bool,
     cache_replay_quiescent: Cell<bool>,
     cpu_deferred_experts: bool,
     /// Trunk layers armed for the D2 tier split (a distinct numerical mode:
@@ -10959,8 +10989,10 @@ impl Qwen4GpuForward {
             moe_borrow,
             expert_cache: None,
             moe_cache: Vec::new(),
+            moe_cache_prefill: Vec::new(),
             cache_routes: None,
             cache_active: false,
+            cache_host_prefill_active: false,
             cache_replay_quiescent: Cell::new(true),
             borrow_class_rows,
             borrow_runtimes_active: false,
@@ -11651,9 +11683,7 @@ impl Qwen4GpuForward {
         borrow_view_class(views, tile_class, spans, extent)
     }
 
-    /// The per-layer MoE runtimes the running tile reads: the BorrowPrefill
-    /// twins during a decode-share prompt tile, the Resident runtimes in every
-    /// other forward (decode, verify, lanes, EP, mesh, small tiles, attach).
+    /// Attach the decode cache and its independent immutable prompt views.
     pub(crate) fn enable_expert_cache(
         &mut self,
         gpu: &mut Gpu,
@@ -11695,11 +11725,56 @@ impl Qwen4GpuForward {
         let mut runtimes = (0..config.num_hidden_layers)
             .map(|_| None)
             .collect::<Vec<_>>();
+        let mut prefill_runtimes = (0..config.num_hidden_layers)
+            .map(|_| None)
+            .collect::<Vec<_>>();
         let built = populate_moe_runtimes(&mut runtimes, &weights.layer_refs, |layer, moe| {
             let binding = cache
                 .layer_binding(layer)
                 .ok_or_else(|| invalid(format!("layer {layer}: missing cache binding")))?;
             Qwen4MoeLayerRuntime::from_moe_cache(gpu, weights, moe, layer, config, &binding)
+        })
+        .and_then(|()| {
+            populate_moe_runtimes(&mut prefill_runtimes, &weights.layer_refs, |layer, moe| {
+                if weights
+                    .expert_tiers()
+                    .and_then(|lease| lease.expert_cache_layer(layer))
+                    .is_none()
+                {
+                    return Err(invalid(format!(
+                        "layer {layer}: missing immutable cache prefill view"
+                    )));
+                }
+                let resident = self
+                    .moe
+                    .get(layer)
+                    .and_then(Option::as_ref)
+                    .ok_or_else(|| {
+                        invalid(format!("layer {layer}: missing Resident prefill runtime"))
+                    })?;
+                let mut prefill = Qwen4MoeLayerRuntime::from_moe_borrow(
+                    gpu, weights, moe, layer, config, false, 0,
+                )?;
+                // The immutable host mirror contains the same verified headers.
+                // Losing this verdict would change the >=512-row IU4 route and
+                // can exceed the compact plan's F32 fallback scratch.
+                prefill.symmetric = resident.symmetric;
+                let decode = runtimes
+                    .get(layer)
+                    .and_then(Option::as_ref)
+                    .expect("decode runtimes were built first");
+                if prefill.mutable_residency.is_some()
+                    || prefill.expert_gate_up_ptrs.buf.as_ptr()
+                        == decode.expert_gate_up_ptrs.buf.as_ptr()
+                    || prefill.expert_down_ptrs.buf.as_ptr() == decode.expert_down_ptrs.buf.as_ptr()
+                {
+                    let _ = prefill.free_gpu(gpu);
+                    return Err(invalid(format!(
+                        "layer {layer}: cache prefill must use independent immutable tables"
+                    )));
+                }
+                Ok(prefill)
+            })
         });
         let routes = built.and_then(|()| {
             ExpertCacheRoutes::new(gpu, config.num_hidden_layers, config.num_experts_per_tok)
@@ -11707,7 +11782,7 @@ impl Qwen4GpuForward {
         let routes = match routes {
             Ok(routes) => routes,
             Err(error) => {
-                for runtime in runtimes.into_iter().flatten() {
+                for runtime in runtimes.into_iter().chain(prefill_runtimes).flatten() {
                     let _ = runtime.free_gpu(gpu);
                 }
                 let _ = cache.shutdown(gpu);
@@ -11715,21 +11790,33 @@ impl Qwen4GpuForward {
             }
         };
         self.moe_cache = runtimes;
+        self.moe_cache_prefill = prefill_runtimes;
         self.cache_routes = Some(routes);
         self.expert_cache = Some(cache);
         eprintln!("  qwen4 exact expert cache: decode-only, tail={}%, max-inflight={}, routed ids unchanged", policy.tail_percent, policy.max_inflight);
+        eprintln!("  qwen4 exact expert cache: dirty prompt tiles below {} rows read immutable core/host tables", self.cache_prefill_stage_min_rows(gpu));
         Ok(())
     }
 
+    fn cache_prefill_stage_min_rows(&self, gpu: &Gpu) -> usize {
+        self.expert_stage.as_ref().map_or_else(
+            || qwen4_expert_stage_min_rows(gpu, self.scratch.max_chunk).0,
+            |stage| stage.min_rows,
+        )
+    }
+
     pub(crate) fn tile_moe(&self) -> &[Option<Qwen4MoeLayerRuntime>] {
-        if self.cache_active {
-            return &self.moe_cache;
-        }
-        tile_moe_of(
-            self.borrow_runtimes_active,
-            self.borrow_view,
-            &self.moe,
-            &self.moe_borrow,
+        cache_tile_moe_of(
+            self.cache_active,
+            self.cache_host_prefill_active,
+            tile_moe_of(
+                self.borrow_runtimes_active,
+                self.borrow_view,
+                &self.moe,
+                &self.moe_borrow,
+            ),
+            &self.moe_cache,
+            &self.moe_cache_prefill,
         )
     }
 
@@ -12097,6 +12184,7 @@ impl Qwen4GpuForward {
             moe,
             moe_borrow,
             moe_cache,
+            moe_cache_prefill,
             cache_routes,
             expert_stage,
             ep,
@@ -12211,7 +12299,12 @@ impl Qwen4GpuForward {
                 }
             }
         }
-        for layer in moe.into_iter().chain(moe_cache).flatten() {
+        for layer in moe
+            .into_iter()
+            .chain(moe_cache)
+            .chain(moe_cache_prefill)
+            .flatten()
+        {
             if let Some(error) = layer.free_gpu(gpu) {
                 if first.is_none() {
                     first = Some(error);
@@ -13283,12 +13376,27 @@ impl Qwen4GpuForward {
         self.share_check()?;
         if self.expert_cache.is_some() {
             if self.prefill_scope {
-                self.expert_cache
-                    .as_mut()
-                    .expect("cache present")
-                    .prepare_prefill(gpu)
-                    .map_err(invalid)?;
-                return self.forward_chunk_tile(
+                let host_prefill = expert_cache_prefill_uses_host(
+                    self.expert_cache
+                        .as_ref()
+                        .expect("cache present")
+                        .is_dirty(),
+                    tokens.len(),
+                    self.cache_prefill_stage_min_rows(gpu),
+                );
+                let cache = self.expert_cache.as_mut().expect("cache present");
+                if host_prefill {
+                    // Only immutable core/host payloads and static tables are
+                    // read. Pending fills can continue writing the donor pool;
+                    // neither their mappings nor cache recency need changing.
+                    cache
+                        .prepare_host_prefill(gpu, tokens.len())
+                        .map_err(invalid)?;
+                } else {
+                    cache.prepare_prefill(gpu).map_err(invalid)?;
+                }
+                let prior = std::mem::replace(&mut self.cache_host_prefill_active, host_prefill);
+                let result = self.forward_chunk_tile(
                     bundle,
                     gpu,
                     tokens,
@@ -13298,6 +13406,8 @@ impl Qwen4GpuForward {
                     wide_hidden_capture,
                     output_policy,
                 );
+                self.cache_host_prefill_active = prior;
+                return result;
             }
             if tokens.len() != 1
                 || self.qsa_tap.is_some()
@@ -13917,6 +14027,10 @@ impl Qwen4GpuForward {
             // Cache decode has independent mutable tables and donor slots;
             // the existing stage remains available only to canonical prefill.
             .filter(|_| !self.cache_active)
+            // This stage was built for Resident placement. Its host mask and
+            // sparse tables cannot stage the extra host-backed donor entries
+            // of the immutable core/host prompt view.
+            .filter(|_| !self.cache_host_prefill_active)
             .filter(|stage| stage.begin_forward(tile_active))
         {
             Some(stage)
@@ -13938,19 +14052,21 @@ impl Qwen4GpuForward {
             // layers compute (the legacy donors refill from their own MoE).
             stage.slab_prime(gpu, self.tile_moe().len())?;
         }
-        // The runtimes this tile reads, as a slice borrowed from the two
+        // The runtimes this tile reads, as a slice borrowed from the
         // runtime fields only (`Self::tile_moe` would borrow all of `self`
         // across the program build and its closures).
-        let tile_moe = if self.cache_active {
-            &self.moe_cache[..]
-        } else {
+        let tile_moe = cache_tile_moe_of(
+            self.cache_active,
+            self.cache_host_prefill_active,
             tile_moe_of(
                 self.borrow_runtimes_active,
                 self.borrow_view,
                 &self.moe,
                 &self.moe_borrow,
-            )
-        };
+            ),
+            &self.moe_cache,
+            &self.moe_cache_prefill,
+        );
         // Whether the donor tail is whole for this call (read once, before the
         // program closures borrow `self`; the loan state cannot change inside a tile).
         let donor_resident = self.share_state_resident();
@@ -16879,6 +16995,28 @@ mod tests {
             tile_moe_of(false, 0, &resident, &none),
             &resident[..]
         ));
+    }
+
+    #[test]
+    fn expert_cache_prefill_preserves_resident_on_pristine_and_staged_tiles() {
+        use super::{expert_cache_prefill_uses_host as host, resolve_expert_stage_min_rows};
+        let floor = resolve_expert_stage_min_rows("gfx1201", 4096, false, None).0;
+        assert_eq!(floor, 2048);
+        // Covers singleton prompt tails, the few-row boundary, the compact
+        // fallback/IU4 boundary, and the first staged-width tile.
+        for rows in [1, 8, 9, 511, 512, 2047] {
+            assert!(host(true, rows, floor), "dirty prompt of {rows} rows");
+            assert!(!host(false, rows, floor), "pristine prompt of {rows} rows");
+        }
+        for rows in [0, 2048, 4096] {
+            assert!(!host(true, rows, floor), "resident tile of {rows} rows");
+        }
+        // After a long prompt restored the tail, its short remainder keeps
+        // Resident weights rather than needlessly moving those reads to host.
+        assert!(!host(false, 1007, floor));
+        let explicit_floor = resolve_expert_stage_min_rows("gfx1201", 4096, false, Some("2")).0;
+        assert!(host(true, 1, explicit_floor));
+        assert!(!host(true, 2, explicit_floor));
     }
 
     #[test]

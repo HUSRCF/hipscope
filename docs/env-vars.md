@@ -33,8 +33,14 @@ Set speculation off, `HIPFIRE_QWEN4_DECODE_SHARE=off` and
 `HIPFIRE_OFFLOAD_EXEC=pcie`. CPU/D2, EP/PP/TP, continuous batching, NPU, S1,
 expert-keep and whole-first placement are refused. Routing is unchanged; a
 miss runs from canonical mapped host bytes and schedules a bounded paired
-fill for later tokens. Prefill restores original resident donor bytes before
-using its frozen view.
+fill for later tokens. Dirty prefill tiles below the effective expert-staging
+threshold (2048 rows by default on gfx1201) use independent immutable tables:
+core experts stay in VRAM; donors and cold experts read their immutable host
+backing. This route preserves pending fills and decode LRU without draining
+copies, restoring donor bytes or widening mutable residency beyond one row;
+it never stages experts. Other prefill tiles retain the frozen resident view
+and restore donor bytes when required, including long staged prefill and its
+subsequent clean short tail.
 
 `HIPFIRE_RAILGUN_CHECK=always` is refused before weight fulfillment when
 this cache is enabled. Its fixed physical `Weights` digest baseline conflicts
@@ -48,9 +54,11 @@ which is not a claim that the combination has been qualified.
 rounded to whole experts from mixed-residency layers. Only that tail needs an
 extra immutable host mirror. `HIPFIRE_QWEN4_EXPERT_CACHE_INFLIGHT` defaults to
 `64` and accepts `1..=4096` paired fills. Table/route owners and a conservative
-32 MiB device queue margin plus 64 MiB host metadata margin join admission;
-the host margin covers the second expert runtime, LRU state and upload/readback
-storage.
+32 MiB device queue margin plus 128 MiB host metadata margin join admission;
+the host margin covers both additional expert runtimes (decode and immutable
+short prefill), binding identities, LRU state and upload/readback storage. The
+short prefill route borrows existing canonical tables and payloads and adds
+no expert payload or GPU table allocation.
 These margins are reserves, not measured peak-memory receipts. Invalid
 explicit values fail the load, including when the cache is disabled. This
 opt-in path carries no default-on or performance claim.

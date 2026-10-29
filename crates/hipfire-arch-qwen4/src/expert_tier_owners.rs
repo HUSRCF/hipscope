@@ -3632,6 +3632,36 @@ mod decode_share_tests {
                 );
             }
         }
+        // A short prefill may overlap slot DMA only because its immutable
+        // tables cannot address any byte of the writable donor pool.
+        let donor_start = (DEV_BASE + tail.donor_offset) as usize;
+        let donor_end = donor_start + tail.donor_bytes as usize;
+        let overlaps = |ptr: usize, len: u64| ptr < donor_end && donor_start < ptr + len as usize;
+        let mut resident_donor_reads = 0;
+        for layer in 0..48 {
+            let warm = binding.layer_view(layer, ExpertReadView::Resident).unwrap();
+            let canonical = binding
+                .layer_view(layer, ExpertReadView::BorrowPrefill(0))
+                .unwrap();
+            assert_ne!(canonical.gate_up_table_base(), warm.gate_up_table_base());
+            assert_ne!(canonical.down_table_base(), warm.down_table_base());
+            for expert in 0..EXPERTS {
+                let entry = canonical.entry(expert).unwrap();
+                assert!(!overlaps(
+                    canonical.gate_up_ptrs()[expert],
+                    entry.gate_up_len
+                ));
+                assert!(!overlaps(canonical.down_ptrs()[expert], entry.down_len));
+                let resident = warm.entry(expert).unwrap();
+                resident_donor_reads +=
+                    usize::from(overlaps(warm.gate_up_ptrs()[expert], resident.gate_up_len));
+                resident_donor_reads +=
+                    usize::from(overlaps(warm.down_ptrs()[expert], resident.down_len));
+            }
+        }
+        // Negative control: using Resident without restoration reads every
+        // original donor from mutable VRAM, so that view is unsafe here.
+        assert_eq!(resident_donor_reads, 2 * tail.donors.len());
         assert_ne!(
             binding.view_digest(ExpertReadView::Resident),
             binding.view_digest(ExpertReadView::BorrowPrefill(0))

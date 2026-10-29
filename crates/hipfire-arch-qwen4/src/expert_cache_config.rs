@@ -129,12 +129,13 @@ impl ExpertCacheConfig {
             .ok_or_else(|| "expert-cache device reserve overflows".into())
     }
 
-    /// Conservative bound for the second 24,576-expert runtime's CPU metadata,
-    /// projection/resource descriptors, LRU state, pointer upload mirrors and
-    /// route landing buffer. It is admission headroom, not measured usage.
-    /// The large immutable donor mirror is charged by the actual tier plan.
+    /// Conservative margin for both additional runtimes (decode and immutable
+    /// short prefill), their CPU projection/resource and binding metadata, LRU
+    /// state, upload mirrors and route landing storage. Current layouts motivate
+    /// this allowance; it is not measured usage or a bound for all future
+    /// layouts/allocators. The payload mirror is charged by the actual tier plan.
     pub fn host_reserve_bytes(self) -> u64 {
-        64 << 20
+        128 << 20
     }
 }
 
@@ -209,7 +210,7 @@ mod tests {
         }
         assert!(c.tail_bytes(u64::MAX).is_err());
         assert!(c.device_reserve_bytes(usize::MAX, 512, 10).is_err());
-        assert_eq!(c.host_reserve_bytes(), 64 << 20);
+        assert_eq!(c.host_reserve_bytes(), 128 << 20);
     }
 
     fn facts() -> ExpertCacheAdmission<'static> {

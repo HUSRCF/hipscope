@@ -1,7 +1,8 @@
 //! Decode-only exact LRU of immutable Flash-Next expert payloads.
 //!
 //! A token uses the tables acquired at its start. Misses execute from immutable
-//! mapped host backing; asynchronous copies serve later tokens. Prefill restores
+//! mapped host backing; asynchronous copies serve later tokens. Dirty short
+//! prefill reads independent immutable core/host tables. Long prefill restores
 //! the original donor bytes before using the frozen resident view.
 
 use crate::expert_cache_config::ExpertCacheConfig;
@@ -76,6 +77,10 @@ pub(crate) struct ExpertCacheStats {
     pub fill_bytes: u64,
     pub evictions: u64,
     pub skipped_full: u64,
+    /// Calls and rows admitted to the independent immutable mapped-prefill
+    /// view. Admission does not prove GPU execution or measure GPU time.
+    pub mapped_prefill_calls: u64,
+    pub mapped_prefill_rows: u64,
     pub prefill_restores: u64,
     pub restore_bytes: u64,
     pub peak_inflight: usize,
@@ -402,6 +407,31 @@ impl ExpertCache {
     pub(crate) fn stats(&self) -> ExpertCacheStats {
         self.stats
     }
+    pub(crate) fn is_dirty(&self) -> bool {
+        self.dirty
+    }
+
+    /// Check readiness for a prefill that reads only the independent immutable
+    /// canonical core/device and donor/host view. The caller must disable the
+    /// Resident staging path and the retained decode route for this view.
+    ///
+    /// Copies may keep filling donor slots: neither those slots nor the mutable
+    /// decode tables are read here. Keep pending tickets, LRU, mappings and dirty
+    /// state intact so later decode publication or long-prefill restoration uses
+    /// the same physical ownership and generation history.
+    pub(crate) fn prepare_host_prefill(&mut self, gpu: &mut Gpu, rows: usize) -> Result<()> {
+        self.check(gpu)?;
+        if rows == 0 {
+            return Err("expert cache mapped prefill requires at least one row".into());
+        }
+        self.stats.mapped_prefill_calls = self.stats.mapped_prefill_calls.saturating_add(1);
+        self.stats.mapped_prefill_rows = self
+            .stats
+            .mapped_prefill_rows
+            .saturating_add(u64::try_from(rows).unwrap_or(u64::MAX));
+        Ok(())
+    }
+
     fn emit_stats(&self) {
         match serde_json::to_string(&self.stats) {
             Ok(json) => eprintln!("  qwen4 exact expert cache stats: {json}"),
