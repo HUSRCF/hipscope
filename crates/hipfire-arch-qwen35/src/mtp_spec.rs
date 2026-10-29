@@ -3546,10 +3546,18 @@ where
         legacy_rotation_k
     };
     // The head pairs token `p` with the trunk hidden of position `p - 1`, as
-    // decode does. Row 0 holds the partner of the first fill token; row
-    // `j + 1` holds the hidden of position `start_pos + j`. Fill row `j`
-    // therefore pairs `prompt_tokens[j]` with row `j`.
-    let prompt_hidden = gpu.alloc_tensor(&[(prompt_tokens.len() + 1) * dim], DType::F32)?;
+    // decode does. The pairing buffer holds one outer chunk plus its partner
+    // row, not the whole prompt (a whole-prompt F32 buffer is 20 KiB/token on
+    // a 5120-dim trunk, allocated per request and charged nowhere): row 0
+    // holds the partner of the chunk's first token, row `j + 1` the hidden of
+    // chunk position `j`, so chunk row `j` pairs `chunk[j]` with row `j`.
+    // After each chunk its last hidden moves to row 0 for the next chunk.
+    let chunk_cap = match route {
+        MtpPromptRoute::Own => head_rows,
+        MtpPromptRoute::ArRoute => trunk_chunk_max.max(1),
+    };
+    let window_rows = prompt_tokens.len().min(chunk_cap);
+    let prompt_hidden = gpu.alloc_tensor(&[(window_rows + 1) * dim], DType::F32)?;
     let mut mtp_prefill_scratch = if use_batched_mtp_fill {
         let created = if fill_fast_wide {
             Qwen35MtpHeadBatchedScratch::new_for_prompt_fill(gpu, &head.config, head_rows)
@@ -3615,8 +3623,8 @@ where
             let chunk_start_pos = start_pos + off;
             let committed_pos = start_pos + end;
 
-            // Per-chunk hidden destination: rows `off + 1..` of the pairing buffer.
-            let chunk_hidden = prompt_hidden.sub_offset((off + 1) * dim, chunk.len() * dim);
+            // Per-chunk hidden destination: rows `1..` of the pairing window.
+            let chunk_hidden = prompt_hidden.sub_offset(dim, chunk.len() * dim);
 
             let t_trunk = Instant::now();
             match route {
@@ -3658,7 +3666,8 @@ where
                 while slice_off < end {
                     let slice_end = ((slice_off / head_rows + 1) * head_rows).min(end);
                     let slice = &prompt_tokens[slice_off..slice_end];
-                    let slice_hidden = prompt_hidden.sub_offset(slice_off * dim, slice.len() * dim);
+                    let slice_hidden =
+                        prompt_hidden.sub_offset((slice_off - off) * dim, slice.len() * dim);
                     let positions: Vec<i32> = (start_pos + slice_off..start_pos + slice_end)
                         .map(|position| position as i32)
                         .collect();
@@ -3679,7 +3688,7 @@ where
                 }
             } else {
                 for (i, &token) in chunk.iter().enumerate() {
-                    let hidden_row = prompt_hidden.sub_offset((off + i) * dim, dim);
+                    let hidden_row = prompt_hidden.sub_offset(i * dim, dim);
                     mtp_head::mtp_head_forward_block_only(
                         gpu,
                         head,
@@ -3694,6 +3703,27 @@ where
                 }
             }
             mtp_prompt_fill_secs += t_mtp_fill.elapsed().as_secs_f64();
+            // Carry the chunk's last hidden (row `chunk.len()`) to row 0: it
+            // partners the next chunk's first token and, after the last
+            // chunk, seeds `prev_hidden`. Ordered after the fill on the
+            // active stream when there is one.
+            match gpu.active_stream.as_ref() {
+                Some(stream) => gpu.hip.memcpy_dtod_async_at(
+                    &prompt_hidden.buf,
+                    0,
+                    &prompt_hidden.buf,
+                    chunk.len() * dim_bytes,
+                    dim_bytes,
+                    stream,
+                )?,
+                None => gpu.hip.memcpy_dtod_at(
+                    &prompt_hidden.buf,
+                    0,
+                    &prompt_hidden.buf,
+                    chunk.len() * dim_bytes,
+                    dim_bytes,
+                )?,
+            }
 
             // Committed boundary: trunk + MTP private KV now cover [0, committed_pos).
             on_committed_boundary(gpu, target.dn_state, committed_pos)?;
@@ -3701,13 +3731,8 @@ where
         }
 
         let last = prompt_tokens.len() - 1;
-        gpu.hip.memcpy_dtod_at(
-            &state.prev_hidden.buf,
-            0,
-            &prompt_hidden.buf,
-            (last + 1) * dim_bytes,
-            dim_bytes,
-        )?;
+        gpu.hip
+            .memcpy_dtod_at(&state.prev_hidden.buf, 0, &prompt_hidden.buf, 0, dim_bytes)?;
         state.prev_hidden_pos = Some(start_pos + last);
         Ok(TrunkSpinePrefillTimings {
             trunk_prefill_secs,
