@@ -61,6 +61,7 @@ mod fit;
 mod kernel_pack;
 mod npu_trunk;
 mod ple;
+mod prefill_progress;
 mod process_identity;
 mod pull_select;
 mod serve;
@@ -2997,9 +2998,28 @@ fn run_command(paths: &Paths, args: RunArgs) -> Result<()> {
     // End the streamed answer's line at `commit_ready`, before the commit is
     // sent, so later daemon stderr never lands on the answer's line.
     let mut line_ended = false;
-    let done = engine.generate(&request, |event| {
+    // Prefill progress redraws one stderr line, only on a terminal and never
+    // under `--json`; it is erased before the first token is written.
+    let mut prefill = prefill_progress::PrefillLine::new(
+        !args.json && std::io::stderr().is_terminal(),
+        Instant::now(),
+    );
+    let generated = engine.generate(&request, |event| {
         match event.get("type").and_then(serde_json::Value::as_str) {
+            Some("prefill_progress") => {
+                if let (Some(done), Some(total)) = (
+                    event.get("done").and_then(serde_json::Value::as_u64),
+                    event.get("total").and_then(serde_json::Value::as_u64),
+                ) {
+                    if let Some(draw) = prefill.update(done, total, Instant::now()) {
+                        eprint!("{draw}");
+                    }
+                }
+            }
             Some("token") => {
+                if let Some(erase) = prefill.clear() {
+                    eprint!("{erase}");
+                }
                 if let Some(text) = event.get("text").and_then(serde_json::Value::as_str) {
                     content.push_str(text);
                     if stream {
@@ -3009,6 +3029,9 @@ fn run_command(paths: &Paths, args: RunArgs) -> Result<()> {
                 }
             }
             Some("commit_ready") if stream && !line_ended => {
+                if let Some(erase) = prefill.clear() {
+                    eprint!("{erase}");
+                }
                 println!();
                 std::io::stdout().flush()?;
                 line_ended = true;
@@ -3016,7 +3039,12 @@ fn run_command(paths: &Paths, args: RunArgs) -> Result<()> {
             _ => {}
         }
         Ok(())
-    })?;
+    });
+    // Also covers an error or cancel before any token.
+    if let Some(erase) = prefill.clear() {
+        eprint!("{erase}");
+    }
+    let done = generated?;
     if let Some(message) = spill.as_mut().and_then(spill::SpillMonitor::check) {
         spill::emit(&message);
     }
@@ -3804,13 +3832,23 @@ fn run_via_http(
 
     let mut tokens = None;
     let mut timings = serde_json::Value::Null;
-    stream_openai_chat(
+    let mut prefill =
+        prefill_progress::PrefillLine::new(std::io::stderr().is_terminal(), Instant::now());
+    let streamed = stream_openai_chat(
         endpoint,
         body,
         timeout,
         |event| {
             match event {
+                OpenAiSseEvent::PrefillProgress { done, total } => {
+                    if let Some(draw) = prefill.update(done, total, Instant::now()) {
+                        eprint!("{draw}");
+                    }
+                }
                 OpenAiSseEvent::Reasoning { text } | OpenAiSseEvent::Content { text } => {
+                    if let Some(erase) = prefill.clear() {
+                        eprint!("{erase}");
+                    }
                     print!("{text}");
                     std::io::stdout().flush()?;
                 }
@@ -3827,7 +3865,11 @@ fn run_via_http(
             Ok(())
         },
         || false,
-    )?;
+    );
+    if let Some(erase) = prefill.clear() {
+        eprint!("{erase}");
+    }
+    streamed?;
     println!();
     if stats {
         eprintln!("{}", format_run_stats(tokens, &timings));
@@ -3949,6 +3991,7 @@ fn chat_command(paths: &Paths, args: ChatArgs) -> Result<()> {
                     | OpenAiSseEvent::ToolCall { .. }
                     | OpenAiSseEvent::Finish { .. }
                     | OpenAiSseEvent::Usage { .. }
+                    | OpenAiSseEvent::PrefillProgress { .. }
                     | OpenAiSseEvent::Done => {}
                 }
                 Ok(())
@@ -17794,6 +17837,7 @@ effort = "high"
                     OpenAiSseEvent::Finish { reason, .. } => cap.finish = Some(reason),
                     OpenAiSseEvent::Usage { usage } => cap.usage = Some(usage),
                     OpenAiSseEvent::Done => cap.saw_done = true,
+                    OpenAiSseEvent::PrefillProgress { .. } => {}
                 }
                 Ok(())
             },
@@ -21439,6 +21483,60 @@ effort = "high"
             assert_eq!(got, 400, "max_tokens=0 stream={stream}");
             assert!(String::from_utf8_lossy(&raw).contains("max_tokens"));
         }
+    }
+
+    /// Daemon prefill progress precedes the first token, i.e. the commit: it
+    /// must not commit the stream early (an error right after it is still a
+    /// JSON error with its real status) and must not leak into a committed
+    /// body that has not yet needed a keepalive.
+    #[cfg(unix)]
+    #[test]
+    fn prefill_progress_does_not_commit_or_corrupt_responses() {
+        let harness = Task11HttpHarness::spawn("prefill-progress");
+        let port = harness.port();
+        for stream in [false, true] {
+            let (status, head, body) = raw_chat_post(
+                port,
+                &harness.base_body("t43-prefill-progress-error", stream),
+            );
+            assert_eq!(status, 400, "stream={stream}: {head}");
+            assert!(head.contains("content-type: application/json"), "{head}");
+            let err: serde_json::Value = serde_json::from_slice(&body)
+                .unwrap_or_else(|e| panic!("one JSON error body ({e}): {body:?}"));
+            assert!(
+                err.pointer("/error/message")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|m| m.contains("validation failed after prefill")),
+                "{err}"
+            );
+        }
+
+        let (status, _, body) =
+            raw_chat_post(port, &harness.base_body("t43-prefill-progress", false));
+        assert_eq!(status, 200);
+        let reply: serde_json::Value = serde_json::from_slice(&body).expect("one JSON body");
+        assert_eq!(
+            reply.pointer("/choices/0/message/content"),
+            Some(&serde_json::json!("hello from fake daemon"))
+        );
+
+        let (status, _, body) =
+            raw_chat_post(port, &harness.base_body("t43-prefill-progress", true));
+        assert_eq!(status, 200);
+        let text = String::from_utf8_lossy(&body);
+        assert!(
+            !text.contains(": prefill"),
+            "progress predates commit: {text}"
+        );
+        let payloads = sse_payloads(&body);
+        assert!(
+            payloads[1].contains("hello from fake daemon"),
+            "{payloads:?}"
+        );
+        assert_eq!(payloads.last().map(String::as_str), Some("[DONE]"));
+        let cap = capture_stream(port, harness.base_body("t43-prefill-progress", true))
+            .expect("stream parses");
+        assert_eq!(cap.content, "hello from fake daemon");
     }
 
     /// A stream that fails after it committed ends with an OpenAI error event

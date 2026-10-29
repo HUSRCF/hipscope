@@ -1085,20 +1085,28 @@ fn clear_generation_route() {
 /// standalone entry points cannot erase an outer request's route when they
 /// return. The start latch is still keyed to the exact attempt captured on
 /// entry; dropping one guard never clears another request's latch.
+///
+/// The scope also owns the request's `prefill_progress` target
+/// ([`hipfire_runtime::prefill_progress::scope`]), so prompt-prefill loops in
+/// crates without the request writer can `report` progress for this
+/// `(id, attempt)`.
 pub struct GenerationRouteScope {
     id: String,
     attempt: u64,
     previous_route: Option<GenerationRoute>,
+    _prefill_progress: hipfire_runtime::prefill_progress::Scope,
 }
 
 impl GenerationRouteScope {
     pub fn enter(route: GenerationRoute, id: &str) -> Self {
         let previous_route = active_generation_route();
         set_generation_route(route);
+        let attempt = active_attempt_id();
         Self {
             id: id.to_owned(),
-            attempt: active_attempt_id(),
+            attempt,
             previous_route,
+            _prefill_progress: hipfire_runtime::prefill_progress::scope(id, Some(attempt)),
         }
     }
 }
@@ -2009,7 +2017,14 @@ pub fn generate_ar_with_forward<Prefill, Decode, Commit>(
 
     emit_generation_start(route, stdout, id, started_in_think);
     let t0 = Instant::now();
-    if let Err(error) = forward_chunk(m, gpu, prompt_tokens, &prompt_logits) {
+    // The prompt prefill is the only call that may report `prefill_progress`
+    // from the arch crates' chunk loops (Qwen4 tiles); the phase ends before
+    // the first decode forward.
+    let prefill_result = {
+        let _prompt_phase = hipfire_runtime::prefill_progress::prompt_phase();
+        forward_chunk(m, gpu, prompt_tokens, &prompt_logits)
+    };
+    if let Err(error) = prefill_result {
         let _ = gpu.free_tensor(prompt_logits);
         let _ = gpu.free_tensor(decode_logits);
         let ep = production_fail_closed_rollback(m, gpu, None, None);
@@ -4675,6 +4690,13 @@ pub fn generate(
                     return;
                 }
                 m.seq_pos += chunk_len;
+                crate::common::emit_prefill_progress(
+                    stdout,
+                    id,
+                    Some(active_attempt_id()),
+                    new_tokens.len() - rest.len(),
+                    new_tokens.len(),
+                );
                 // The eviction gate remains closed until adaptive KV reaches
                 // its explicit handoff point and finishes every transcode.
                 // Drive that transition at the same bounded committed-prefix
@@ -4781,6 +4803,13 @@ pub fn generate(
                     return;
                 }
                 m.seq_pos += chunk.len();
+                crate::common::emit_prefill_progress(
+                    stdout,
+                    id,
+                    Some(active_attempt_id()),
+                    end,
+                    new_tokens.len(),
+                );
                 // Adaptive KV: downshift BETWEEN prefill chunks the moment the
                 // start-tier (q8/fwht4) buffer fills, so a long prompt can't
                 // overflow the floor-sized buffer before decode begins. The

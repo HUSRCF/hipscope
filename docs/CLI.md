@@ -251,6 +251,8 @@ hipfire run qwen3.5:27b -md ~/.hipfire/models/qwen35-27b-dflash-mq4.hfq "..."
 HIPFIRE_LOCAL=1 hipfire run qwen3.5:4b "..."   # skip HTTP; always local spawn
 ```
 
+While a long prompt prefills, `hipfire run` draws one self-overwriting line on stderr, only when stderr is a terminal and never with `--json`: `  prefill 512/2048 tokens (25%), ETA 6s`. It redraws at most every 500 ms, the ETA extrapolates the prefill rate since the request was sent, and the line is erased before the first token is written. Through a healthy `serve` the line follows the stream's `: prefill <done>/<total>` comments (sent only once the stream has committed, see [SERVE.md](SERVE.md)), so it can appear later than with a local daemon.
+
 Local-forcing (skip a healthy serve): `HIPFIRE_LOCAL` truthy, `--image`, `--kv-mode`, `--kv-backend`, `--kv-k`, `--kv-v`, `--max-seq`, `--head`, `--tp` above 1, `--spec`/`--speculation`, `--model-draft`, `--vision`, `--draft-max`, or `--dspark-conf-threshold` (exact list: `run_should_force_local` in `crates/hipfire-cli/src/main.rs`). JSON and non-streaming responses are supported by the native HTTP service and do not by themselves force a local daemon.
 
 ### Load summary

@@ -4419,6 +4419,10 @@ impl Qwen4Bundle {
                 self.session_at_boundary(gpu, &prompt[..end])?;
             }
             pos = end;
+            // `prefill_progress`: rows this request computes (the restored
+            // `reused` prefix is in neither count). Silent outside the
+            // prompt phase and once `pos` reaches the end.
+            hipfire_runtime::prefill_progress::report(pos - reused, prompt.len() - reused);
         }
         self.slowlink_record_incumbent(reused, &windows);
         Ok(())

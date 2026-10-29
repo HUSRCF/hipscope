@@ -15,6 +15,13 @@
 //!   ← {"type":"loaded","arch":"qwen3_5","dim":4096,"layers":32,"vocab":248320,"vl":true}
 //!   → {"type":"generate","id":"r1","prompt":"Hello","temperature":0.3,"max_tokens":512}
 //!   → {"type":"generate","id":"r1","prompt":"Describe this","image":"/path/to/img.png","temperature":0.3,"max_tokens":512}
+//!   ← {"type":"gen_start","id":"r1","attempt_id":1,...}
+//!   ← {"type":"prefill_progress","id":"r1","attempt_id":1,"done":2048,"total":9000}
+//!       Prompt-prefill progress, one line per completed chunk while `done < total`
+//!       (none for a single-chunk prompt or at `done == total`; counts exclude a
+//!       cache-hit prefix). Ordered after `gen_start` and before the first
+//!       `token`/`reasoning`. Default on; `HIPFIRE_PREFILL_PROGRESS=0` suppresses it.
+//!       Clients that do not know the type ignore it.
 //!   ← {"type":"token","id":"r1","text":"The"}
 //!   ← {"type":"done","id":"r1","tokens":42,"tok_s":44.5}
 //!   → {"type":"unload"}

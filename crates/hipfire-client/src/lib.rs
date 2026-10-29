@@ -341,8 +341,38 @@ pub enum OpenAiSseEvent {
     },
     /// Separate `choices: []` usage chunk (never rides the finish choice).
     Usage { usage: Value },
+    /// Prefill progress from the `: prefill <done>/<total>` SSE comment frame
+    /// (sent only before the first token; never a delta).
+    PrefillProgress { done: u64, total: u64 },
     /// Literal `data: [DONE]` terminator.
     Done,
+}
+
+/// Whole-percent prefill completion (`done * 100 / total`, floored, capped at
+/// 100; 0 when `total` is 0).
+pub fn prefill_percent(done: u64, total: u64) -> u64 {
+    if total == 0 {
+        return 0;
+    }
+    (u128::from(done.min(total)) * 100 / u128::from(total)) as u64
+}
+
+/// Seconds until prefill finishes at the rate observed so far (`done` tokens
+/// in `elapsed` since the request was sent). `None` until a rate exists.
+pub fn prefill_eta_secs(done: u64, total: u64, elapsed: Duration) -> Option<f64> {
+    let secs = elapsed.as_secs_f64();
+    if done == 0 || secs <= 0.0 {
+        return None;
+    }
+    let remaining = total.saturating_sub(done) as f64;
+    Some(remaining * secs / done as f64)
+}
+
+/// Parse the exact `: prefill <done>/<total>` SSE comment line.
+fn parse_prefill_comment(line: &str) -> Option<(u64, u64)> {
+    let rest = line.strip_prefix(": prefill ")?;
+    let (done, total) = rest.split_once('/')?;
+    Some((done.parse().ok()?, total.parse().ok()?))
 }
 
 /// Deterministic SSE reader/parser seam over an already-open byte stream.
@@ -368,7 +398,10 @@ pub fn read_openai_sse(
             continue;
         }
         let Some(payload) = trimmed.strip_prefix("data:").map(str::trim) else {
-            // Ignore SSE comments / event: / id: / retry: lines.
+            if let Some((done, total)) = parse_prefill_comment(trimmed) {
+                on_event(OpenAiSseEvent::PrefillProgress { done, total })?;
+            }
+            // Ignore other SSE comments / event: / id: / retry: lines.
             continue;
         };
         if payload.is_empty() {
@@ -755,6 +788,7 @@ impl Engine {
                     ty,
                     "gen_start"
                         | "token"
+                        | "prefill_progress"
                         | "reasoning"
                         | "tool_calls"
                         | "committed"
@@ -1824,6 +1858,7 @@ fn reject_stale_lifecycle_event(
         "gen_start"
             | "token"
             | "reasoning"
+            | "prefill_progress"
             | "tool_calls"
             | "committed"
             | "commit_ready"
@@ -1984,6 +2019,47 @@ mod tests {
             })
             .collect();
         assert_eq!(kinds, vec!["r", "c", "f", "d"]);
+    }
+
+    #[test]
+    fn sse_prefill_comment_parsed_other_comments_ignored() {
+        let raw = format!(
+            ": keepalive\n\n: prefill 512/2048\n\n: prefill 1024/2048\n\n: prefill nope\n\n: prefill 1/\n\n{}{}",
+            sse_line(r#"{"choices":[{"index":0,"delta":{"content":"x"},"finish_reason":null}]}"#),
+            sse_line(r#"{"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#),
+        ) + "data: [DONE]\n\n";
+        let events = collect_sse(&raw).unwrap();
+        assert_eq!(
+            events[..2],
+            [
+                OpenAiSseEvent::PrefillProgress {
+                    done: 512,
+                    total: 2048
+                },
+                OpenAiSseEvent::PrefillProgress {
+                    done: 1024,
+                    total: 2048
+                },
+            ]
+        );
+        assert!(matches!(events[2], OpenAiSseEvent::Content { .. }));
+        assert_eq!(events.len(), 5);
+    }
+
+    #[test]
+    fn prefill_percent_and_eta_helpers() {
+        assert_eq!(prefill_percent(512, 2048), 25);
+        assert_eq!(prefill_percent(2047, 2048), 99);
+        assert_eq!(prefill_percent(5, 0), 0);
+        assert_eq!(prefill_percent(9, 4), 100);
+        let secs = prefill_eta_secs(512, 2048, Duration::from_secs(2)).unwrap();
+        assert!((secs - 6.0).abs() < 1e-9, "{secs}");
+        assert_eq!(prefill_eta_secs(0, 2048, Duration::from_secs(2)), None);
+        assert_eq!(prefill_eta_secs(1, 2, Duration::ZERO), None);
+        assert_eq!(
+            prefill_eta_secs(2048, 2048, Duration::from_secs(2)),
+            Some(0.0)
+        );
     }
 
     #[test]
@@ -2467,6 +2543,7 @@ mod tests {
             "gen_start",
             "token",
             "reasoning",
+            "prefill_progress",
             "tool_calls",
             "committed",
             "commit_ready",
@@ -2638,6 +2715,7 @@ mod tests {
             "gen_start",
             "token",
             "reasoning",
+            "prefill_progress",
             "tool_calls",
             "committed",
             "commit_ready",
@@ -2972,6 +3050,61 @@ done
             !logged.contains(r#""type":"abort""#),
             "successful commit must not send abort: {logged}"
         );
+        engine.unload().unwrap();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn generate_routes_prefill_progress_to_callback_non_terminal() {
+        let root = env::temp_dir().join(format!(
+            "hipfire-client-prefill-progress-{}-{}",
+            std::process::id(),
+            "a"
+        ));
+        let daemon = write_fake_daemon(
+            &root,
+            r#"#!/bin/sh
+while IFS= read -r line; do
+  case "$line" in
+    *'"generate"'*)
+      echo '{"type":"gen_start","id":"req-pp","attempt_id":3}'
+      echo '{"type":"prefill_progress","id":"req-pp","attempt_id":3,"done":512,"total":2048}'
+      echo '{"type":"prefill_progress","id":"req-pp","attempt_id":3,"done":1024,"total":2048}'
+      echo '{"type":"prefill_progress","id":"other","attempt_id":3,"done":1,"total":2}'
+      echo '{"type":"commit_ready","id":"req-pp","attempt_id":3,"finish_reason":"stop"}'
+      ;;
+    *'"commit"'*)
+      echo '{"type":"done","id":"req-pp","attempt_id":3,"finish_reason":"stop"}'
+      ;;
+    *'"unload"'*) echo '{"type":"unloaded"}'; exit 0 ;;
+  esac
+done
+"#,
+        );
+        let mut engine = spawn_fake_engine(&daemon);
+        let mut progress = Vec::new();
+        engine
+            .generate(
+                &serde_json::json!({
+                    "type": "generate",
+                    "id": "req-pp",
+                    "attempt_id": 3,
+                    "prompt": "hi",
+                }),
+                |ev| {
+                    if ev.get("type").and_then(Value::as_str) == Some("prefill_progress") {
+                        progress.push((
+                            ev.get("done").and_then(Value::as_u64).unwrap(),
+                            ev.get("total").and_then(Value::as_u64).unwrap(),
+                        ));
+                    }
+                    Ok(())
+                },
+            )
+            .unwrap();
+        // The peer-id progress line is quarantined, never delivered here.
+        assert_eq!(progress, vec![(512, 2048), (1024, 2048)]);
         engine.unload().unwrap();
         let _ = fs::remove_dir_all(root);
     }

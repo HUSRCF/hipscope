@@ -3957,6 +3957,9 @@ where
 
             // Committed boundary: trunk + MTP private KV now cover [0, committed_pos).
             on_committed_boundary(gpu, target.dn_state, &*target.kv_cache, committed_pos)?;
+            // `prefill_progress` for the request's prompt prefill (live only
+            // inside a `prompt_phase`; silent for decode-time replays).
+            hipfire_runtime::prefill_progress::report(end, prompt_tokens.len());
             off = end;
         }
 

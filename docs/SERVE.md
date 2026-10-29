@@ -459,7 +459,17 @@ curl -N http://127.0.0.1:11435/v1/chat/completions \
   status as a non-stream request. A stream that fails after that ends with
   `data: {"error": {"message", "type"}}` and then `data: [DONE]`. Until
   `[DONE]`, 15 s without a frame sends a `: keepalive` SSE comment, which
-  SSE parsers ignore.
+  SSE parsers ignore. While the engine prefills a long prompt, the committed
+  stream also carries a `: prefill <done>/<total>` SSE comment (prompt tokens
+  processed so far; for example `: prefill 512/2048`) after each prefill chunk,
+  before the first token. It is sent only after the `200` is on the wire (it
+  never commits a stream early, so a pre-commit failure is still a JSON error;
+  progress reported before the commit is dropped), counts as activity for the
+  keepalive timer, never follows the final frame, and is ignored by SSE
+  parsers. `hipfire_client::read_openai_sse` surfaces it as
+  `OpenAiSseEvent::PrefillProgress`, and `hipfire run` and the TUI show it.
+  `/v1/messages` and `/v1/responses` streams carry the same comment;
+  non-streaming requests have none.
 - **`stream: false` / omitted falsey:** single `chat.completion` JSON body.
 - Oversized body → **413** before the daemon lock (Content-Length or streamed
   cap at `max_request_bytes`).
@@ -555,8 +565,8 @@ follow at the end, each with one `input_json_delta` holding the full arguments.
 Then `message_delta` (`stop_reason`, `usage`) and `message_stop`. The
 `message_start` usage is zero, because token counts are known only at the
 terminal, and `message_delta` carries the real counts. Commit timing,
-keepalives and the pre-commit JSON errors work as on chat. A failure after
-commit ends the stream with `event: error`.
+keepalives, `: prefill` progress comments and the pre-commit JSON errors work
+as on chat. A failure after commit ends the stream with `event: error`.
 
 Errors use the Anthropic shape `{"type": "error", "error": {"type", "message"}}`
 with chat's status mapping: 400 `invalid_request_error`, 404

@@ -9227,6 +9227,12 @@ impl Qwen4MtpDrafter {
                         .slowlink_publish_cut_mtp(gpu, pending)
                         .map_err(|error| error.to_string())?;
                 }
+                // `prefill_progress` (silent outside the request's prompt
+                // phase and past the last tile).
+                hipfire_runtime::prefill_progress::report(
+                    end - start_pos,
+                    prompt_tokens.len() - start_pos,
+                );
                 Ok(())
             };
             let outcome = Self::bundle(target)?.slowlink_try_capture(
@@ -9334,6 +9340,10 @@ impl Qwen4MtpDrafter {
                 first_token = pick;
             }
             pos = end;
+            hipfire_runtime::prefill_progress::report(
+                pos - start_pos,
+                prompt_tokens.len() - start_pos,
+            );
         }
         let pick = first_token.expect("non-empty MTP prefill produced no seed");
         // The seed is the first emitted token: sampled, it is drawn from the
