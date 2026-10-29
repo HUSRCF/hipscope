@@ -8,8 +8,8 @@
 //! non-fused fold, and `Spec::validate` rejects what has no generator.
 use iu4_emu::*;
 use peacemaker_isa::kernels::iu4_gemm::{
-    emit, module, ALayout, Epi, FetchPlace, FoldOp, IdleHalf, Mma, QkvStore, RingDepth, Spec, Tile,
-    Tune, WaitPlace,
+    emit, module, ALayout, Epi, FetchPlace, FoldOp, FoldSched, IdleHalf, Mma, QkvStore, RingDepth,
+    Spec, Tile, Tune, WaitPlace,
 };
 
 #[macro_use]
@@ -49,6 +49,7 @@ fn default_tune_is_the_shipped_codegen() {
             ring: RingDepth::Two,
             wait: WaitPlace::AfterMma,
             fold_op: FoldOp::Fma,
+            fold_sched: FoldSched::Paired,
             fetch: FetchPlace::Split,
             idle: IdleHalf::Off,
             qkv: QkvStore::Gdn,
@@ -502,7 +503,7 @@ fn muladd_matches_the_non_fused_cpu_fold_bitwise() {
 }
 
 /// `WaitPlace::Window` (the shipped 27B gate/up `_b1s` export, `Tune::shipped_gate_up_slab`): a distinct schedule that
-/// emits and assembles, keeps the symbol, names itself `-wwindow`, round-trips its knob string, and is refused where
+/// emits and assembles, keeps the symbol, names itself `-wwindow-fschain`, round-trips its knob string, and is refused where
 /// it has no generator (ring depth 3, the 16-wave tile, the sparse K-loop).
 #[test]
 fn window_placement_emits_and_is_refused_where_it_has_no_generator() {
@@ -516,7 +517,7 @@ fn window_placement_emits_and_is_refused_where_it_has_no_generator() {
     assert_eq!(window.symbol(), spec.symbol());
     assert_eq!(
         window.variant_name(),
-        "k128-128x128x8-cacc1-slab-silu-wwindow"
+        "k128-128x128x8-cacc1-slab-silu-wwindow-fschain"
     );
     let e = emit(window).unwrap();
     peacemaker_isa::native::assemble(&e.s_text, window.arch).unwrap();
@@ -572,6 +573,128 @@ fn window_placement_emits_and_is_refused_where_it_has_no_generator() {
     };
     let msg = sparse.validate().unwrap_err();
     assert!(msg.contains("wait placement window"), "{msg}");
+}
+
+/// `FoldSched::Chain` (the shipped gate/up export's fold, F3-01-lead1rot-prio): a distinct schedule at every wait
+/// placement that emits and assembles, keeps the symbol, raises wave priority to 2 at each block head and drops it to 1
+/// at each fold, is selected only by the shipped gate/up tune, and is refused where it has no generator.
+#[test]
+fn chain_fold_schedule_emits_and_is_refused_where_it_has_no_generator() {
+    assert_eq!("chain".parse::<FoldSched>().unwrap(), FoldSched::Chain);
+    assert_eq!("paired".parse::<FoldSched>().unwrap(), FoldSched::Paired);
+    assert!("fused".parse::<FoldSched>().is_err());
+    assert_eq!(FoldSched::Chain.name(), "chain");
+    assert_eq!(Tune::shipped_gate_up_slab().fold_sched, FoldSched::Chain);
+    for epi in [
+        Epi::Set,
+        Epi::Add,
+        Epi::GateUpSilu,
+        Epi::GateUpSiluBf16,
+        Epi::QkvzaGdn,
+    ] {
+        for act in [ALayout::Token, ALayout::Slab] {
+            let want = if epi == Epi::GateUpSilu && act == ALayout::Slab {
+                Tune::shipped_gate_up_slab()
+            } else {
+                Tune::default()
+            };
+            assert_eq!(
+                peacemaker_isa::kernels::iu4_gemm::module_tune(Tile::T128x128x8, act, epi),
+                want,
+                "{epi:?} {act:?}"
+            );
+        }
+    }
+    let spec = node();
+    let count = |t: &str, m: &str| t.lines().filter(|l| l.trim() == m).count();
+    let paired = emit(spec).unwrap();
+    for wait in [
+        WaitPlace::AfterMma,
+        WaitPlace::MidMma,
+        WaitPlace::BeforeMma,
+        WaitPlace::Window,
+    ] {
+        let chain = with(
+            spec,
+            Tune {
+                wait,
+                fold_sched: FoldSched::Chain,
+                ..Tune::default()
+            },
+        );
+        chain.validate().unwrap();
+        assert_eq!(chain.symbol(), spec.symbol());
+        assert!(
+            chain.variant_name().ends_with("-fschain"),
+            "{}",
+            chain.variant_name()
+        );
+        let e = emit(chain).unwrap();
+        peacemaker_isa::native::assemble(&e.s_text, chain.arch).unwrap();
+        assert_eq!(emit(chain).unwrap().s_text, e.s_text, "not deterministic");
+        let plain = emit(with(
+            spec,
+            Tune {
+                wait,
+                ..Tune::default()
+            },
+        ))
+        .unwrap();
+        assert_ne!(
+            e.s_text,
+            plain.s_text,
+            "{} chain equals paired",
+            wait.name()
+        );
+        // Four K-loop blocks (m0, m1, t0, t1): a priority-2 head each, a priority-1 fold each.
+        assert_eq!(count(&e.s_text, "s_setprio 2"), 4, "{}", wait.name());
+        assert_eq!(
+            count(&e.s_text, "s_setprio 1"),
+            count(&plain.s_text, "s_setprio 1") + 4
+        );
+        assert_eq!(count(&plain.s_text, "s_setprio 2"), 0);
+    }
+    assert_eq!(count(&paired.s_text, "s_setprio 2"), 0);
+    // Chain is generated for the dense k128 128x128x8 cacc1 fused-accumulate fold at ring depth 2 only.
+    let bad = |tune: Tune, spec: Spec| {
+        let msg = with(spec, tune).validate().unwrap_err();
+        assert!(msg.contains("fold schedule chain"), "{msg}");
+    };
+    let chain = Tune {
+        fold_sched: FoldSched::Chain,
+        ..Tune::default()
+    };
+    // The wider tile supports neither packed bf16 nor slab activations, so use the
+    // plain token-layout SiLU control to reach the chain-specific refusals.
+    let silu = Spec::control(Epi::GateUpSilu);
+    bad(
+        Tune {
+            ring: RingDepth::Three,
+            ..chain
+        },
+        silu,
+    );
+    bad(
+        Tune {
+            fold_op: FoldOp::MulAdd,
+            ..chain
+        },
+        silu,
+    );
+    bad(
+        chain,
+        Spec {
+            tile: Tile::T256x128x16,
+            ..silu
+        },
+    );
+    bad(
+        chain,
+        Spec {
+            mma: Mma::S24X64,
+            ..Spec::control(Epi::Set)
+        },
+    );
 }
 
 /// `QkvStore::Set` (the fused projection's QKV tiles store like SET): a distinct `..._qkvzaset` symbol that emits and

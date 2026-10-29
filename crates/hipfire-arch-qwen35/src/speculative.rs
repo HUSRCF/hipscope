@@ -13510,6 +13510,8 @@ pub fn seed_target_hidden_from_prompt_abortable_parts(
                 )?;
                 seq_pos += piece;
             }
+            // Prompt-prefill progress (silent outside a `prompt_phase`).
+            hipfire_runtime::prefill_progress::report(seq_pos, prompt_tokens.len());
             if let Some(cks) = checkpoints.as_deref_mut() {
                 take_dn_checkpoint(
                     cks,
@@ -13610,6 +13612,9 @@ pub fn seed_target_hidden_suffix_abortable_parts(
                 pos += piece;
                 off += piece;
             }
+            // Prompt-prefill progress (silent outside a `prompt_phase`, so
+            // forced advances and terminal repair stay quiet).
+            hipfire_runtime::prefill_progress::report(off, suffix.len());
             if let Some(cks) = checkpoints.as_deref_mut() {
                 take_dn_checkpoint(
                     cks,

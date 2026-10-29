@@ -197,6 +197,48 @@ impl std::str::FromStr for FoldOp {
     }
 }
 
+/// The schedule of the K-loop fold (the dense 128x128x8 `cacc1` K128 block at ring depth 2).
+/// `Paired` is the shipped order: stage 1 (`float(C) - magic`) of the first four accumulators
+/// between the slab-1 WMMAs, stage 2 of each carrying stage 1 of its row-group-1 partner.
+/// `Chain` (F3-01-lead1rot-prio, GPU-confirmed on the gate/up slab) keeps every per-element
+/// operation (`x = C - magic`, `t = RN(sc * d)`, `acc = fma(t, x, acc)`) and changes only
+/// where they issue and which registers hold `x`:
+///
+/// - only accumulator `k_0` is unbiased between the WMMAs (after WMMA 2, pair-swapped so
+///   `float(C[j])` lands in slot `j ^ 1`); `k_1` is unbiased by group 0's `subrev` halves;
+/// - stage 2 runs in bundle order, each accumulator's `fmac` packets carrying the `subrev`
+///   of the NEXT accumulator, whose unbiased values rotate one slot down the element order
+///   (see `fold::chain`) so each packet reads four distinct banks;
+/// - the last accumulator has no partner (four `fmac::fmac` packets);
+/// - wave priority is 2 from each block's head (after the descriptor step) and 1 from the fold
+///   on, so the WMMA groups win arbitration over co-resident folds. The epilogue stays 0.
+///
+/// Scheduling and register naming only: every stored bit is the `Paired` result.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum FoldSched {
+    #[default]
+    Paired,
+    Chain,
+}
+impl FoldSched {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Paired => "paired",
+            Self::Chain => "chain",
+        }
+    }
+}
+impl std::str::FromStr for FoldSched {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, String> {
+        match s {
+            "paired" => Ok(Self::Paired),
+            "chain" => Ok(Self::Chain),
+            _ => Err(format!("unknown fold schedule {s} (paired|chain)")),
+        }
+    }
+}
+
 /// What the fused GDN projection's QKV row tiles do with their accumulators
 /// (`Epi::QkvzaGdn` only). `Gdn` (the shipped kernel) runs `gdn_chunk_prep` on them
 /// (`gdn_epilogue`) and stores only the raw rows its completion pass reads. `Set`
@@ -307,6 +349,7 @@ pub struct Tune {
     pub ring: RingDepth,
     pub wait: WaitPlace,
     pub fold_op: FoldOp,
+    pub fold_sched: FoldSched,
     pub fetch: FetchPlace,
     pub idle: IdleHalf,
     pub qkv: QkvStore,
@@ -322,11 +365,13 @@ impl Tune {
     /// The tune the shipped `_b1s` module emits for its 27B gate/up export
     /// `gemm_mq4g256v2_gate_up_silu_mmq_iu4_b1s` (`Epi::GateUpSilu`, slab layout,
     /// 128x128x8 tile): the B1 rendezvous window ([`WaitPlace::Window`], GPU-timed
-    /// R2GateStack-05, 0.9966 of the previous schedule); ring depth 2 and every other
-    /// knob are the default. Every other symbol of every module keeps `Tune::default()`.
+    /// R2GateStack-05, 0.9966 of the previous schedule) with the chained fold and wave
+    /// priorities ([`FoldSched::Chain`], F3-01-lead1rot-prio, GPU-confirmed; every output
+    /// bit is the `Paired` schedule's); ring depth 2 and every other knob are the default. Every other symbol of every module keeps `Tune::default()`.
     pub fn shipped_gate_up_slab() -> Self {
         Self {
             wait: WaitPlace::Window,
+            fold_sched: FoldSched::Chain,
             ..Self::default()
         }
     }
@@ -706,6 +751,9 @@ impl Spec {
         if t.fold_op != FoldOp::Fma {
             s += &format!("-f{}", t.fold_op.name());
         }
+        if t.fold_sched != FoldSched::Paired {
+            s += &format!("-fs{}", t.fold_sched.name());
+        }
         if t.fetch != FetchPlace::Split {
             s += &format!("-x{}", t.fetch.name());
         }
@@ -876,6 +924,28 @@ impl Spec {
                     "wait placement window is generated for Tile::T128x128x8 only (tile axis is {:?})",
                     self.tile
                 ));
+            }
+        }
+        if self.tune.fold_sched == FoldSched::Chain {
+            if self.mma.is_sparse() {
+                return Err(format!(
+                    "fold schedule chain is generated for the dense K-loop block only (mma axis is {})",
+                    self.mma.name()
+                ));
+            }
+            if self.tune.ring != RingDepth::Two {
+                return Err("fold schedule chain is generated at ring depth 2 only".into());
+            }
+            if self.tile != Tile::T128x128x8 || self.cacc != Cacc::One || self.fold != Fold::K128 {
+                return Err(format!(
+                    "fold schedule chain is generated for the k128 Tile::T128x128x8 cacc1 fold only (fold axis is {:?}, tile axis is {:?}, cacc axis is {:?})",
+                    self.fold, self.tile, self.cacc
+                ));
+            }
+            if self.tune.fold_op != FoldOp::Fma {
+                return Err(
+                    "fold schedule chain is the fused-accumulate fold (fold op fma) only".into(),
+                );
             }
         }
         if self.tune.n64

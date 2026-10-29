@@ -219,6 +219,7 @@ v_mul_f32_e64	alu
 v_mul_hi_u32	alu
 v_mul_lo_u32	alu
 v_mul_u32_u24_e32	alu
+v_mul_hi_u32_u24_e32	alu
 v_or_b32_e32	alu
 v_perm_b32	alu
 v_permlanex16_b32	alu
@@ -485,6 +486,7 @@ v_cndmask_b16	alu
 v_cvt_f32_f16_e32	alu
 v_cvt_f16_u16_e64	alu
 v_pk_mul_f16	alu
+v_pk_lshrrev_b16	alu
 # f32 VALU.
 v_sub_f32_e64	alu
 v_fmac_f32_e64	alu

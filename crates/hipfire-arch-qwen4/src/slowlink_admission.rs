@@ -356,6 +356,15 @@ pub enum SlowlinkDecline {
     ShortContext {
         max_seq: usize,
     },
+    /// The window (`min(S1_WINDOW_ROWS, max_seq)` rows) is smaller than the route's worst-case
+    /// cohort bound: the dispatch layout needs `k1_rows + tail_rows <= rows`
+    /// ([`check_window_cohort`]). An incumbent decline, never a capacity refusal: the bound is
+    /// the route's own constants, so no free memory makes the window legal.
+    WindowTooSmall {
+        rows: usize,
+        k1_rows: usize,
+        tail_rows: usize,
+    },
     /// Measured discrete link at or above 16 GB/s.
     FastLink {
         gbps: f64,
@@ -399,6 +408,14 @@ impl fmt::Display for SlowlinkDecline {
             Self::ShortContext { max_seq } => write!(
                 f,
                 "context {max_seq} is shorter than the {S1_MIN_FORCED_REQUEST_ROWS}-row minimum multi-chunk window"
+            ),
+            Self::WindowTooSmall {
+                rows,
+                k1_rows,
+                tail_rows,
+            } => write!(
+                f,
+                "window too small for its cohort rows: rows {rows} < k1 {k1_rows} + tail {tail_rows}"
             ),
             Self::FastLink { gbps } => write!(
                 f,
@@ -1042,6 +1059,27 @@ pub fn route_dims(
         },
         route: geometry.route,
     }
+}
+
+/// Whether a window of `rows` rows can hold the cohort capacities [`route_dims`] charges
+/// (`k1_rows + tail_rows <= rows`, the same bound `PromptRouteLayout::new` enforces), so a window
+/// too small for them is a named incumbent decline before the census instead of a layout error
+/// at load. Only the aggregate routes charge tail rows: the slab route's 48 K1 rows always fit a
+/// window of at least [`S1_MIN_FORCED_REQUEST_ROWS`] rows.
+pub fn check_window_cohort(geometry: &ModelGeometry, rows: usize) -> Result<(), SlowlinkDecline> {
+    let dims = route_dims(geometry, rows);
+    if dims
+        .k1_rows
+        .checked_add(dims.tail_rows)
+        .is_none_or(|cohort| cohort > rows)
+    {
+        return Err(SlowlinkDecline::WindowTooSmall {
+            rows,
+            k1_rows: dims.k1_rows,
+            tail_rows: dims.tail_rows,
+        });
+    }
+    Ok(())
 }
 
 /// Device bytes of the dispatch crate's `PromptRouteStorage` for a window of
@@ -1869,6 +1907,7 @@ pub fn project_at_tile(
             "slow-link prefill tile {tile_rows} is not a legal rung"
         )));
     }
+    check_window_cohort(&inputs.geometry, inputs.window_rows)?;
     let (pages, arena, census) =
         census_at_tile(inputs, tile_rows).map_err(SlowlinkDecline::Geometry)?;
     let granule =
@@ -2861,6 +2900,9 @@ pub enum RequestBypass {
     },
     /// The profile's tile is not a valid chunk for this request.
     NoRows,
+    /// SP is armed, the request is a single window of 5..=tile rows, and that
+    /// window is not SP-qualified: the incumbent runs.
+    Sp(crate::slowlink_sp::SpBypass),
 }
 
 /// Judge a request against the frozen profile, before any mutation or S1
@@ -2899,6 +2941,46 @@ pub fn qualify_request(
     Ok(RequestVerdict {
         rows: request.rows,
         windows: profile.windows_for(request.rows),
+    })
+}
+
+/// [`qualify_request`] with SP armed (HOOK-DESIGN §5.1, per request).
+///
+/// A request of `SP_MIN_ROWS ..= profile.tile_rows` rows is one window of one
+/// tile, below S1's own multi-chunk floor: S1 admits it **only if that window
+/// is SP-qualified** ([`crate::slowlink_sp::qualify_sp_shape`]); otherwise the
+/// incumbent runs, with the named reason. Every other request (off, shorter,
+/// or longer than one tile) is exactly [`qualify_request`], with SP decided per
+/// window by the runtime.
+pub(crate) fn qualify_request_sp(
+    mode: SlowlinkMode,
+    profile: &SlowlinkProfile,
+    sp: &crate::slowlink_sp::SpProfile,
+    request: &RequestShape,
+) -> Result<RequestVerdict, RequestBypass> {
+    let single_tile = (crate::slowlink_sp::SP_MIN_ROWS..=profile.tile_rows).contains(&request.rows);
+    if mode == SlowlinkMode::Off || !single_tile {
+        return qualify_request(mode, profile, request);
+    }
+    match request.capture {
+        CaptureKind::None | CaptureKind::Bounded => {}
+        CaptureKind::AllRows => return Err(RequestBypass::AllRowCapture),
+        CaptureKind::External => return Err(RequestBypass::ExternalCapture),
+    }
+    // One window of one tile of `rows` routing rows (rows >= 5: never a one-row
+    // tile); K1 rows are the one-row decode tiles, none here.
+    crate::slowlink_sp::qualify_sp_shape(
+        sp,
+        request.rows,
+        request.session_cuts,
+        None,
+        0,
+        request.capture,
+    )
+    .map_err(RequestBypass::Sp)?;
+    Ok(RequestVerdict {
+        rows: request.rows,
+        windows: 1,
     })
 }
 
@@ -7913,6 +7995,84 @@ mod tests {
         }
     }
 
+    /// A window smaller than the aggregate routes' worst-case cohort bound
+    /// (`k1 48 + tail 3066 = 3114` rows) is a named incumbent decline before the census, not a
+    /// layout error at load; every size that admits is untouched and builds a valid layout.
+    #[test]
+    fn slowlink_admission_window_smaller_than_its_cohort_rows_declines_by_name() {
+        use hipfire_dispatch::pipeline::slowlink_prefill::PromptRouteLayout;
+        let cohort = S1_K1_TAIL_ROWS + S1_AGGREGATE_TAIL_ROWS;
+        assert_eq!(cohort, 3114);
+        for route in [WindowRoute::Aggregate, WindowRoute::AggregateSymIu4] {
+            for max_seq in [1536, 1537, 3113, 3114, S1_WINDOW_ROWS] {
+                let load = LoadShape { max_seq, ..shape() };
+                let pre = preflight(SlowlinkMode::Force, &load);
+                if max_seq < S1_MIN_FORCED_REQUEST_ROWS {
+                    assert_eq!(pre, Err(SlowlinkDecline::ShortContext { max_seq }));
+                    continue;
+                }
+                assert_eq!(pre, Ok(()), "{route:?} {max_seq}");
+                let inputs = AdmissionInputs {
+                    window_rows: S1_WINDOW_ROWS.min(max_seq),
+                    ..j1778_inputs(route, AdmissionPurpose::Product, J1778_PRELOAD_FREE)
+                };
+                let admitted = admit_grown(&inputs, max_seq);
+                if max_seq < cohort {
+                    let decline = SlowlinkDecline::WindowTooSmall {
+                        rows: max_seq,
+                        k1_rows: S1_K1_TAIL_ROWS,
+                        tail_rows: S1_AGGREGATE_TAIL_ROWS,
+                    };
+                    assert_eq!(
+                        admitted.map(|_| ()),
+                        Err(decline.clone()),
+                        "{route:?} {max_seq}"
+                    );
+                    assert!(!decline.is_capacity());
+                    assert_eq!(
+                        decline.to_string(),
+                        format!(
+                            "window too small for its cohort rows: rows {max_seq} < k1 48 + tail 3066"
+                        )
+                    );
+                    // The forced selector keeps the incumbent instead of failing the load.
+                    let selected = select_profile(
+                        SlowlinkMode::Force,
+                        &load,
+                        || HostLink::Discrete { gbps: 7.09 },
+                        |_| Ok(inputs.clone()),
+                    );
+                    assert_eq!(
+                        selected.map(|p| p.is_some()),
+                        Ok(false),
+                        "{route:?} {max_seq}"
+                    );
+                } else {
+                    let profile = admitted.unwrap_or_else(|d| panic!("{route:?} {max_seq}: {d}"));
+                    assert_eq!(profile.window_rows, S1_WINDOW_ROWS.min(max_seq));
+                    let layout = PromptRouteLayout::new(&profile.route_dims()).unwrap();
+                    assert_eq!(layout.total_bytes() as u64, profile.census.route_storage);
+                    assert_eq!(layout.dims().k1_rows, S1_K1_TAIL_ROWS);
+                    assert_eq!(layout.dims().tail_rows, S1_AGGREGATE_TAIL_ROWS);
+                }
+            }
+        }
+        // The slab route charges no tail rows: every legal context admits.
+        for max_seq in [1537, 3113, 3114, S1_WINDOW_ROWS] {
+            let inputs = AdmissionInputs {
+                window_rows: S1_WINDOW_ROWS.min(max_seq),
+                ..j1778_inputs(
+                    WindowRoute::SlabIu4,
+                    AdmissionPurpose::Product,
+                    J1778_PRELOAD_FREE,
+                )
+            };
+            let profile = admit_grown(&inputs, max_seq).unwrap();
+            let layout = PromptRouteLayout::new(&profile.route_dims()).unwrap();
+            assert_eq!((layout.dims().k1_rows, layout.dims().tail_rows), (48, 0));
+        }
+    }
+
     #[test]
     fn slowlink_admission_sym_iu4_route_dims_keep_the_aggregate_cohort_bounds() {
         let config = crate::config::compact_test_config();
@@ -7982,5 +8142,186 @@ mod tests {
             assert_eq!(admit(&resolved).unwrap(), admit(&incumbent).unwrap());
             assert_eq!(census_of(&resolved).unwrap().2.a4_sidecars, 0);
         }
+    }
+
+    fn sp_facts_of(
+        profile: &SlowlinkProfile,
+        knob: bool,
+    ) -> crate::slowlink_sp::SpLoadFacts<'static> {
+        crate::slowlink_sp::SpLoadFacts {
+            knob,
+            touched_knob: false,
+            force_all: false,
+            pages: 18,
+            f16_route_ready: true,
+            window_rows: profile.window_rows,
+            s1_route: Some(profile.geometry.route),
+            arch: "gfx1100",
+            n_exp: 512,
+            cpu_gate_up_quant: true,
+            cpu_down_quant: true,
+            splice_workers: Some(16),
+            region_fit_rows: 5_593,
+            hidden: 2560,
+            pinned_budget_bytes: 1 << 30,
+            prefix_cache: false,
+        }
+    }
+
+    /// SP adds no VRAM and moves no layer: on the real j1778 fixtures, both
+    /// routes and purposes, the admitted profile (resident layers, every census
+    /// term, the placement quote) is identical before and after SP is armed
+    /// and admitted, and SP's own admission reads nothing the profile charges.
+    #[test]
+    fn slowlink_sp_armed_leaves_the_j1778_profiles_identical() {
+        use crate::slowlink_sp::{admit_sp, SpDecline};
+        for (route, purpose) in [
+            (WindowRoute::Aggregate, AdmissionPurpose::Product),
+            (WindowRoute::Aggregate, AdmissionPurpose::PrimitiveSelftest),
+            (WindowRoute::SlabIu4, AdmissionPurpose::Product),
+            (WindowRoute::SlabIu4, AdmissionPurpose::PrimitiveSelftest),
+        ] {
+            let label = format!("{route:?} {purpose:?}");
+            let inputs = j1778_inputs(route, purpose, J1778_PRELOAD_FREE);
+            let before = admit(&inputs).unwrap();
+            assert_eq!(before.resident_layers, 10, "{label}");
+            let total = before.census.total().unwrap();
+            let census = census_of(&inputs).unwrap().2;
+
+            let armed = admit_sp(&sp_facts_of(&before, true));
+            match route {
+                WindowRoute::Aggregate => {
+                    let sp = armed.unwrap_or_else(|d| panic!("{label}: {d}"));
+                    assert_eq!(sp.sp_max_rows, 5_376, "{label}");
+                }
+                _ => assert_eq!(
+                    armed.unwrap_err(),
+                    SpDecline::Route {
+                        route,
+                        mode: crate::slowlink_sp::SpMode::Hybrid
+                    },
+                    "{label}"
+                ),
+            }
+            let unarmed = admit_sp(&sp_facts_of(&before, false));
+            assert_eq!(unarmed.unwrap_err(), SpDecline::KnobOff, "{label}");
+
+            // The S1 admission after SP armed: bit-for-bit the same profile.
+            let after = admit(&inputs).unwrap();
+            assert_eq!(after, before, "{label}");
+            assert_eq!(after.resident_layers, before.resident_layers, "{label}");
+            assert_eq!(after.census.total().unwrap(), total, "{label}");
+            assert_eq!(census_of(&inputs).unwrap().2, census, "{label}");
+        }
+    }
+
+    #[test]
+    fn slowlink_sp_request_truth_table() {
+        use crate::slowlink_sp::{admit_sp, SpBypass};
+        let profile = profile_at_ten();
+        let sp = admit_sp(&crate::slowlink_sp::SpLoadFacts {
+            s1_route: Some(WindowRoute::Aggregate),
+            ..sp_facts_of(&profile, true)
+        })
+        .unwrap();
+        let tile = profile.tile_rows;
+        assert_eq!(tile, S1_PRODUCT_TILE_ROWS);
+        let req = |rows, cuts, capture| RequestShape {
+            rows,
+            entry_pos: 0,
+            session_cuts: cuts,
+            capture,
+        };
+        let sp_req =
+            |mode, rows| qualify_request_sp(mode, &profile, &sp, &req(rows, 0, CaptureKind::None));
+        for mode in [SlowlinkMode::Auto, SlowlinkMode::Force] {
+            // 5..=tile rows: S1 admits one SP window below its own floor.
+            for rows in [5, 100, 512, tile] {
+                assert_eq!(
+                    sp_req(mode, rows),
+                    Ok(RequestVerdict { rows, windows: 1 }),
+                    "{mode:?} {rows}"
+                );
+            }
+            // Below SP's minimum, and above the tile, the request is exactly
+            // `qualify_request`.
+            for rows in [
+                0,
+                1,
+                4,
+                tile + 1,
+                1536,
+                1537,
+                3072,
+                S1_WINDOW_ROWS,
+                S1_WINDOW_ROWS + 1,
+            ] {
+                assert_eq!(
+                    sp_req(mode, rows),
+                    qualify_request(mode, &profile, &req(rows, 0, CaptureKind::None)),
+                    "{mode:?} {rows}"
+                );
+            }
+        }
+        // The kill switch wins everywhere.
+        assert_eq!(
+            sp_req(SlowlinkMode::Off, 512),
+            Err(RequestBypass::KillSwitch)
+        );
+        // A bounded capture qualifies; all-rows / external stay incumbent.
+        assert_eq!(
+            qualify_request_sp(
+                SlowlinkMode::Auto,
+                &profile,
+                &sp,
+                &req(512, 0, CaptureKind::Bounded)
+            ),
+            Ok(RequestVerdict {
+                rows: 512,
+                windows: 1
+            })
+        );
+        assert_eq!(
+            qualify_request_sp(
+                SlowlinkMode::Auto,
+                &profile,
+                &sp,
+                &req(512, 0, CaptureKind::AllRows)
+            ),
+            Err(RequestBypass::AllRowCapture)
+        );
+        assert_eq!(
+            qualify_request_sp(
+                SlowlinkMode::Auto,
+                &profile,
+                &sp,
+                &req(512, 0, CaptureKind::External)
+            ),
+            Err(RequestBypass::ExternalCapture)
+        );
+        // An interior session cut makes the one window non-SP: the incumbent runs.
+        assert_eq!(
+            qualify_request_sp(
+                SlowlinkMode::Auto,
+                &profile,
+                &sp,
+                &req(512, 1, CaptureKind::None)
+            ),
+            Err(RequestBypass::Sp(SpBypass::InteriorCuts { cuts: 1 }))
+        );
+        // Requests above one tile keep today's cut rule.
+        assert_eq!(
+            qualify_request_sp(
+                SlowlinkMode::Force,
+                &profile,
+                &sp,
+                &req(3072, 5, CaptureKind::None)
+            ),
+            qualify_request(
+                SlowlinkMode::Force,
+                &profile,
+                &req(3072, 5, CaptureKind::None)
+            )
+        );
     }
 }

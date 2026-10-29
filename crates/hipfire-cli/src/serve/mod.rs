@@ -336,6 +336,11 @@ pub(crate) struct LoadedInfo {
     /// or before the first load ack. Published through `/health` without
     /// taking the runtime lock.
     pub(crate) swap: serde_json::Value,
+    /// The daemon's `load_summary` object from the load ack (`line`, `spec`,
+    /// `kv`, `context`, `placement`, `prefill`); `null` when the ack has none.
+    /// The daemon already prints the line to the stderr serve inherits, so
+    /// serve does not print it again.
+    pub(crate) load_summary: serde_json::Value,
 }
 
 /// Rollout switches for the VMM continuous-batching route (PLAN §6 Slice1C).
@@ -1352,7 +1357,12 @@ pub(crate) fn serve_command(paths: &Paths, mut args: ServeArgs) -> Result<()> {
     }
     if let Some(vision) = args.vision.as_ref() {
         if !vision.is_file() {
-            bail!("vision sidecar not found: {}", vision.display());
+            bail!(
+                "vision sidecar not found: {}\n  pass an existing --vision <path>, fetch the \
+                 model's vision tower with `hipfire pull <model>`, or disable vision: \
+                 HIPFIRE_VISION_MODE=off (hipfire config set vision.mode off)",
+                vision.display()
+            );
         }
     }
     let api_key = resolve_api_key(&args, &resolved)?;
@@ -1568,7 +1578,11 @@ pub(crate) fn detach_serve(paths: &Paths, args: &ServeArgs, host: &str, port: u1
                  stop that server or choose another port",
                 pid_path.display()
             ),
-            None => bail!("port {port} is in use by another process; choose another port"),
+            None => bail!(
+                "port {port} is in use by another process; choose another port: \
+                 `hipfire serve [model] {host} <port>` (default port: \
+                 `hipfire config set serve.port <port>`)"
+            ),
         }
     }
     let log = fs::OpenOptions::new()
@@ -1718,7 +1732,7 @@ pub(crate) fn serve_foreground(
     global: hipfire_config::ResolvedConfig,
     api_key: Option<BearerToken>,
 ) -> Result<()> {
-    let daemon = find_daemon(paths).ok_or_else(|| anyhow!("daemon binary not found"))?;
+    let daemon = find_daemon(paths).ok_or_else(|| crate::daemon_not_found_error(paths))?;
     let registry = load_registry(&paths.registry).registry;
     // Swap budgets are deployment policy resolved by the daemon from the
     // process config. Apply the CLI overrides there rather than in the load
@@ -2283,14 +2297,18 @@ impl ServeRuntime {
             // pull has already verified the installed payload; avoid a second hash.
             path = find_model_path(&self.paths, &self.registry, model);
         }
-        let path =
-            path.ok_or_else(|| ModelNotFound(format!("model not found locally: {model}")))?;
+        let path = path.ok_or_else(|| {
+            ModelNotFound(format!(
+                "model not found locally: {model}; run `hipfire pull {model}` on the server first"
+            ))
+        })?;
         let resolved = resolved_for_model(&self.paths, model, tag.as_deref(), entry)?;
         if self.current_path.as_ref() != Some(&path) {
             if origin == ModelOrigin::Request && !self.request_may_load(&path, entry) {
                 return Err(ModelNotFound(format!(
                     "model not found: {model} (a request may name only installed models; \
-                     loading other files is off: serve.allow_request_paths)"
+                     loading other files is off: serve.allow_request_paths; enable with \
+                     `hipfire config set serve.allow_request_paths true`)"
                 ))
                 .into());
             }
@@ -2469,6 +2487,10 @@ impl ServeRuntime {
                     .and_then(serde_json::Value::as_str)
                     .map(str::to_owned),
                 max_seq: loaded.get("max_seq").and_then(serde_json::Value::as_u64),
+                load_summary: loaded
+                    .get("load_summary")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null),
                 swap: loaded.get("swap").cloned().unwrap_or_else(|| {
                     configured_swap_json(&self.spawner.process_config, self.multi_slot_enabled)
                 }),

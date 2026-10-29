@@ -5528,8 +5528,12 @@ pub const GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_B1_CONTROL: &[u8] =
 /// the slab activation layout (`peacemaker-isa emit --alayout slab`), fed only
 /// by the slab producer twins (`Gpu::a4_slab_active`), including the fused
 /// GDN input projection `gemm_mq4g256v2_residual_mmq_iu4_qkvzagdn_b1s`.
-/// SHA-256 b952699f05d513c3374c6ea22326deb64a92c481cf08d7d6d1398fbcd0659c40
-/// (previously f6bb37eff7b7f70c0fc6a980251692b56a2416d60835e8f06e5e244ad1d7057a without the four
+/// SHA-256 b351ce70156444a657f31165c704b02faf58c4e81acc3de2d1ff35ffa428eefa
+/// (was b952699f05d513c3374c6ea22326deb64a92c481cf08d7d6d1398fbcd0659c40, which differs only in the 27B
+/// gate/up export `gemm_mq4g256v2_gate_up_silu_mmq_iu4_b1s`, code sha256 c9f1efc5… -> 9d12e51e…: the
+/// lead1 + rotation fold chain, then the prio2 WMMA / prio1 fold (F3-01-lead1rot-prio; bit-identical,
+/// GPU-timed ratios 0.9745 / 0.9758); the nine other exports are byte-identical; the module is 256 B
+/// longer; b952699f was previously f6bb37eff7b7f70c0fc6a980251692b56a2416d60835e8f06e5e244ad1d7057a without the four
 /// small-N `_v64` exports `gemm_mq4g256v2_gate_up_silu_mmq_iu4_b1s_v64`, `..._full_add_b1s_v64`,
 /// `..._full_set_b1s_v64` and `..._qkvzaset_b1s_v64` (`iu4_gemm::verify64_tune`: per-shape schedules
 /// for launches of at most 128 rows, byte-identical to the shipped exports); the six other exports
