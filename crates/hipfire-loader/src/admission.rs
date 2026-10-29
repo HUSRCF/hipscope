@@ -1558,9 +1558,8 @@ pub fn qwen35_measured_fit(
     cap: usize,
     mut growth: impl FnMut(usize) -> Result<usize, String>,
 ) -> Result<usize, String> {
-    let mut fits = |t: usize| -> Result<bool, String> {
-        Ok(growth(t)?.saturating_add(transient) <= free)
-    };
+    let mut fits =
+        |t: usize| -> Result<bool, String> { Ok(growth(t)?.saturating_add(transient) <= free) };
     if !fits(0)? {
         return Ok(0);
     }
@@ -1603,10 +1602,7 @@ mod qwen35_measured_fit_tests {
             qwen35_measured_fit(1000, 0, 10_000, |t| Ok(t * 10)),
             Ok(100)
         );
-        assert_eq!(
-            qwen35_measured_fit(999, 0, 10_000, |t| Ok(t * 10)),
-            Ok(99)
-        );
+        assert_eq!(qwen35_measured_fit(999, 0, 10_000, |t| Ok(t * 10)), Ok(99));
     }
 
     #[test]

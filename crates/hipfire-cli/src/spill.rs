@@ -45,7 +45,8 @@ fn gtt_growth(baseline: &SpillSample, sample: &SpillSample) -> u64 {
 }
 
 fn vram_full(sample: &SpillSample) -> bool {
-    sample.vram_total > 0 && sample.vram_used >= sample.vram_total.saturating_sub(VRAM_HEADROOM_BYTES)
+    sample.vram_total > 0
+        && sample.vram_used >= sample.vram_total.saturating_sub(VRAM_HEADROOM_BYTES)
 }
 
 /// GTT grew by at least the threshold over `baseline` while VRAM is full.
@@ -225,7 +226,10 @@ mod tests {
         let first = decide(&base, &s(300 + 512, 16_368, 16_368), 0).unwrap();
         let last = first.growth_bytes;
         assert_eq!(decide(&base, &s(300 + 512, 16_368, 16_368), last), None);
-        assert_eq!(decide(&base, &s(300 + 512 + 255, 16_368, 16_368), last), None);
+        assert_eq!(
+            decide(&base, &s(300 + 512 + 255, 16_368, 16_368), last),
+            None
+        );
         let again = decide(&base, &s(300 + 512 + 256, 16_368, 16_368), last).unwrap();
         assert_eq!(again.growth_bytes, 768 * MIB);
         assert!(again.message.contains("GTT +768 MiB"));
@@ -245,7 +249,11 @@ mod tests {
         let put = |gtt: u64, used: u64| {
             std::fs::write(dir.join("mem_info_gtt_used"), format!("{}\n", gtt * MIB)).unwrap();
             std::fs::write(dir.join("mem_info_vram_used"), format!("{}\n", used * MIB)).unwrap();
-            std::fs::write(dir.join("mem_info_vram_total"), format!("{}\n", 16_368 * MIB)).unwrap();
+            std::fs::write(
+                dir.join("mem_info_vram_total"),
+                format!("{}\n", 16_368 * MIB),
+            )
+            .unwrap();
         };
         put(100, 15_000);
         let mut monitor = SpillMonitor {

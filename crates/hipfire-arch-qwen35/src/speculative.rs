@@ -2150,8 +2150,8 @@ impl GdnTape {
             };
             bytes += 4 * shape.region_bytes()
                 + n_la
-                    * (std::mem::size_of::<rdna_compute::dflash_gdn_replay::DflashReplayPreLayer>()
-                        + std::mem::size_of::<rdna_compute::dflash_gdn_replay::GdnLayerTable>());
+                    * (std::mem::size_of::<rdna_compute::dflash_gdn_replay::DflashReplayPreLayer>(
+                    ) + std::mem::size_of::<rdna_compute::dflash_gdn_replay::GdnLayerTable>());
         }
         bytes
     }
@@ -13072,8 +13072,8 @@ pub fn take_dn_checkpoint(
     // A new snapshot beyond the ring's first (the charged one) is allowed only
     // from memory the admitted context does not need; otherwise the oldest is
     // recycled, shrinking the ring to what fits.
-    let recycle = cks.len() >= cap
-        || (!cks.is_empty() && !checkpoint_fits_admitted_context(gpu, kv, dn));
+    let recycle =
+        cks.len() >= cap || (!cks.is_empty() && !checkpoint_fits_admitted_context(gpu, kv, dn));
     let mut snap = if recycle {
         cks.remove(0).1
     } else {
@@ -13112,9 +13112,10 @@ fn checkpoint_fits_admitted_context(gpu: &Gpu, kv: &KvCache, dn: &DeltaNetState)
     let Ok(snapshot) = usize::try_from(DeltaNetSnapshot::bytes_for(dn)) else {
         return false;
     };
-    free_now >= snapshot
-        .saturating_add(growth)
-        .saturating_add(floor.reserve_bytes)
+    free_now
+        >= snapshot
+            .saturating_add(growth)
+            .saturating_add(floor.reserve_bytes)
 }
 
 /// Outer chunk ceiling of the DFlash prompt seed ([`SeedPrefill::plan`]):

@@ -3459,7 +3459,11 @@ pub fn mtp_prompt_fill_requested_bytes(
         .max(config.dim)
         .max(head_config.n_head * head_config.head_dim);
     hidden
-        + Qwen35MtpHeadBatchedScratch::legacy_prompt_fill_bytes(head_config, rows, legacy_rotation_k)
+        + Qwen35MtpHeadBatchedScratch::legacy_prompt_fill_bytes(
+            head_config,
+            rows,
+            legacy_rotation_k,
+        )
 }
 
 #[cfg(test)]
@@ -3549,8 +3553,7 @@ mod lazy_state_bytes_tests {
         let (max_n, vc) = (5usize, 5usize);
         let rows = vc + 1;
         let snap = 123_456_789usize;
-        let got =
-            MtpSpecState::requested_bytes("gfx1100", &c, snap, &h, None, max_n, vc).unwrap();
+        let got = MtpSpecState::requested_bytes("gfx1100", &c, snap, &h, None, max_n, vc).unwrap();
         let small = 5120
             + 3 * rows * 5120
             + rows * 248320
