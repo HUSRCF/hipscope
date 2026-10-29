@@ -255,8 +255,8 @@ pub enum SpDecline {
     NoS1Profile,
     /// `sp: arch not calibrated`.
     ArchNotCalibrated { arch: String },
-    /// The window route is not `Aggregate`.
-    Route { route: WindowRoute },
+    /// The window route is not one the armed mode serves.
+    Route { route: WindowRoute, mode: SpMode },
     /// The model's expert count is not 512.
     ExpertCount { n_exp: usize },
     /// A host layer's gate_up or down dtype has no CPU quant.
@@ -302,13 +302,20 @@ impl fmt::Display for SpDecline {
             Self::ArchNotCalibrated { arch } => {
                 write!(f, " ({arch:?}; calibrated on {SP_ARCH:?} only)")
             }
-            Self::Route { route } => {
-                write!(
+            Self::Route { route, mode } => match mode {
+                SpMode::Hybrid => write!(
                     f,
-                    " ({route:?}; only {:?} is served)",
+                    " ({route:?}; the hybrid mode serves only {:?}; \
+                     HIPFIRE_QWEN4_MOE_SYM_IU4=0 selects it)",
                     WindowRoute::Aggregate
-                )
-            }
+                ),
+                SpMode::TouchedOnly => write!(
+                    f,
+                    " ({route:?}; touched-only serves {:?} and {:?})",
+                    WindowRoute::Aggregate,
+                    WindowRoute::AggregateSymIu4
+                ),
+            },
             Self::ExpertCount { n_exp } => {
                 write!(f, " ({n_exp} experts; only {SP_N_EXPERTS} is calibrated)")
             }
@@ -359,8 +366,18 @@ pub(crate) fn admit_sp(facts: &SpLoadFacts<'_>) -> Result<SpProfile, SpDecline> 
             arch: facts.arch.to_string(),
         });
     }
-    if route != WindowRoute::Aggregate {
-        return Err(SpDecline::Route { route });
+    // The hybrid mode K2-izes the F32-tail tiles of the F16 route and carries its own row
+    // table; it serves `Aggregate` only. Touched-only runs S1's own panel pipeline, which
+    // serves every aggregate lowering the incumbent does: the F16 route and, since the
+    // gfx1100 default turned the symmetric IU4 route on, `AggregateSymIu4`.
+    let served = match mode {
+        SpMode::Hybrid => route == WindowRoute::Aggregate,
+        SpMode::TouchedOnly => {
+            matches!(route, WindowRoute::Aggregate | WindowRoute::AggregateSymIu4)
+        }
+    };
+    if !served {
+        return Err(SpDecline::Route { route, mode });
     }
     match mode {
         SpMode::Hybrid => admit_hybrid(facts),
@@ -1104,6 +1121,7 @@ mod tests {
                 },
                 SpDecline::Route {
                     route: WindowRoute::SlabIu4,
+                    mode: SpMode::Hybrid,
                 },
             ),
             (
@@ -1114,6 +1132,7 @@ mod tests {
                 },
                 SpDecline::Route {
                     route: WindowRoute::AggregateSymIu4,
+                    mode: SpMode::Hybrid,
                 },
             ),
             (
@@ -1347,13 +1366,14 @@ mod tests {
                 },
             ),
             (
-                "route",
+                "route slab",
                 SpLoadFacts {
-                    s1_route: Some(WindowRoute::AggregateSymIu4),
+                    s1_route: Some(WindowRoute::SlabIu4),
                     ..touched_facts()
                 },
                 SpDecline::Route {
-                    route: WindowRoute::AggregateSymIu4,
+                    route: WindowRoute::SlabIu4,
+                    mode: SpMode::TouchedOnly,
                 },
             ),
             (
@@ -1405,6 +1425,43 @@ mod tests {
             })
             .unwrap_err(),
             SpDecline::SplicePool
+        );
+    }
+
+    /// Regression (card job vt): on the gfx1100 default the S1 window route is the symmetric
+    /// IU4 aggregate (`A4 sidecars` in the load line). Touched-only admission demanded the F16
+    /// `Aggregate` route, declined `sp: route` silently, and the request ran stream-all S1.
+    /// Touched-only runs S1's own pipeline and now serves both aggregate routes; the hybrid
+    /// mode (K2-ized F16 tails, its own row table) still declines the IU4 route by name, and the
+    /// decline text names the kill switch that selects the F16 route.
+    #[test]
+    fn touched_only_is_armed_on_the_default_sym_iu4_route_and_hybrid_declines_it_by_name() {
+        for route in [WindowRoute::Aggregate, WindowRoute::AggregateSymIu4] {
+            let profile = admit_sp(&SpLoadFacts {
+                s1_route: Some(route),
+                ..touched_facts()
+            })
+            .unwrap_or_else(|d| panic!("{route:?}: {d}"));
+            assert_eq!(profile.mode, SpMode::TouchedOnly, "{route:?}");
+            // The forced placement k = U reaches the same mode on the same route.
+            let forced = admit_sp(&SpLoadFacts {
+                s1_route: Some(route),
+                force_all: true,
+                ..facts()
+            })
+            .unwrap();
+            assert_eq!(forced.mode, SpMode::TouchedOnly, "{route:?}");
+        }
+        let declined = admit_sp(&SpLoadFacts {
+            s1_route: Some(WindowRoute::AggregateSymIu4),
+            ..facts()
+        })
+        .unwrap_err();
+        assert_eq!(declined.label(), "route");
+        let text = declined.to_string();
+        assert!(
+            text.contains("AggregateSymIu4") && text.contains("HIPFIRE_QWEN4_MOE_SYM_IU4=0"),
+            "{text}"
         );
     }
 

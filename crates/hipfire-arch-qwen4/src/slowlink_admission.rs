@@ -8076,7 +8076,14 @@ mod tests {
                     let sp = armed.unwrap_or_else(|d| panic!("{label}: {d}"));
                     assert_eq!(sp.sp_max_rows, 5_376, "{label}");
                 }
-                _ => assert_eq!(armed.unwrap_err(), SpDecline::Route { route }, "{label}"),
+                _ => assert_eq!(
+                    armed.unwrap_err(),
+                    SpDecline::Route {
+                        route,
+                        mode: crate::slowlink_sp::SpMode::Hybrid
+                    },
+                    "{label}"
+                ),
             }
             let unarmed = admit_sp(&sp_facts_of(&before, false));
             assert_eq!(unarmed.unwrap_err(), SpDecline::KnobOff, "{label}");

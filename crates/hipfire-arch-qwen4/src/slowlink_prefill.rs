@@ -1847,6 +1847,34 @@ fn load_decline(
     .err()
 }
 
+/// The one INFO line of the SP load decision (a SP knob is on): the armed mode and its
+/// row cap, or the named sticky decline. SP is otherwise silent in the daemon log, so a
+/// declined knob used to look like an SP that ran no layers.
+pub(crate) fn sp_log_decision(decision: Result<&SpProfile, &SpDecline>) {
+    match decision {
+        Ok(sp) => tracing::info!(
+            mode = sp.mode.label(),
+            sp_max_rows = sp.sp_max_rows,
+            "qwen4 SP: {} mode armed (single windows of {}..={} rows, no session cut)",
+            sp.mode.label(),
+            crate::slowlink_sp::SP_MIN_ROWS,
+            sp.sp_max_rows,
+        ),
+        Err(decline) => tracing::info!(
+            reason = decline.label(),
+            "qwen4 SP: knob on but not armed: {decline}"
+        ),
+    }
+}
+
+/// [`sp_log_decision`] for a load whose S1 runtime itself was declined (SP rides on S1).
+fn sp_log_s1_unavailable(reason: &str) {
+    tracing::info!(
+        reason = "S1 unavailable",
+        "qwen4 SP: knob on but not armed: the slow-link prefill (S1) is unavailable on this load: {reason}"
+    );
+}
+
 /// Materialize the whole admitted S1 runtime ONCE, at the selected load, after
 /// the profile is attached and the forward built, before ANY product request
 /// (so no later first-use allocation can take the memory the placement
@@ -1859,24 +1887,33 @@ pub(crate) fn bind_at_load(
     bundle: &mut Qwen4Bundle,
     gpu: &mut Gpu,
 ) -> Result<(), String> {
+    let sp_knob = hipfire_config::memory::qwen4_sp() || hipfire_config::memory::qwen4_sp_touched();
     let Some(profile) = forward.slowlink_profile().copied() else {
+        if sp_knob {
+            sp_log_decision(Err(&SpDecline::NoS1Profile));
+        }
         return Ok(());
     };
     if forward.slowlink.runtime.is_some() || forward.slowlink.unavailable.is_some() {
         return Ok(());
     }
-    let sp_knob = hipfire_config::memory::qwen4_sp() || hipfire_config::memory::qwen4_sp_touched();
     if sp_knob {
         forward.slowlink.sp.knob = true;
         forward.slowlink.sp.decline = Some(SpDecline::NoS1Profile);
     }
     if let Some(reason) = load_decline(forward, &*bundle, gpu, &profile) {
+        if sp_knob {
+            sp_log_s1_unavailable(&reason);
+        }
         forward.slowlink.unavailable = Some(reason);
         return Ok(());
     }
     let plan = match plan_runtime(forward, &*bundle, gpu, &profile) {
         Ok(plan) => plan,
         Err(reason) => {
+            if sp_knob {
+                sp_log_s1_unavailable(&reason);
+            }
             forward.slowlink.unavailable = Some(reason);
             return Ok(());
         }
@@ -1886,9 +1923,11 @@ pub(crate) fn bind_at_load(
         match sp_load_decision(&*forward, &*gpu, &profile, pages)? {
             Ok(bind) => {
                 forward.slowlink.sp.decline = None;
+                sp_log_decision(Ok(&bind.profile()));
                 Some(bind)
             }
             Err(decline) => {
+                sp_log_decision(Err(&decline));
                 forward.slowlink.sp.decline = Some(decline);
                 None
             }
@@ -3852,6 +3891,13 @@ pub(crate) fn try_run_prompt(
     let selection = match select(forward, bundle, gpu, tokens, &output, mode) {
         Ok(selection) => selection,
         Err(reason) => {
+            if forward.slowlink.sp_knob() && tracing::enabled!(tracing::Level::DEBUG) {
+                tracing::debug!(
+                    rows = tokens.len(),
+                    reason = %reason,
+                    "qwen4 SP request: not run layer-major, the incumbent runs"
+                );
+            }
             bundle.slowlink_note_bypass(reason);
             return Ok(false);
         }
@@ -3938,6 +3984,25 @@ pub(crate) fn try_run_prompt(
                         .unwrap_or_default(),
                 })
                 .collect();
+            if tracing::enabled!(tracing::Level::DEBUG) {
+                for (window, entry) in plan.windows.iter().zip(&sp_windows) {
+                    let engaged = entry.report.layers > 0;
+                    tracing::debug!(
+                        window = window.index,
+                        rows = entry.rows,
+                        engaged,
+                        layers = entry.report.layers,
+                        streamed_experts = entry.report.streamed_experts,
+                        bypass = entry
+                            .verdict
+                            .err()
+                            .map(|bypass| bypass.to_string())
+                            .unwrap_or_default(),
+                        "qwen4 SP window: {}",
+                        if engaged { "engaged" } else { "not engaged" },
+                    );
+                }
+            }
             forward.slowlink.sp_receipt(&sp_windows)
         })
         .flatten();
