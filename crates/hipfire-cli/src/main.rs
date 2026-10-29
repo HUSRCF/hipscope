@@ -184,8 +184,10 @@ enum ConfigAction {
     Reset { key: Option<String> },
     /// Explain a key's type, scope, default, effective value, and provenance.
     Explain {
-        key: String,
-        /// Explain the key for one model (same as `hipfire config MODEL explain KEY`).
+        /// Key to explain; omit to list every effective setting with its source
+        /// and audit the HIPFIRE_* environment.
+        key: Option<String>,
+        /// Explain for one model (same as `hipfire config MODEL explain KEY`).
         #[arg(long, value_name = "MODEL")]
         model: Option<String>,
         #[command(flatten)]
@@ -1241,9 +1243,17 @@ fn config_command(paths: &Paths, args: ConfigArgs) -> Result<()> {
             }
             Ok(())
         }
-        ConfigAction::Explain { key, output, .. } => {
-            config_view::explain_global_to(paths, &key, output.json, &mut std::io::stdout())
-        }
+        ConfigAction::Explain { key, output, .. } => match key {
+            Some(key) => {
+                config_view::explain_global_to(paths, &key, output.json, &mut std::io::stdout())
+            }
+            None => config_view::explain_all_global_to(
+                paths,
+                output.json,
+                &hipfire_config::env_audit::audit_process_env(),
+                &mut std::io::stdout(),
+            ),
+        },
         ConfigAction::Overrides(output) => {
             config_view::overrides_to(paths, output.json, &mut std::io::stdout())
         }
@@ -1490,9 +1500,21 @@ fn model_config_command_to(
             }
             Ok(())
         }
-        ConfigAction::Explain { key, output, .. } => {
-            config_view::explain_model_to(paths, registry, model_name, &key, output.json, out)
-        }
+        ConfigAction::Explain {
+            key: None, output, ..
+        } => config_view::explain_all_model_to(
+            paths,
+            registry,
+            model_name,
+            output.json,
+            &hipfire_config::env_audit::audit_process_env(),
+            out,
+        ),
+        ConfigAction::Explain {
+            key: Some(key),
+            output,
+            ..
+        } => config_view::explain_model_to(paths, registry, model_name, &key, output.json, out),
         ConfigAction::Migrate
         | ConfigAction::Schema(_)
         | ConfigAction::Profile { .. }
@@ -12572,6 +12594,61 @@ effort = "high"
         assert_eq!(doc["group"], "memory-context");
         assert!(doc["applies"].is_string());
         assert!(doc["shadowed"].is_array(), "existing fields stay");
+        let _ = fs::remove_dir_all(&paths.root);
+    }
+
+    #[test]
+    fn config_explain_without_key_lists_every_setting_source_and_env_audit() {
+        let paths = settings_fixture("cfg-explain-all", None, None, Some(GFX1201));
+        // Fixture names are assembled at runtime so check-lifecycle.py does not
+        // read the typo / secret fixtures as variables the CLI reads.
+        let env_name = |suffix: &str| format!("HIPFIRE_{suffix}");
+        let env = hipfire_config::env_audit::audit_env([
+            (env_name("KVMODE"), "q8".to_owned()),
+            (env_name("DFLASH_CTX_CAP"), "1".to_owned()),
+            (env_name("API_KEY"), "hunter2".to_owned()),
+        ]);
+        let mut out = Vec::new();
+        config_view::explain_all_global_to(&paths, false, &env, &mut out).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.starts_with("Effective configuration (config.toml: "),
+            "{text}"
+        );
+        let kv = text
+            .lines()
+            .find(|line| line.trim_start().starts_with("memory.kv_cache "))
+            .unwrap_or_else(|| panic!("{text}"));
+        assert!(kv.ends_with("default · gfx1201"), "{kv}");
+        assert!(text.contains("\nenvironment\n"), "{text}");
+        assert!(
+            text.contains("UNKNOWN: not a hipfire variable (typo? did you mean HIPFIRE_KV_MODE)"),
+            "{text}"
+        );
+        assert!(
+            text.contains("DEPRECATED since 0.4.0, removed in 0.5.0: unset it"),
+            "{text}"
+        );
+        assert!(
+            text.contains("(set)") && !text.contains("hunter2"),
+            "{text}"
+        );
+        assert!(
+            text.ends_with("explain one key: hipfire config explain <key>\n"),
+            "{text}"
+        );
+
+        let mut out = Vec::new();
+        config_view::explain_all_global_to(&paths, true, &env, &mut out).unwrap();
+        let doc: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        let settings = doc["settings"].as_array().unwrap();
+        let kv = settings
+            .iter()
+            .find(|row| row["key"] == "memory.kv_cache")
+            .unwrap();
+        assert_eq!(kv["source"]["kind"], "default-arch");
+        assert_eq!(kv["source"]["label"], "default · gfx1201");
+        assert_eq!(doc["env"].as_array().unwrap().len(), 3);
         let _ = fs::remove_dir_all(&paths.root);
     }
 

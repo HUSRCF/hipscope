@@ -123,6 +123,25 @@ differs from the resolved one or carries a reason, for example
 `fp8 (auto: fp8 on exact gfx1201, one GPU, Qwen)`), `from:`, `group:` and
 `applies:`. Its JSON adds `effective`, `origin`, `from`, `group` and `applies`.
 
+`hipfire config explain [--model M] [-j]` with **no key** prints every effective
+setting with the layer that set it, grouped like `list`, then an `environment`
+audit and the hint `explain one key: hipfire config explain <key>`. The header
+names `config.toml` once (and, with `--model`, the per-model catalog file
+(`models.toml`, or a legacy `models.json` not yet migrated), resolved exactly as
+`hipfire config M list` does). Sources: `default`, `default · <arch>`,
+`registry <tag>`, `profile <name>`, `config.toml`, `<catalog file> [<model>]`,
+`env HIPFIRE_X`, `cli`. `developer.*` keys appear only when set. The
+`environment` section lists each `HIPFIRE_*` variable set in the current
+process with one of: `applies <config key>` (schema alias or `developer.*`
+mapping), `bootstrap` (read before config exists, e.g. `HIPFIRE_HOME`,
+`HIPFIRE_DEVICES`), `runtime` (documented in [`env-vars.md`](env-vars.md) but not
+a config key), `DEPRECATED since 0.4.0, removed in 0.5.0: <what to do instead>`, or
+`UNKNOWN: not a hipfire variable (typo? did you mean HIPFIRE_Y)` (nearest known
+name within edit distance 3). Values of names containing `KEY`, `TOKEN`,
+`SECRET` or `PASS` print as `(set)`. `-j` prints an object with `settings`
+(array of `{key, value, effective, source:{kind, label, env?, path?}}`) and
+`env` (array of `{name, value, status, label}`).
+
 `hipfire config overrides [--json]` lists every per-model value in
 `~/.hipfire/models.toml` next to the all-models value it overrides:
 

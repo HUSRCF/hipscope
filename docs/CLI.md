@@ -393,7 +393,7 @@ PNG/JPEG image is refused with the `ffmpeg` extraction to run.
 | `hipfire config` | Global interactive TUI → `~/.hipfire/config.toml` (`hipfire-tui --settings`: opens on the Settings tab). |
 | `hipfire config <tag>` | Print resolved per-model policy and override provenance. |
 | `hipfire config list\|get\|set\|reset ...` | Scriptable global ops (`-j/--json` on list/get; `reset` with no key removes every override). |
-| `hipfire config explain <key> [-j]` | Explain a key's type, scope, default, effective value and provenance. |
+| `hipfire config explain [<key>] [--model <tag>] [-j]` | With a key: type, scope, default, effective value and provenance. With no key: every effective setting with its source, plus an audit of the `HIPFIRE_*` variables set in the environment (applies / bootstrap / runtime / deprecated / unknown with a did-you-mean). |
 | `hipfire config schema [-j]` | Print the authoritative typed configuration schema. |
 | `hipfire config migrate` | Convert legacy `config.json` to sparse `config.toml` without deleting the JSON. |
 | `hipfire config profile [set <name>\|create <name>]` | `set` merges a built-in (`default`, `dev`, `hip`, `redline`) or custom profile into the global sparse config (profile keys overwrite, every other key is kept; `default` leaves per-arch/registry defaults such as `memory.kv_cache` and `speculation.dflash` at auto) and prints how many keys it set; `create` snapshots the current global config as a new custom profile; with no action it opens the profile wizard in `hipfire-tui`. `migrate`, `schema` and `profile` are global-only. |
