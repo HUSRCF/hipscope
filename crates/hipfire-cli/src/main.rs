@@ -4583,6 +4583,15 @@ fn trunk_locations(model_path: &Path) -> Vec<PathBuf> {
     locations
 }
 
+/// Lowercased `name` without `-`, `.` and `_`: the separator-insensitive key
+/// [`find_model_path`] compares a registry tag's file against disk by.
+fn strip_name_separators(name: &str) -> String {
+    name.to_ascii_lowercase()
+        .chars()
+        .filter(|c| !matches!(c, '-' | '.' | '_'))
+        .collect()
+}
+
 /// Resolve a model name or path to a local file. A path the user named (or a
 /// catalog path) is returned as selected, made absolute but with symlinks
 /// intact: the PLE sidecar lookup probes `<selected>.ple-*` first and the
@@ -4667,6 +4676,21 @@ pub(crate) fn find_model_path(
     let search = model.replace(':', "-").to_ascii_lowercase();
     let explicit_quant = MODEL_SUFFIXES.iter().any(|suffix| search.ends_with(suffix));
     let local = local_model_paths(paths, registry).ok()?;
+    // A registry tag names exactly one file. When that file is missing (or a
+    // dangling symlink) the substring scans below would hand back any sibling
+    // whose name merely contains the tag: `qwen3.8:27b-mq3` reached
+    // `qwen3.8-27b.mq3-xt`, a different tier, and loaded it silently. Only a
+    // spelling of the SAME file qualifies (equal once `-`, `.`, `_` are ignored:
+    // the renamed-artifact case); otherwise report it absent so the caller pulls
+    // the canonical file.
+    if let Some((_, entry)) = registry.model(model) {
+        let wanted = strip_name_separators(&entry.file);
+        return local.into_iter().find(|path| {
+            path.file_name()
+                .and_then(|file| file.to_str())
+                .is_some_and(|name| strip_name_separators(name) == wanted)
+        });
+    }
     // Two passes. The first matches the literal spelling and is what has always
     // run. The second retries with `-`, `.` and `_` stripped from both sides, so
     // an input and an on-disk file that differ only in separators still meet:
@@ -11176,6 +11200,46 @@ mod tests {
         let registry = hipfire_registry::bundled().unwrap();
 
         assert_eq!(find_model_path(&paths, &registry, "-.-"), None);
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    /// A tag whose canonical file is a dangling symlink must not resolve to a
+    /// sibling that merely shares its prefix (`qwen3.8-27b.mq3-xt`/`-pro` for
+    /// `qwen3.8:27b-mq3`): it is absent, so callers pull the real file.
+    #[cfg(unix)]
+    #[test]
+    fn missing_or_dangling_tag_file_never_resolves_to_a_sibling_tier() {
+        let paths = test_paths("dangling-tag-sibling");
+        fs::create_dir_all(&paths.models).unwrap();
+        let registry = hipfire_registry::bundled().unwrap();
+        let (_, entry) = registry.model("qwen3.8:27b-mq3").unwrap();
+        assert_eq!(entry.file, "qwen3.8-27b.mq3");
+        for sibling in ["qwen3.8-27b.mq3-xt", "qwen3.8-27b.mq3-pro"] {
+            fs::write(paths.models.join(sibling), b"sibling").unwrap();
+        }
+        let canonical = paths.models.join(&entry.file);
+
+        // Canonical file absent.
+        assert_eq!(find_model_path(&paths, &registry, "qwen3.8:27b-mq3"), None);
+        // Canonical file a dangling symlink.
+        std::os::unix::fs::symlink(paths.root.join("gone.hfq"), &canonical).unwrap();
+        assert_eq!(find_model_path(&paths, &registry, "qwen3.8:27b-mq3"), None);
+        assert_eq!(
+            resolve_model_path(&paths, &registry, "qwen3.8:27b-mq3").unwrap(),
+            None
+        );
+        // The siblings still resolve under their own tags.
+        assert_eq!(
+            find_model_path(&paths, &registry, "qwen3.8:27b-mq3-xt"),
+            Some(paths.models.join("qwen3.8-27b.mq3-xt"))
+        );
+        // A real canonical file wins again.
+        fs::remove_file(&canonical).unwrap();
+        fs::write(&canonical, b"canonical").unwrap();
+        assert_eq!(
+            find_model_path(&paths, &registry, "qwen3.8:27b-mq3"),
+            Some(canonical)
+        );
         fs::remove_dir_all(&paths.root).unwrap();
     }
 
