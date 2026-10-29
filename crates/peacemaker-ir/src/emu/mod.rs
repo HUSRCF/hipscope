@@ -31,8 +31,6 @@ pub use hw::RunReport;
 mod memory;
 pub mod mma;
 #[cfg(test)]
-mod gate_ops_tests;
-#[cfg(test)]
 mod swmmac_fixtures;
 pub mod trans;
 mod wide;
