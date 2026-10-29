@@ -20,23 +20,10 @@ pub const GROUP_BYTES: usize = 136;
 pub const POISON: u32 = 0x7FC0_DEAD;
 /// The most lanes either kernel supports.
 pub const MAX_LANES: usize = 8;
-/// A timing pool's weight sets together exceed this many bytes (production runs against a cold
-/// last-level cache: the other ~25 kernels between two launches of a decode step evict it).
-pub const POOL_BYTES: usize = 192 << 20;
-/// Bytes of each of the two device-to-device flush buffers (`flush=1`).
-pub const FLUSH_BYTES: usize = 96 << 20;
+/// The cold-cache pool and flush sizes live in `support/cold.rs` (shared with `pm_loop`).
+pub use crate::cold::{pool_sets, POOL_BYTES};
 /// WGP count assumed offline (R9700); the device attribute must agree on the card.
 pub const WGP_COUNT: usize = 32;
-
-/// How many distinct weight sets a timing pool of `set_bytes` each needs: their total exceeds
-/// [`POOL_BYTES`], the count is odd (so ABBA arms do not alias set parity), clamped to 3..=161.
-pub fn pool_sets(set_bytes: usize) -> usize {
-    let mut n = POOL_BYTES / set_bytes.max(1) + 1;
-    if n % 2 == 0 {
-        n += 1;
-    }
-    n.clamp(3, 161)
-}
 
 // ---------------------------------------------------------------------------
 // Weights

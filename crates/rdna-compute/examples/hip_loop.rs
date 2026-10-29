@@ -130,6 +130,8 @@
 
 #[path = "support/abba.rs"]
 mod abba;
+#[path = "support/cold.rs"]
+mod cold;
 #[path = "hip_loop/elf.rs"]
 mod elf;
 #[path = "hip_loop/emu.rs"]
@@ -1044,7 +1046,7 @@ fn sample(
     cand: &mut Arm,
     n: usize,
     rounds: usize,
-    flush: Option<&(node::Buf, node::Buf)>,
+    flush: Option<&cold::Flush>,
 ) -> Result<(Vec<f64>, Vec<f64>)> {
     let (per_arm, _) = abba::timing_counts(n, rounds)?;
     let (mut b, mut c) = (Vec::with_capacity(per_arm), Vec::with_capacity(per_arm));
@@ -1058,15 +1060,7 @@ fn sample(
     };
     // `--flush`: evict L2 / the last-level cache / TLBs / instruction caches between dispatches
     // the way the other kernels of a decode step do; always outside the timed interval.
-    let evict = |gpu: &rdna_compute::Gpu| -> Result<()> {
-        match flush {
-            Some((a, f)) => gpu
-                .hip
-                .memcpy_dtod(&f.buf, &a.buf, lane_common::FLUSH_BYTES)
-                .map_err(err),
-            None => Ok(()),
-        }
-    };
+    let evict = |gpu: &rdna_compute::Gpu| -> Result<()> { cold::evict(&gpu.hip, flush) };
     let measured = (|| -> Result<()> {
         evict(gpu)?;
         for (i, which) in abba::timing_schedule(n, rounds)?.into_iter().enumerate() {
@@ -1315,10 +1309,7 @@ fn gpu_run(
     }
 
     let flush = if node.flush_requested() {
-        Some((
-            node::Buf::alloc(gpu, lane_common::FLUSH_BYTES).map_err(stage("setup"))?,
-            node::Buf::alloc(gpu, lane_common::FLUSH_BYTES).map_err(stage("setup"))?,
-        ))
+        Some(cold::Flush::alloc(&gpu.hip).map_err(stage("setup"))?)
     } else {
         None
     };
@@ -1332,9 +1323,8 @@ fn gpu_run(
         o.rounds,
         flush.as_ref(),
     );
-    if let Some((a, b)) = flush {
-        a.free(gpu);
-        b.free(gpu);
+    if let Some(f) = flush {
+        f.free(&gpu.hip);
     }
     let (b_ns, c_ns) = sampled.map_err(stage("timing"))?;
     let after = clock_note(gpu);
@@ -1346,10 +1336,7 @@ fn gpu_run(
     }
     rec["timing"]["flush"] = json!(node.flush_requested());
     if node.flush_requested() {
-        rec["timing"]["flush_method"] = json!(format!(
-            "2 x {} MiB device-to-device copy after every timed dispatch, outside the per-dispatch hipEvent interval",
-            lane_common::FLUSH_BYTES >> 20
-        ));
+        rec["timing"]["flush_method"] = json!(cold::flush_method());
     }
     rec["clock_note"] = json!({
         "clocks_pinned": false,

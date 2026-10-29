@@ -278,8 +278,7 @@ impl Node for LaneWo {
             "weights": "MQ4G256V2 (16 groups x 136 B per row), seeded",
             "x": "f32 [lanes][4096], seeded random in [-1, 1)",
             "y": "f32 [lanes][m], accumulated (y += W x), restored from a pristine copy before every dispatch",
-            "timing_pool": {"sets": sets, "bytes_per_set": self.set_bytes(),
-                "total_bytes": sets * self.set_bytes(), "dispatch_i_uses_set": "i % sets"},
+            "timing_pool": crate::cold::pool_json(sets, self.set_bytes()),
         })
     }
     fn incumbent(&self) -> Result<Incumbent> {

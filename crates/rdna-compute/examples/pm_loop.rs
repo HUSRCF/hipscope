@@ -7,8 +7,8 @@
 //! `qwen4_moe_sym` and `qwen4_moe_verify`). Prints ONE JSON object (schema 1) on stdout.
 //!
 //! ```text
-//! pm_loop --kernel iu4_gemm|mq6_i8_gemm|fp8_gemm|fa_prefill|qwen4_moe_sym|qwen4_moe_verify --shape <S> [kernel knobs]
-//!         [--arch gfx1201|gfx1151|gfx1100] [--base-<knob> V ...] [--rip FILE.rip] [--time N] [--rounds R]
+//! pm_loop --kernel iu4_gemm|qkvzaset|mq6_i8_gemm|fp8_gemm|fa_prefill|qwen4_moe_sym|qwen4_moe_verify --shape <S> [kernel knobs]
+//!         [--arch gfx1201|gfx1151|gfx1100] [--base-<knob> V ...] [--rip FILE.rip] [--time N] [--rounds R] [--flush]
 //!         [--cand-object FILE: qwen4_moe_sym --arch gfx1100 only, a prebuilt candidate object]
 //!         [--max-rounds R] [--time-budget-s S] [--min-effect F] [--emu] [--offline] [--out DIR]
 //!         [--null-control aa] [--noise-floor FILE]
@@ -147,11 +147,27 @@
 //! numeric distance of the two routes. `--rip`, `--emu` are refused; `--null-control aa` runs the
 //! baseline chain as the candidate and requires bit identity.
 //!
+//! Cold timing (`--flush`, `--kernel iu4_gemm|qkvzaset`; `support/cold.rs`, shared with `hip_loop`): the default
+//! loop is HOT: the same weights back to back, so a verify-shape matrix of at most ~47 MB stays resident in the
+//! 64 MB Infinity Cache and a DRAM-bound change reads far larger than in the model (the shipped `_v64` down:
+//! 100.6 -> 62.6 us here, 122.3 -> 98.4 us in-model). `--flush` runs the production way: a pool of distinct seeded
+//! weight sets whose total exceeds 192 MiB (dispatch `i`, either arm, uses set `i % sets`; the set count is odd so
+//! the ABBA arms do not alias set parity), and a 2 x 96 MiB device-to-device copy after every timed dispatch,
+//! enqueued OUTSIDE the hipEvent interval (L2, MALL, TLB and instruction caches are cold at every launch). Set 0 is the
+//! correctness set (the CPU reference reads it); the arms are additionally compared bit for bit on every other pool
+//! member (`correctness.pool = {sets, identical, per_set_identical, max_abs_diff_vs_baseline}`; a candidate identical
+//! on set 0 must stay identical on all of them), and the post-sampling check re-runs set 0. Recording:
+//! `shape.flush = true` and `shape.timing_pool = {sets, bytes_per_set, total_bytes, dispatch_i_uses_set}` (only when
+//! cold: a hot run's `shape` keeps its bytes, so `pm-census noise` groups still match), `timing.flush` (always) and
+//! `timing.flush_method`. The event interval still contains the host launch latency in both modes. `--flush` with a
+//! 2:4 sparse arm is refused (the packed image has no pool); other kernels refuse the flag.
+//!
 //! Exit status: 0 ok; 1 correctness failure (record still printed); 3 the
 //! candidate could not be emitted/certified/launched (record printed with the
 //! error); 2 usage error.
 //!
-//! Kernel knobs and shape grammar: see the doc comment of `pm_loop/iu4.rs`
+//! Kernel knobs and shape grammar: see the doc comment of `pm_loop/qkvzaset.rs` (`--kernel qkvzaset`, the fused
+//! verify GDN projection, 120-byte ABI, identity vs the shipped `_b1s`/`_v64` export) and of `pm_loop/iu4.rs`
 //! (`--kernel iu4_gemm`), `pm_loop/mq6.rs` (`--kernel mq6_i8_gemm`), `pm_loop/fp8.rs`
 //! (`--kernel fp8_gemm`), `pm_loop/fa.rs` (`--kernel fa_prefill`) and `pm_loop/moe.rs`
 //! (`--kernel qwen4_moe_sym`).
@@ -178,6 +194,8 @@
 mod abba;
 #[path = "pm_loop/c8.rs"]
 mod c8;
+#[path = "support/cold.rs"]
+mod cold;
 #[path = "pm_loop/common.rs"]
 mod common;
 #[path = "pm_loop/fa.rs"]
@@ -200,6 +218,8 @@ mod moe_verify_iu4;
 mod mq6;
 #[path = "pm_loop/prod.rs"]
 mod prod;
+#[path = "pm_loop/qkvzaset.rs"]
+mod qkvzaset;
 #[path = "pm_loop/rotate.rs"]
 mod rotate;
 #[path = "pm_loop/workload.rs"]
@@ -274,11 +294,15 @@ struct Opts {
     noise_floor_doc: Option<Value>,
     /// `--offline`: stop after emit + M7 + baseline resolution (no device).
     offline: bool,
+    /// `--flush`: cold-cache timing (`support/cold.rs`): a rotating weight pool whose total exceeds
+    /// the last-level cache and a 2 x 96 MiB device copy after every timed dispatch (outside the
+    /// event interval); `iu4_gemm` and `qkvzaset` only.
+    flush: bool,
     knobs: Knobs,
 }
 
 const DRIVER_FLAGS: &str =
-    "--kernel K --shape S [--arch gfx1201|gfx1151|gfx1100] [--time N] [--rounds R] [--max-rounds R] [--time-budget-s S] [--min-effect F] [--emu] [--offline] [--out DIR] [--rip FILE.rip] [--cand-object FILE] [--null-control aa] [--noise-floor FILE] [--<knob> V]... [--base-<knob> V]...";
+    "--kernel K --shape S [--arch gfx1201|gfx1151|gfx1100] [--time N] [--rounds R] [--max-rounds R] [--time-budget-s S] [--min-effect F] [--emu] [--offline] [--flush] [--out DIR] [--rip FILE.rip] [--cand-object FILE] [--null-control aa] [--noise-floor FILE] [--<knob> V]... [--base-<knob> V]...";
 
 fn parse_args(mut a: impl Iterator<Item = String>) -> Result<Opts> {
     let mut o = Opts {
@@ -298,6 +322,7 @@ fn parse_args(mut a: impl Iterator<Item = String>) -> Result<Opts> {
         noise_floor: None,
         noise_floor_doc: None,
         offline: false,
+        flush: false,
         knobs: Knobs::default(),
     };
     while let Some(arg) = a.next() {
@@ -311,6 +336,10 @@ fn parse_args(mut a: impl Iterator<Item = String>) -> Result<Opts> {
         }
         if key == "offline" {
             o.offline = true;
+            continue;
+        }
+        if key == "flush" {
+            o.flush = true;
             continue;
         }
         let value = a
@@ -389,6 +418,13 @@ fn parse_args(mut a: impl Iterator<Item = String>) -> Result<Opts> {
     if o.kernel == CHAIN_KERNEL && o.offline {
         return Err(format!(
             "--offline is not supported with --kernel {CHAIN_KERNEL}: chain arms are enqueued through the device launchers"
+        ));
+    }
+    if o.flush && !workload::COLD_KERNELS.contains(&o.kernel.as_str()) {
+        return Err(format!(
+            "--flush is only supported with --kernel {} (got --kernel {}): cold-cache timing needs a weight pool",
+            workload::COLD_KERNELS.join("|"),
+            o.kernel
         ));
     }
     if o.rip.is_some()
@@ -484,9 +520,10 @@ fn build_workload(o: &mut Opts) -> Result<Box<dyn Workload>> {
         "iu4_c8_producer_pm" => c8::new_with_rip(&shape, &mut knobs, o.rip.as_deref())?,
         "moe_rotate_i4_pm" => rotate::new_with_rip(&shape, &mut knobs, o.rip.as_deref())?,
         "gdn_chunk_prep_pm" => gdn::new_with_rip(&shape, &mut knobs, o.rip.as_deref())?,
+        "qkvzaset" => qkvzaset::new(&shape, &mut knobs)?,
         other => {
             return Err(format!(
-                "unknown --kernel {other} (iu4_gemm|mq6_i8_gemm|fp8_gemm|fa_prefill|qwen4_moe_sym|qwen4_moe_verify|iu4_c8_producer_pm|moe_rotate_i4_pm|gdn_chunk_prep_pm)"
+                "unknown --kernel {other} (iu4_gemm|mq6_i8_gemm|fp8_gemm|fa_prefill|qwen4_moe_sym|qwen4_moe_verify|iu4_c8_producer_pm|moe_rotate_i4_pm|gdn_chunk_prep_pm|qkvzaset)"
             ))
         }
     };
@@ -639,7 +676,12 @@ fn load(gpu: &Gpu, obj: &Object) -> Result<Loaded> {
 }
 
 fn launch(gpu: &Gpu, w: &dyn Workload, arm: Arm, f: &Loaded) -> Result<()> {
-    let mut l = w.launch(arm);
+    launch_set(gpu, w, arm, 0, f)
+}
+
+/// [`launch`] on weight set `set` of the workload's timing pool (`Workload::launch_set`).
+fn launch_set(gpu: &Gpu, w: &dyn Workload, arm: Arm, set: usize, f: &Loaded) -> Result<()> {
+    let mut l = w.launch_set(arm, set);
     // SAFETY: the workload packs the kernarg per the kernel's declared ABI
     // and every pointer addresses a live allocation it owns.
     unsafe {
@@ -647,6 +689,34 @@ fn launch(gpu: &Gpu, w: &dyn Workload, arm: Arm, f: &Loaded) -> Result<()> {
             .launch_kernel_blob(&f.func, l.grid, l.block, l.lds, None, &mut l.kernarg)
     }
     .map_err(err)
+}
+
+/// Identity of the two arms on every member of the `--flush` weight pool (sets `1..`; set 0 is the
+/// correctness set the caller already compared): each arm runs once on each set from its restored
+/// state, and the outputs are compared bit for bit.
+fn pool_identity(gpu: &Gpu, w: &dyn Workload, bf: &Loaded, cf: &Loaded) -> Result<Value> {
+    let sets = w.pool_sets();
+    let (mut per_set, mut worst) = (Vec::new(), 0f64);
+    for set in 1..sets {
+        for arm in [Arm::Baseline, Arm::Candidate] {
+            w.reset(gpu, arm)?;
+        }
+        launch_set(gpu, w, Arm::Baseline, set, bf)?;
+        launch_set(gpu, w, Arm::Candidate, set, cf)?;
+        gpu.hip.device_synchronize().map_err(err)?;
+        let (b, c) = (
+            w.output(gpu, Arm::Baseline)?,
+            w.output(gpu, Arm::Candidate)?,
+        );
+        worst = worst.max(w.max_abs_diff(&b, &c)?);
+        per_set.push(b == c);
+    }
+    Ok(json!({
+        "sets": sets, "members_checked": per_set.len(),
+        "identical": per_set.iter().all(|x| *x), "per_set_identical": per_set,
+        "max_abs_diff_vs_baseline": worst,
+        "note": "candidate vs baseline on every pool member (set 0 above); no CPU reference for sets >= 1",
+    }))
 }
 
 fn device_json(gpu: &Gpu) -> Value {
@@ -809,6 +879,12 @@ trait ArmExec {
     fn begin_round(&mut self, _round: usize) {}
     fn reset(&mut self, arm: Arm) -> Result<()>;
     fn launch(&mut self, arm: Arm) -> Result<()>;
+    /// Evict the caches (`--flush`) the way the other kernels of a decode step do. Enqueued before
+    /// the first launch of a batch and after every timed launch, so it is never inside an event
+    /// interval. Default: nothing.
+    fn evict(&mut self) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// Single-object workload: the workload plus the two loaded modules.
@@ -817,6 +893,10 @@ struct SingleExec<'a> {
     w: &'a dyn Workload,
     base: &'a Loaded,
     cand: &'a Loaded,
+    /// `--flush`: the eviction buffers.
+    flush: Option<&'a cold::Flush>,
+    /// Timed launches issued so far: dispatch `i` runs on weight set `i % w.pool_sets()`.
+    slot: usize,
 }
 
 impl ArmExec for SingleExec<'_> {
@@ -831,7 +911,12 @@ impl ArmExec for SingleExec<'_> {
             Arm::Baseline => self.base,
             Arm::Candidate => self.cand,
         };
-        launch(self.gpu, self.w, arm, f)
+        let set = self.slot % self.w.pool_sets();
+        self.slot += 1;
+        launch_set(self.gpu, self.w, arm, set, f)
+    }
+    fn evict(&mut self) -> Result<()> {
+        cold::evict(&self.gpu.hip, self.flush)
     }
 }
 
@@ -873,6 +958,7 @@ fn sample_rounds(ex: &mut dyn ArmExec, n: usize, rounds: usize, s: &mut Sampled)
         }
     };
     let measured = (|| -> Result<()> {
+        ex.evict()?;
         for (i, which) in timing_schedule(n, rounds)?.enumerate() {
             if i % (4 * n) == 0 {
                 ex.begin_round(done + i / (4 * n));
@@ -891,6 +977,7 @@ fn sample_rounds(ex: &mut dyn ArmExec, n: usize, rounds: usize, s: &mut Sampled)
                 TimingArm::Incumbent => s.base_ns.push(ns),
                 TimingArm::Candidate => s.cand_ns.push(ns),
             }
+            ex.evict()?;
         }
         Ok(())
     })();
@@ -997,6 +1084,10 @@ fn timed_record(
         );
     }
     t["post_outputs_unchanged"] = json!(true);
+    t["flush"] = json!(o.flush);
+    if o.flush {
+        t["flush_method"] = json!(cold::flush_method());
+    }
     Ok(t)
 }
 
@@ -1050,6 +1141,11 @@ fn run(o: &mut Opts) -> (Value, Outcome) {
         Ok(w) => w,
         Err(e) => return fail(rec, "args", e),
     };
+    if o.flush {
+        if let Err(e) = w.set_cold(true) {
+            return fail(rec, "args", e);
+        }
+    }
     let arch = w.arch();
     rec["arch"] = json!(arch);
     rec["shape"] = w.shape_json();
@@ -1292,27 +1388,64 @@ fn run(o: &mut Opts) -> (Value, Outcome) {
         "output_bytes": cand_out.len(),
         "emu": emu_field,
     });
+    // `--flush`: the arms must also agree on every member of the weight pool.
+    let mut pass = pass;
+    if w.pool_sets() > 1 {
+        match pool_identity(&gpu, &*w, &bf, &cf) {
+            Ok(p) => {
+                // Identical on the correctness set: identical on every pool member too.
+                if identical && p["identical"] != json!(true) {
+                    pass = false;
+                    rec["correctness"]["pass"] = json!(false);
+                }
+                rec["correctness"]["pool"] = p;
+            }
+            Err(e) => return fail(rec, "launch", e),
+        }
+    }
     if !pass {
         rec["timing"] = json!({"status": "refused: candidate failed correctness"});
         return (rec, Outcome::CorrectnessFailed);
     }
 
     // 4. ABBA timing
+    let flush = if o.flush {
+        match cold::Flush::alloc(&gpu.hip) {
+            Ok(f) => Some(f),
+            Err(e) => return fail(rec, "setup", e),
+        }
+    } else {
+        None
+    };
     let sampled = sample(
         &mut SingleExec {
             gpu: &gpu,
             w: &*w,
             base: &bf,
             cand: &cf,
+            flush: flush.as_ref(),
+            slot: 0,
         },
         o,
     );
     let post = (|| -> Result<bool> {
-        // The last timed launch of each arm must still equal its warm output.
         gpu.hip.device_synchronize().map_err(err)?;
+        if w.pool_sets() > 1 {
+            // The last timed launch of each arm ran on whichever pool set it fell on: re-run both
+            // arms on set 0 and compare with the warm outputs.
+            for (arm, f) in [(Arm::Baseline, &bf), (Arm::Candidate, &cf)] {
+                w.reset(&gpu, arm)?;
+                launch(&gpu, &*w, arm, f)?;
+            }
+            gpu.hip.device_synchronize().map_err(err)?;
+        }
+        // The last timed launch of each arm must still equal its warm output.
         Ok(w.output(&gpu, Arm::Baseline)? == base_out
             && w.output(&gpu, Arm::Candidate)? == cand_out)
     })();
+    if let Some(f) = flush {
+        f.free(&gpu.hip);
+    }
     match (sampled, post) {
         (Ok((s, stop, secs)), Ok(true)) => {
             let baseline_sha = rec["baseline"]["co_sha256"]
@@ -2215,5 +2348,116 @@ mod tests {
         let v = vs_noise_floor(&doc, "mq6_i8_gemm", &shape, "bb", 0.9);
         assert!(v["floor"].is_null() && v["status"].is_string());
         assert_eq!(v["group"], "g5");
+    }
+
+    #[test]
+    fn flush_flag_parses_and_is_cold_kernels_only() {
+        for k in ["iu4_gemm", "qkvzaset"] {
+            let o = parse_args(args(&format!("--kernel {k} --flush --shape N=64"))).unwrap();
+            assert!(o.flush, "{k}");
+            assert!(
+                o.knobs.0.is_empty(),
+                "--flush is not a knob: {:?}",
+                o.knobs.0
+            );
+            assert!(!parse_args(args(&format!("--kernel {k}"))).unwrap().flush);
+        }
+        // `--flush` takes no value: the next flag is parsed as itself.
+        let o = parse_args(args("--kernel iu4_gemm --flush --time 7 --epi add")).unwrap();
+        assert_eq!((o.flush, o.time), (true, 7));
+        assert_eq!(o.knobs.0.get("epi").map(String::as_str), Some("add"));
+        for k in [
+            "qwen4_moe_sym",
+            "qwen4_moe_verify",
+            "mq6_i8_gemm",
+            "fa_prefill",
+            "nope",
+        ] {
+            let e = parse_args(args(&format!("--kernel {k} --flush"))).unwrap_err();
+            assert!(
+                e.contains("--flush is only supported with --kernel iu4_gemm|qkvzaset"),
+                "{k}: {e}"
+            );
+        }
+        assert!(DRIVER_FLAGS.contains("[--flush]"));
+        assert_eq!(workload::COLD_KERNELS, ["iu4_gemm", "qkvzaset"]);
+    }
+
+    #[test]
+    fn cold_aware_workloads_build_and_the_rest_refuse_flush() {
+        // The kernels that take --flush build GPU-free and report a pool once cold.
+        for (kernel, shape) in [("iu4_gemm", "M=5120,N=64,K=17408"), ("qkvzaset", "N=64")] {
+            let mut o = parse_args(args(&format!(
+                "--kernel {kernel} --flush --shape {shape} --epi add"
+            )))
+            .unwrap();
+            if kernel == "qkvzaset" {
+                o.knobs.0.remove("epi");
+            }
+            let mut w = build_workload(&mut o).unwrap();
+            assert_eq!(w.pool_sets(), 1);
+            w.set_cold(true).unwrap();
+            assert!(w.pool_sets() >= 3 && w.pool_sets() % 2 == 1, "{kernel}");
+            assert_eq!(w.shape_json()["flush"], true);
+            assert!(
+                w.shape_json()["timing_pool"]["total_bytes"]
+                    .as_u64()
+                    .unwrap()
+                    > cold::POOL_BYTES as u64
+            );
+        }
+        // A workload without a pool refuses (the default `Workload::set_cold`).
+        let mut o = parse_args(args("--kernel fa_prefill --shape fn:small")).unwrap();
+        if let Ok(mut w) = build_workload(&mut o) {
+            let e = w.set_cold(true).unwrap_err();
+            assert!(
+                e.contains("--flush is not supported by --kernel fa_prefill"),
+                "{e}"
+            );
+        }
+    }
+
+    #[test]
+    fn timing_record_names_the_flush() {
+        let mut hot = parse_args(args("--kernel iu4_gemm")).unwrap();
+        let mut cold = parse_args(args("--kernel iu4_gemm --flush")).unwrap();
+        for o in [&mut hot, &mut cold] {
+            (o.time, o.rounds) = (2, 6);
+        }
+        let s = flat(2, 12, 100_000.0, 100_000.0);
+        let shape = json!({});
+        let t = timed_record(&hot, &shape, "sha", &s, abba::ExtendStop::MaxRounds, 1.0).unwrap();
+        assert_eq!(t["flush"], false);
+        assert!(t.get("flush_method").is_none());
+        let t = timed_record(&cold, &shape, "sha", &s, abba::ExtendStop::MaxRounds, 1.0).unwrap();
+        assert_eq!(t["flush"], true);
+        let m = t["flush_method"].as_str().unwrap();
+        assert!(
+            m.starts_with("2 x 96 MiB device-to-device copy") && m.contains("outside"),
+            "{m}"
+        );
+    }
+
+    /// Dispatch `i` of the timing schedule runs on set `i % sets` (odd): both arms cycle the whole pool.
+    #[test]
+    fn rotating_pool_gives_every_arm_every_set() {
+        for sets in [3usize, 5, 13] {
+            let (mut base, mut cand) = (vec![0usize; sets], vec![0usize; sets]);
+            for (slot, which) in timing_schedule(7, 6).unwrap().enumerate() {
+                let set = slot % sets;
+                match which {
+                    TimingArm::Incumbent => base[set] += 1,
+                    TimingArm::Candidate => cand[set] += 1,
+                }
+            }
+            for (name, v) in [("base", &base), ("cand", &cand)] {
+                assert!(
+                    v.iter().all(|c| *c > 0),
+                    "{name} misses a set at {sets} sets: {v:?}"
+                );
+                let (lo, hi) = (v.iter().min().unwrap(), v.iter().max().unwrap());
+                assert!(hi - lo <= 2 * 7, "{name} is lopsided at {sets} sets: {v:?}");
+            }
+        }
     }
 }

@@ -63,6 +63,9 @@ pub struct RefReport {
     pub pass: bool,
 }
 
+/// The `--kernel`s that take `--flush` (cold-cache timing with a rotating weight pool).
+pub const COLD_KERNELS: [&str; 2] = ["iu4_gemm", "qkvzaset"];
+
 /// Raw `--key value` flags the driver did not consume. A module `take`s the
 /// flags it understands and the driver errors on whatever is left.
 #[derive(Clone, Debug, Default)]
@@ -163,6 +166,27 @@ pub trait Workload {
     /// workgroups, cand_out_sha256, base_out_sha256, ..}`. `None`: this workload has no emulator gate.
     fn emu_gate(&self, _cand: &Object, _base: &Object) -> Option<Value> {
         None
+    }
+
+    /// `--flush` (cold timing, `support/cold.rs`): called once after construction, before `setup`.
+    /// A workload that supports it allocates a rotating weight pool in `setup` ([`Workload::pool_sets`]
+    /// sets whose total exceeds the last-level cache) and records `flush` / `timing_pool` in its
+    /// `shape_json`; the driver evicts the caches between timed dispatches. The default refuses.
+    fn set_cold(&mut self, _cold: bool) -> Result<()> {
+        Err(format!(
+            "--flush is not supported by --kernel {} (cold timing: {})",
+            self.kernel(),
+            COLD_KERNELS.join(", ")
+        ))
+    }
+    /// Distinct weight sets a timing pool cycles (1: no pool, every dispatch reads the same weights).
+    fn pool_sets(&self) -> usize {
+        1
+    }
+    /// [`Workload::launch`] with weight set `set` (`0..pool_sets()`; set 0 is the correctness set the
+    /// CPU reference reads). The driver issues timed dispatch `i` on set `i % pool_sets()`.
+    fn launch_set(&self, arm: Arm, _set: usize) -> Launch {
+        self.launch(arm)
     }
 }
 
