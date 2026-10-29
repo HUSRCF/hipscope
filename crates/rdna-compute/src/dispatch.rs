@@ -952,9 +952,10 @@ pub enum DType {
     E8PI4G128R128,
     /// ggml Q4_K (GGUF type 12), served as-is: 144 B per 256 elements, 4.5 bpw.
     /// Distinct from the legacy llama `Q4K` until that path is cut over to the
-    /// ggml kernels. No kernel consumes it yet: every execution site must refuse
-    /// it by name ([`DType::ggml_name`]), never reinterpret it as another dtype.
-    /// `K % 256 == 0`.
+    /// ggml kernels. Consumed only by the GGUF-native route (decode mmvq GEMV,
+    /// dequantising prefill GEMM, embedding gather; see `ggml_ops`): every other
+    /// execution site must refuse it by name ([`DType::ggml_name`]), never
+    /// reinterpret it as another dtype. `K % 256 == 0`.
     GgmlQ4K,
     /// ggml Q5_K (GGUF type 13): 176 B per 256 elements, 5.5 bpw. `K % 256 == 0`.
     GgmlQ5K,
@@ -1282,13 +1283,14 @@ impl DType {
         }
     }
 
-    /// Refusal text for an execution site handed a `Ggml*` dtype (no ggml
-    /// kernel is wired yet); `None` for every other dtype.
+    /// Refusal text for an execution site that has no GGUF-native path and was
+    /// handed a `Ggml*` dtype; `None` for every other dtype.
     pub fn ggml_refusal(self) -> Option<String> {
         self.ggml_name().map(|name| {
             format!(
-                "this build cannot run GGUF {name} weights yet: the ggml block format is only \
-                 parsed and inspected, and no ggml kernel is wired; use an MQ or HFQ model"
+                "this route has no ggml kernel for GGUF {name} weights: GGUF-native serving \
+                 (HIPFIRE_GGUF_NATIVE=1) runs the decode GEMV and the dequantising prefill GEMM \
+                 only; use an MQ or HFQ model for this feature"
             )
         })
     }
@@ -3032,6 +3034,7 @@ impl Gpu {
                 gdn_pair_counters: None,
                 mq_rmsnorm_awq_wavegrid_scratch: None,
                 gemv_residual_tmp: None,
+                ggml: Default::default(),
                 q8x_act: None,
                 mq6_fp8_x_rot: None,
                 paro_x_scratch: None,

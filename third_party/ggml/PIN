@@ -37,3 +37,8 @@ ff7a578d98937554775931f696e25d171eec9d763c445115fc6ef0b119601a0a  src/ggml-cuda/
 a8c7e041000ba4e90b37842a3d21003a6d4f83808a118bcb96f86c183ba84e52  src/ggml-cuda/unary.cuh  ggml/src/ggml-cuda/unary.cuh
 5e6882fe30b86f2f1ba294542ec88866c962e8f90500d4e035882eff3942f975  src/ggml-cuda/vecdotq.cuh  ggml/src/ggml-cuda/vecdotq.cuh
 9f8a9e935aaa9aa8eac5d07def11b67b757dff02fe8d81ce4908540c5779df7e  src/ggml-cuda/vendors/hip.h  ggml/src/ggml-cuda/vendors/hip.h
+4984ec7d0a7d0a054dc7d1189d0ef01482c3ac2346eb31d945d53357b62b78fc  src/ggml-cuda/convert.cu  ggml/src/ggml-cuda/convert.cu
+c22bcfa617140b6dfd7fb5eb11fc5ae4c25244a435aceb8e7c4c26f4bd578fd0  src/ggml-cuda/convert.cuh  ggml/src/ggml-cuda/convert.cuh
+135b3f11b7e7e49d96b18cc653a0440e79e05591397a3d12f94ce61b58432469  src/ggml-cuda/dequantize.cuh  ggml/src/ggml-cuda/dequantize.cuh
+3691d71610908bd1bbe38729ee143649a99da349ab3077a5cedd155137767adb  src/ggml-cuda/getrows.cu  ggml/src/ggml-cuda/getrows.cu
+5c365e5111fe5a44ded0c0344568dbc8489c94aa87583746c8e15666fe910601  src/ggml-cuda/getrows.cuh  ggml/src/ggml-cuda/getrows.cuh

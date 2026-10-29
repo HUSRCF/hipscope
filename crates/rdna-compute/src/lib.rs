@@ -42,6 +42,9 @@ pub mod gdn_chunk_prep_pm;
 #[cfg(test)]
 mod gdn_q8ef_reference;
 pub mod gemm;
+pub mod ggml_convert;
+pub mod ggml_mmvq;
+pub mod ggml_ops;
 mod gemm_fp8_verify;
 mod gemm_mq6_fp8;
 mod gemm_mq6_i8;
