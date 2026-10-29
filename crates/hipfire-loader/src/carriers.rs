@@ -8189,6 +8189,7 @@ impl Carrier for Qwen35Carrier {
                             "  vision tower: {}; activation reserve {} MiB for {patches} patches",
                             match residency {
                                 TowerResidency::Resident => "resident",
+                                TowerResidency::HostMapped => "host-mapped",
                                 TowerResidency::Streamed => "streamed",
                             },
                             bytes >> 20
