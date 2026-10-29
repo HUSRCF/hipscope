@@ -1374,7 +1374,10 @@ fn score(
             "--tail-split must be below the window length {n_ctx}"
         ));
     }
-    let mut m = Model::load(model, n_ctx, n_ctx, ple_hot, pin)?;
+    // KV capacity at least S1's minimum so short-context corpora (code24, n_ctx 512) can
+    // load through S1 and exercise SP; logits rows stay n_ctx, so scores are unchanged.
+    let max_seq = n_ctx.max(hipfire_arch_qwen4::slowlink_admission::S1_MIN_FORCED_REQUEST_ROWS);
+    let mut m = Model::load(model, max_seq, n_ctx, ple_hot, pin)?;
     emit_untiered_receipt(&m, output)?;
     if m.vocab != h.n_vocab {
         return Err(format!(

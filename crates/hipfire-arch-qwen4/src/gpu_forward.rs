@@ -12975,7 +12975,10 @@ impl Qwen4GpuForward {
             });
         }
         let invariant = std::mem::replace(&mut gpu.prefill_invariant_scope, pm_invariant || append);
-        let f16_moe = std::mem::replace(&mut gpu.qwen4_append_f16_moe_scope, append);
+        let f16_moe = std::mem::replace(
+            &mut gpu.qwen4_append_f16_moe_scope,
+            crate::slowlink_sp::f16_moe_scope(append, self.slowlink.sp_f16_moe()),
+        );
         let ragged_scope = native_trunk_prefill_scope(
             self.prefill_scope,
             gpu.qwen4_trunk_iu4,

@@ -8036,6 +8036,7 @@ mod tests {
             touched_knob: false,
             force_all: false,
             pages: 18,
+            f16_route_ready: true,
             window_rows: profile.window_rows,
             s1_route: Some(profile.geometry.route),
             arch: "gfx1100",

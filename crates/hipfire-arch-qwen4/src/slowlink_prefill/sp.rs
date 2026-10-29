@@ -190,8 +190,8 @@ pub(crate) fn sp_region_fit_rows(profile: &SlowlinkProfile) -> usize {
     lo
 }
 
-/// The SP route layout of a `rows`-row window, checked against the admitted
-/// route region before anything is carved from it.
+/// The SP route layout of a `rows`-row window (the F16 `Aggregate` route), checked against
+/// the admitted route region before anything is carved from it.
 pub(crate) fn sp_window_layout(
     profile: &SlowlinkProfile,
     rows: usize,
@@ -203,10 +203,14 @@ pub(crate) fn sp_window_layout(
             admitted.rows
         )));
     }
+    // The hybrid mode's windows run the F16 `Aggregate` route whatever the profile's own route
+    // is: on a symmetric-IU4 profile the SP layout (x_f16 window rows, the panel slot map, the
+    // hybrid row table) is carved from the route region the IU4 layout was charged.
     let dims = dsp::PromptRouteDims {
         rows,
         k1_rows: 0,
         tail_rows: 0,
+        route: dsp::WindowRoute::Aggregate,
         ..admitted
     };
     let layout = dsp::PromptRouteLayout::with_sp_rows(&dims).map_err(dsp_err("SP route layout"))?;
@@ -272,12 +276,15 @@ pub(crate) struct SpBindPlan {
 ///
 /// The hybrid-only facts (the CPU quants, the splice pool, the SP-layout fit, the
 /// pinned budget, the prefix cache) are gathered only when the knobs select the
-/// hybrid mode; touched-only never reads them.
+/// hybrid mode; touched-only never reads them. `f16_route_ready` is the caller's
+/// load-time dry run of the F16 `Aggregate` route on a symmetric-IU4 profile (see
+/// [`SpLoadFacts::f16_route_ready`]).
 pub(crate) fn sp_load_decision(
     forward: &Qwen4GpuForward,
     gpu: &Gpu,
     profile: &SlowlinkProfile,
     pages: usize,
+    f16_route_ready: bool,
 ) -> Result<SpOutcome, String> {
     let placement = lab_placement()?;
     let hybrid_knob = hipfire_config::memory::qwen4_sp();
@@ -290,6 +297,7 @@ pub(crate) fn sp_load_decision(
         touched_knob,
         force_all,
         pages,
+        f16_route_ready,
         window_rows: profile.window_rows,
         s1_route: Some(route),
         arch: &gpu.arch,
@@ -318,8 +326,8 @@ pub(crate) fn sp_load_decision(
         facts.cpu_gate_up_quant = dtypes.is_some();
         facts.cpu_down_quant = dtypes.is_some();
         facts.splice_workers = (gpu.arch == crate::slowlink_sp::SP_ARCH
-            && route == dsp::WindowRoute::Aggregate)
-            .then(hipfire_dispatch::cpu_exec::splice_pool_threads);
+            && route.is_aggregate_layout())
+        .then(hipfire_dispatch::cpu_exec::splice_pool_threads);
         facts.region_fit_rows = sp_region_fit_rows(profile);
         facts.pinned_budget_bytes = sp_pinned_budget(
             rdna_compute::kv_slots::mem_available_bytes(),
@@ -367,6 +375,22 @@ pub(crate) fn sp_window_verdicts(
     plan.windows
         .iter()
         .map(|window| qualify_sp_window(sp, window, plan.window_tiles(window), capture))
+        .collect()
+}
+
+/// The window route of every window of a plan ([`crate::slowlink_sp::sp_window_route`] per
+/// window): what the run executes, what the preflight admits and what the receipt reports.
+pub(crate) fn sp_window_routes(
+    base: dsp::WindowRoute,
+    sp: Option<&SpProfile>,
+    verdicts: &[Result<(), SpBypass>],
+    windows: usize,
+) -> Vec<dsp::WindowRoute> {
+    (0..windows)
+        .map(|index| {
+            let qualified = verdicts.get(index).is_some_and(|verdict| verdict.is_ok());
+            crate::slowlink_sp::sp_window_route(base, sp, qualified)
+        })
         .collect()
 }
 
@@ -585,6 +609,9 @@ pub(crate) struct SpWindowReport {
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct SpWindowEntry {
     pub(crate) rows: usize,
+    /// The window route the window runs: the hybrid SP's F16 `Aggregate` route for an
+    /// SP-qualified window, else the profile's own.
+    pub(crate) route: dsp::WindowRoute,
     /// The pre-mutation verdict (`Err` = the named `sp_bypass`).
     pub(crate) verdict: Result<(), SpBypass>,
     pub(crate) report: SpWindowReport,
@@ -612,6 +639,7 @@ pub(crate) fn sp_receipt_json(summary: &SpSummary, windows: &[SpWindowEntry]) ->
             };
             json!({
                 "rows": entry.rows,
+                "route": entry.route.label(),
                 "engaged": engaged,
                 "bypass": bypass,
                 "layers": entry.report.layers,
@@ -630,6 +658,8 @@ pub(crate) fn sp_receipt_json(summary: &SpSummary, windows: &[SpWindowEntry]) ->
         "knob": true,
         "armed": armed,
         "mode": summary.admitted.map(|sp| sp.mode.label()),
+        "base_route": summary.admitted.map(|sp| sp.base_route.label()),
+        "sp_route": summary.admitted.map(|sp| sp.window_route.label()),
         "decline": summary.decline.as_ref().map(ToString::to_string),
         "decline_reason": summary.decline.as_ref().map(|decline| decline.label()),
         "unavailable": summary.unavailable,
@@ -980,6 +1010,7 @@ impl TouchedRuntime {
 #[derive(Clone, Debug)]
 struct LayerTrace {
     mode: SpMode,
+    route: dsp::WindowRoute,
     layer: usize,
     rows: usize,
     k: usize,
@@ -1001,6 +1032,7 @@ impl LayerTrace {
         json!({
             "sp_layer": self.layer,
             "mode": self.mode.label(),
+            "route": self.route.label(),
             "rows": self.rows,
             "k": self.k,
             "u": self.active,
@@ -1032,6 +1064,20 @@ impl Run<'_, '_> {
                 .is_some_and(|verdict| verdict.is_ok())
     }
 
+    /// The window route this window runs ([`sp_window_route`]): the hybrid SP's F16
+    /// `Aggregate` route for an SP-qualified window, the S1 profile's own otherwise.
+    pub(super) fn window_route(&self, w: &WinCtx<'_>) -> dsp::WindowRoute {
+        let qualified = self
+            .sp_verdicts
+            .get(w.window.index)
+            .is_some_and(|verdict| verdict.is_ok());
+        crate::slowlink_sp::sp_window_route(
+            self.profile.geometry.route,
+            self.rt.sp.as_ref().map(|sp| &sp.profile),
+            qualified,
+        )
+    }
+
     /// The route layout of the window: the S1 one, or the SP one.
     pub(super) fn window_layout(&self, w: &WinCtx<'_>, sp_on: bool) -> R<dsp::PromptRouteLayout> {
         if sp_on {
@@ -1052,9 +1098,13 @@ impl Run<'_, '_> {
         &mut self,
         routes: &mut dsp::PromptRouteStorage,
         progress: &mut Progress,
+        f16_moe: bool,
     ) -> R<()> {
         progress.sp_armed = true;
         routes.set_sp(true);
+        // Every tile scope of this window (resident and host layers alike) suppresses the
+        // symmetric IU4 MoE arm when the window runs the F16 route on an IU4 profile.
+        self.forward.slowlink.set_sp_f16_moe(f16_moe);
         let sp = self
             .rt
             .sp
@@ -1082,6 +1132,7 @@ impl Run<'_, '_> {
             )));
         }
         self.gpu.hip.stream_synchronize(&sp.xfer)?;
+        self.forward.slowlink.set_sp_f16_moe(false);
         sp.protocol.end_window().map_err(proto_err)?;
         sp.acc.streamed_bytes = sp.submitted;
         let report = sp.acc;
@@ -1123,6 +1174,7 @@ impl Run<'_, '_> {
         let hidden = geo.hidden;
         let rows = w.window.rows;
         let tile_count = w.tiles.len();
+        let sp_route = self.window_route(w);
         routes.reset_for_layer();
 
         // §3.3 tiles: mixer prefix + route preparation, then x16 D2H on xfer.
@@ -1245,7 +1297,7 @@ impl Run<'_, '_> {
         let inject = self
             .bundle
             .slowlink_take_injection(SlowlinkFailPoint::DuringPanel);
-        let anchor_index = sp_anchor_tile(self.profile.geometry.route, w.tiles, geo.few_row_limit);
+        let anchor_index = sp_anchor_tile(sp_route, w.tiles, geo.few_row_limit);
         let stand_in;
         let anchor: &TilePlan = match anchor_index {
             Some(ti) => &w.tiles[ti],
@@ -1293,7 +1345,7 @@ impl Run<'_, '_> {
                     &sealed,
                     anchor.window_row,
                     anchor.position,
-                    self.profile.geometry.route,
+                    sp_route,
                 );
                 Qwen4GpuForward::leave_tile_scopes(gpu, tile_scopes);
                 let call = call.map_err(dsp_err("admission"))?;
@@ -1508,6 +1560,7 @@ impl Run<'_, '_> {
         if sp.trace {
             let trace = LayerTrace {
                 mode: SpMode::Hybrid,
+                route: sp_route,
                 layer,
                 rows,
                 k: plan.split.k,
@@ -1744,6 +1797,7 @@ impl Run<'_, '_> {
             // The hybrid trace's shape: k = U, no CPU slot, no returned row.
             let line = LayerTrace {
                 mode: SpMode::TouchedOnly,
+                route: self.profile.geometry.route,
                 layer,
                 rows: w.window.rows,
                 k: touched_count,
@@ -1784,6 +1838,8 @@ mod tests {
     fn sp_profile() -> SpProfile {
         SpProfile {
             mode: SpMode::Hybrid,
+            base_route: AGG,
+            window_route: AGG,
             sp_max_rows: SP_MAX_ROWS,
             s_cap: 5 * SP_MAX_ROWS,
             workers: 16,
@@ -2313,6 +2369,7 @@ mod tests {
             ..SpSummary::default()
         };
         let window = SpWindowEntry {
+            route: AGG,
             rows: 300,
             verdict: Ok(()),
             report: SpWindowReport::default(),
@@ -2332,6 +2389,7 @@ mod tests {
             ..SpSummary::default()
         };
         let ran = SpWindowEntry {
+            route: AGG,
             rows: 1024,
             verdict: Ok(()),
             report: SpWindowReport {
@@ -2343,6 +2401,7 @@ mod tests {
             },
         };
         let bypassed = SpWindowEntry {
+            route: AGG,
             rows: 16_896,
             verdict: Err(SpBypass::TooManyRows {
                 rows: 16_896,
@@ -2404,6 +2463,7 @@ mod tests {
         with_sp["sp"] = sp_receipt_json(
             &armed,
             &[SpWindowEntry {
+                route: AGG,
                 rows: plan.rows,
                 verdict: Ok(()),
                 report: SpWindowReport::default(),
@@ -2421,6 +2481,8 @@ mod tests {
     fn touched_profile() -> SpProfile {
         SpProfile {
             mode: SpMode::TouchedOnly,
+            base_route: AGG,
+            window_route: AGG,
             sp_max_rows: SP_MAX_ROWS,
             s_cap: 0,
             workers: 0,
@@ -2584,6 +2646,7 @@ mod tests {
             ..SpSummary::default()
         };
         let ran = SpWindowEntry {
+            route: AGG,
             rows: 1024,
             verdict: Ok(()),
             report: SpWindowReport {
@@ -2622,10 +2685,13 @@ mod tests {
         );
     }
 
+    const SYM_ROUTE: dsp::WindowRoute = dsp::WindowRoute::AggregateSymIu4;
+
     #[test]
     fn touched_only_trace_line_has_the_sp_trace_shape_with_k_equal_u_and_no_cpu() {
         let line = LayerTrace {
             mode: SpMode::TouchedOnly,
+            route: SYM_ROUTE,
             layer: 7,
             rows: 1024,
             k: 212,
@@ -2646,9 +2712,153 @@ mod tests {
         // The keys the V2a scorer reads: one `sp_layer` line per host layer, k == u, no CPU.
         assert_eq!(value["sp_layer"], json!(7));
         assert_eq!(value["mode"], json!("touched_only"));
+        assert_eq!(value["route"], json!("aggregate-sym-iu4"));
         assert_eq!(value["k"], value["u"]);
         assert_eq!(value["cpu_slots"], json!(0));
         assert_eq!(value["cpu_experts"], json!(0));
         assert_eq!(value["rows"], json!(1024));
+    }
+
+    // ── hybrid SP windows on the symmetric-IU4 profile ────────────────
+
+    const SYM: dsp::WindowRoute = dsp::WindowRoute::AggregateSymIu4;
+
+    fn sym_hybrid_profile() -> SpProfile {
+        SpProfile {
+            base_route: SYM,
+            ..sp_profile()
+        }
+    }
+
+    /// The SP row layout on a symmetric-IU4 profile is the F16 `Aggregate` layout carved from
+    /// the route region the IU4 layout was charged (no new VRAM): it fits for at least the
+    /// admission floor, the fit is monotone and exact, and on an F16 profile it is the
+    /// layout it always was.
+    #[test]
+    fn hybrid_sp_layout_fits_the_sym_iu4_profiles_route_region() {
+        use crate::slowlink_sp::SP_MIN_REGION_ROWS;
+        let sym = product_profile_on(SYM);
+        let f16 = product_profile_on(AGG);
+        assert_eq!(sym.geometry.route, SYM);
+        let fit = sp_region_fit_rows(&sym);
+        assert!(
+            fit >= SP_MIN_REGION_ROWS,
+            "the F16 SP layout must fit the IU4 route region for at least {SP_MIN_REGION_ROWS} rows, fits {fit}"
+        );
+        assert!(fit <= SP_MAX_ROWS);
+        // Exact boundary of the fit; the layout is the F16 aggregate one with SP rows.
+        let at = sp_window_layout(&sym, fit).unwrap();
+        assert_eq!(at.route(), AGG);
+        assert!(at.has_sp() && at.x_f16_bytes() > 0);
+        assert!(at.total_bytes() as u64 <= sym.census.route_storage);
+        if fit < SP_MAX_ROWS.min(sym.route_dims().rows) {
+            assert!(sp_window_layout(&sym, fit + 1).is_err());
+        }
+        // Every row count up to the fit has a layout inside the region.
+        for rows in [5, 300, 768, 1024, 1536, 2048, fit] {
+            let layout = sp_window_layout(&sym, rows).unwrap();
+            assert!(
+                layout.total_bytes() as u64 <= sym.census.route_storage,
+                "{rows}"
+            );
+        }
+        // The F16 profile's own layout is unchanged by the override.
+        let f16_fit = sp_region_fit_rows(&f16);
+        assert!(f16_fit >= fit);
+        assert_eq!(sp_window_layout(&f16, 1024).unwrap().route(), AGG);
+        // The route region the window carves is the profile's: S1's own layout of the same
+        // window (its non-SP windows) still fits it.
+        let plan = plan_agg_on(&sym, 1024);
+        let window = &plan.windows[0];
+        assert!(
+            window_route_layout(&sym, window.rows, window.k1_rows, window.tail_rows)
+                .unwrap()
+                .total_bytes() as u64
+                <= sym.census.route_storage
+        );
+    }
+
+    fn plan_agg_on(profile: &SlowlinkProfile, rows: usize) -> Qwen4PromptPlan {
+        plan_for_profile(profile, 0, rows, &[], &gfx1100_routing, 8)
+            .unwrap()
+            .expect("the aggregate request plans")
+    }
+
+    /// Window verdict and route per window of a symmetric-IU4 plan: SP-qualified windows run
+    /// the F16 route, every other window and every request with SP off keeps SymIu4.
+    #[test]
+    fn sp_windows_run_the_f16_route_and_the_others_keep_sym_iu4() {
+        let profile = product_profile_on(SYM);
+        let hybrid = sym_hybrid_profile();
+        let touched = SpProfile {
+            mode: SpMode::TouchedOnly,
+            window_route: SYM,
+            ..sym_hybrid_profile()
+        };
+        for (rows, qualified) in [
+            (300, true),
+            (768, true),
+            (1024, true),
+            (2304, true),
+            (5376, true),
+            (5377, false),
+            (16_896, false),
+            (16_896 + 300, false),
+        ] {
+            let plan = plan_agg_on(&profile, rows);
+            let verdicts = sp_window_verdicts(Some(&hybrid), &plan, CaptureKind::None);
+            let routes = sp_window_routes(SYM, Some(&hybrid), &verdicts, plan.windows.len());
+            assert_eq!(routes.len(), plan.windows.len());
+            for (route, verdict) in routes.iter().zip(&verdicts) {
+                assert_eq!(
+                    *route,
+                    if verdict.is_ok() { AGG } else { SYM },
+                    "rows {rows}"
+                );
+            }
+            assert_eq!(
+                verdicts.iter().all(|verdict| verdict.is_ok()),
+                qualified,
+                "rows {rows}"
+            );
+            // SP off and touched-only: every window keeps the profile's route.
+            let off = sp_window_routes(SYM, None, &verdicts, plan.windows.len());
+            assert!(off.iter().all(|&route| route == SYM), "rows {rows}");
+            let touched_verdicts = sp_window_verdicts(Some(&touched), &plan, CaptureKind::None);
+            let on_touched =
+                sp_window_routes(SYM, Some(&touched), &touched_verdicts, plan.windows.len());
+            assert!(on_touched.iter().all(|&route| route == SYM), "rows {rows}");
+        }
+        // The F16 windows' tile counts land in the F16 K2 slot, the rest in the IU4 one.
+        let plan = plan_agg_on(&profile, 1024);
+        let tiles = |route| moe_iu4_tile_counts(route, plan.window_tiles(&plan.windows[0]), 8);
+        assert_eq!(tiles(AGG), [0, 1, 1, 0, 0]);
+        assert_eq!(tiles(SYM), [1, 0, 1, 0, 0]);
+    }
+
+    /// The receipt names each window's route and the profile's base and SP routes.
+    #[test]
+    fn hybrid_sp_receipt_names_the_per_window_routes() {
+        let armed = SpSummary {
+            knob: true,
+            admitted: Some(sym_hybrid_profile()),
+            ..SpSummary::default()
+        };
+        let window = |route, layers| SpWindowEntry {
+            rows: 1024,
+            route,
+            verdict: Ok(()),
+            report: SpWindowReport {
+                layers,
+                ..SpWindowReport::default()
+            },
+        };
+        let sp = sp_receipt_json(&armed, &[window(AGG, 40), window(SYM, 0)]).unwrap();
+        assert_eq!(sp["mode"], json!("hybrid"));
+        assert_eq!(sp["base_route"], json!("aggregate-sym-iu4"));
+        assert_eq!(sp["sp_route"], json!("aggregate"));
+        assert_eq!(sp["windows"][0]["route"], json!("aggregate"));
+        assert_eq!(sp["windows"][1]["route"], json!("aggregate-sym-iu4"));
+        assert_eq!(sp["windows"][0]["engaged"], json!(true));
     }
 }

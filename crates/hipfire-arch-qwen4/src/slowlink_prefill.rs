@@ -86,8 +86,9 @@ use std::time::Instant;
 mod sp;
 use crate::slowlink_sp::{SpBypass, SpDecline, SpMode, SpProfile};
 use sp::{
-    sp_floor_verdict, sp_load_decision, sp_receipt_json, sp_request_verdict, sp_window_verdicts,
-    SpBind, SpBindPlan, SpRuntime, SpSummary, SpWindowEntry, SpWindowReport, TouchedRuntime,
+    sp_floor_verdict, sp_load_decision, sp_receipt_json, sp_request_verdict, sp_window_routes,
+    sp_window_verdicts, SpBind, SpBindPlan, SpRuntime, SpSummary, SpWindowEntry, SpWindowReport,
+    TouchedRuntime,
 };
 
 type R<T> = Result<T, Qwen4GpuForwardError>;
@@ -1189,6 +1190,11 @@ pub(crate) struct SlowlinkSlot {
     /// What the load decided about SP ([`bind_at_load`]); the default (knob
     /// off) on every other load.
     sp: SpLoad,
+    /// A hybrid SP window runs the F16 `Aggregate` route on a symmetric-IU4 profile: every
+    /// tile scope of the window suppresses the symmetric IU4 MoE arm
+    /// ([`crate::slowlink_sp::f16_moe_scope`]). Set by the run at window entry, cleared at
+    /// window exit and on any failure; an atomic so the shared-reference preflight can set it.
+    sp_f16_moe: std::sync::atomic::AtomicBool,
 }
 
 impl SlowlinkSlot {
@@ -1198,6 +1204,16 @@ impl SlowlinkSlot {
             Some(runtime) => runtime.free_gpu(gpu),
             None => Ok(()),
         }
+    }
+
+    /// [`Self::sp_f16_moe`] field, read by every tile scope.
+    pub(crate) fn sp_f16_moe(&self) -> bool {
+        self.sp_f16_moe.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub(crate) fn set_sp_f16_moe(&self, on: bool) {
+        self.sp_f16_moe
+            .store(on, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// The hybrid SP is admitted on this load: every session snapshot scope carries
@@ -1851,7 +1867,24 @@ fn load_decline(
 /// row cap, or the named sticky decline. SP is otherwise silent in the daemon log, so a
 /// declined knob used to look like an SP that ran no layers.
 pub(crate) fn sp_log_decision(decision: Result<&SpProfile, &SpDecline>) {
+    fn route_name(route: dsp::WindowRoute) -> &'static str {
+        match route {
+            dsp::WindowRoute::Aggregate => "Aggregate F16",
+            dsp::WindowRoute::AggregateSymIu4 => "SymIu4",
+            dsp::WindowRoute::SlabIu4 => "SlabIu4",
+        }
+    }
     match decision {
+        Ok(sp) if sp.window_route != sp.base_route => tracing::info!(
+            mode = sp.mode.label(),
+            sp_max_rows = sp.sp_max_rows,
+            sp_route = sp.window_route.label(),
+            base_route = sp.base_route.label(),
+            "qwen4 SP: {} mode armed (SP windows use {}; others {})",
+            sp.mode.label(),
+            route_name(sp.window_route),
+            route_name(sp.base_route),
+        ),
         Ok(sp) => tracing::info!(
             mode = sp.mode.label(),
             sp_max_rows = sp.sp_max_rows,
@@ -1865,6 +1898,38 @@ pub(crate) fn sp_log_decision(decision: Result<&SpProfile, &SpDecline>) {
             "qwen4 SP: knob on but not armed: {decline}"
         ),
     }
+}
+
+/// The load-time dry run of the F16 `Aggregate` route on a symmetric-IU4 profile: the admitted
+/// tile's sealed call must be admitted as an F16 WMMA tile of an `Aggregate` window under the F16
+/// MoE scope (the scope the hybrid SP's windows run under). A profile that is already F16
+/// has nothing to prove.
+fn sp_f16_route_probe(
+    forward: &Qwen4GpuForward,
+    bundle: &Qwen4Bundle,
+    gpu: &mut Gpu,
+    profile: &SlowlinkProfile,
+) -> Result<(), String> {
+    if profile.geometry.route != dsp::WindowRoute::AggregateSymIu4 {
+        return Ok(());
+    }
+    let few_row_limit = few_row_limit_of(forward, gpu, profile.tile_rows);
+    let geo = RunGeo::new(forward, bundle, few_row_limit, profile.geometry.num_experts)
+        .map_err(|error| error.to_string())?;
+    let routing = tile_routing(forward, gpu, profile.tile_rows);
+    preflight_signatures_on(
+        forward,
+        bundle,
+        gpu,
+        &geo,
+        vec![(profile.tile_rows, routing)],
+        bundle.state.position,
+        profile,
+        PreflightRoute {
+            route: dsp::WindowRoute::Aggregate,
+            f16_moe: true,
+        },
+    )
 }
 
 /// [`sp_log_decision`] for a load whose S1 runtime itself was declined (SP rides on S1).
@@ -1920,7 +1985,23 @@ pub(crate) fn bind_at_load(
     };
     let sp_bind = if sp_knob {
         let pages = plan.spec.as_ref().map_or(0, |spec| spec.pages());
-        match sp_load_decision(&*forward, &*gpu, &profile, pages)? {
+        // The F16 `Aggregate` route dry run: only a hybrid SP on a symmetric-IU4 profile needs
+        // it (its windows run the F16 route); every other load is ready by construction.
+        let f16_route_ready = if hipfire_config::memory::qwen4_sp() {
+            match sp_f16_route_probe(&*forward, &*bundle, gpu, &profile) {
+                Ok(()) => true,
+                Err(why) => {
+                    tracing::info!(
+                        "qwen4 SP: the F16 Aggregate route does not admit the admitted tile on this \
+                         load: {why}"
+                    );
+                    false
+                }
+            }
+        } else {
+            true
+        };
+        match sp_load_decision(&*forward, &*gpu, &profile, pages, f16_route_ready)? {
             Ok(bind) => {
                 forward.slowlink.sp.decline = None;
                 sp_log_decision(Ok(&bind.profile()));
@@ -2620,6 +2701,7 @@ fn preflight_tiles(
     geo: &RunGeo,
     plan: &Qwen4PromptPlan,
     profile: &SlowlinkProfile,
+    window_routes: &[dsp::WindowRoute],
 ) -> Result<(), String> {
     let mut signatures = plan.signatures();
     // A window of one-row decode tiles only has no prefill tile to anchor the
@@ -2648,7 +2730,50 @@ fn preflight_tiles(
         signatures,
         plan.entry_pos,
         profile,
+    )?;
+    // The windows that run another route than the profile's (the hybrid SP's F16
+    // `Aggregate` windows on a symmetric-IU4 profile) are admitted for that route under the
+    // F16 MoE scope, the scope the run itself sets for them.
+    let mut override_signatures: Vec<(usize, TileRouting)> = Vec::new();
+    for (window, &route) in plan.windows.iter().zip(window_routes) {
+        if route == profile.geometry.route {
+            continue;
+        }
+        for tile in plan.window_tiles(window) {
+            let known = |(rows, routing): &(usize, TileRouting)| {
+                *rows == tile.rows
+                    && routing.route_rows == tile.routing.route_rows
+                    && routing.bf16_streams == tile.routing.bf16_streams
+            };
+            if !override_signatures.iter().any(known) {
+                override_signatures.push((tile.rows, tile.routing));
+            }
+        }
+    }
+    if override_signatures.is_empty() {
+        return Ok(());
+    }
+    preflight_signatures_on(
+        forward,
+        bundle,
+        gpu,
+        geo,
+        override_signatures,
+        plan.entry_pos,
+        profile,
+        PreflightRoute {
+            route: dsp::WindowRoute::Aggregate,
+            f16_moe: true,
+        },
     )
+}
+
+/// The window route a preflight admits its tiles for and whether the tile scope suppresses
+/// the symmetric IU4 MoE arm (a hybrid SP window on a symmetric-IU4 profile).
+#[derive(Clone, Copy)]
+struct PreflightRoute {
+    route: dsp::WindowRoute,
+    f16_moe: bool,
 }
 
 /// [`preflight_tiles`] over explicit launch signatures at `entry_pos`: the
@@ -2662,6 +2787,33 @@ fn preflight_signatures(
     signatures: Vec<(usize, TileRouting)>,
     entry_pos: usize,
     profile: &SlowlinkProfile,
+) -> Result<(), String> {
+    preflight_signatures_on(
+        forward,
+        bundle,
+        gpu,
+        geo,
+        signatures,
+        entry_pos,
+        profile,
+        PreflightRoute {
+            route: profile.geometry.route,
+            f16_moe: false,
+        },
+    )
+}
+
+/// [`preflight_signatures`] for an explicit window route and MoE scope.
+#[allow(clippy::too_many_arguments)]
+fn preflight_signatures_on(
+    forward: &Qwen4GpuForward,
+    bundle: &Qwen4Bundle,
+    gpu: &mut Gpu,
+    geo: &RunGeo,
+    signatures: Vec<(usize, TileRouting)>,
+    entry_pos: usize,
+    profile: &SlowlinkProfile,
+    on: PreflightRoute,
 ) -> Result<(), String> {
     let layer = geo
         .band
@@ -2688,6 +2840,7 @@ fn preflight_signatures(
             ends_at_cut: None,
             last_in_window: false,
         };
+        forward.slowlink.set_sp_f16_moe(on.f16_moe);
         let (scopes, _) = forward.enter_tile_scopes(gpu, rows);
         let result = with_tile_frame(
             forward,
@@ -2702,36 +2855,32 @@ fn preflight_signatures(
                     return Err(invalid("a host layer's FFN is not MoE"));
                 };
                 let sealed = frame.env.seal_moe(frame.ctx, *moe, frame.scratch_desc)?;
-                dsp::PreparedChunkCall::new(
-                    &*gpu,
-                    &sealed,
-                    0,
-                    stub.position,
-                    profile.geometry.route,
-                )
-                .map(|call| {
-                    (
-                        call.arm_signature(),
-                        call.is_k2(),
-                        call.window_route(),
-                        call.tile_kind(),
-                    )
-                })
-                .map_err(dsp_err("admission"))
+                dsp::PreparedChunkCall::new(&*gpu, &sealed, 0, stub.position, on.route)
+                    .map(|call| {
+                        (
+                            call.arm_signature(),
+                            call.is_k2(),
+                            call.window_route(),
+                            call.tile_kind(),
+                        )
+                    })
+                    .map_err(dsp_err("admission"))
             },
         );
         Qwen4GpuForward::leave_tile_scopes(gpu, scopes);
+        forward.slowlink.set_sp_f16_moe(false);
         let (arm, is_k2, route, kind) = result.map_err(|error| {
             format!(
                 "tile of {rows} rows (route rows {}): {error}",
                 routing.route_rows
             )
         })?;
-        if route != profile.geometry.route {
+        if route != on.route {
             return Err(format!(
                 "tile of {rows} rows (route rows {}): the sealed call's window route is \
-                 {route:?} but the admitted profile's census is for {:?}",
-                routing.route_rows, profile.geometry.route
+                 {route:?} but the window was admitted for {:?} (the profile's census is for \
+                 {:?})",
+                routing.route_rows, on.route, profile.geometry.route
             ));
         }
         // The plan counted this tile's rows toward its window's K1 / F32-tail
@@ -2756,7 +2905,7 @@ fn preflight_signatures(
     // prefill K1 call or the one-row decode call) keeps its own original arm as
     // a separate cohort, so it is compared on geometry alone and never refused
     // for its arm. One shared rule with the dispatch crate's prepare.
-    if !dsp::window_arms_compatible(profile.geometry.route, &arms) {
+    if !dsp::window_arms_compatible(on.route, &arms) {
         return Err(format!(
             "the plan's tiles seal incompatible dispatch arms (signature, K2): {arms:?}"
         ));
@@ -2894,7 +3043,13 @@ fn select(
     {
         return Err("the MTP pending backup was not bound at load".into());
     }
-    preflight_tiles(forward, bundle, gpu, &geo, &plan, &profile)?;
+    let window_routes = sp_window_routes(
+        profile.geometry.route,
+        sp.as_ref(),
+        &sp_verdicts,
+        plan.windows.len(),
+    );
+    preflight_tiles(forward, bundle, gpu, &geo, &plan, &profile, &window_routes)?;
     runtime_gate(
         forward.slowlink.runtime.is_some(),
         forward.slowlink.unavailable.as_deref(),
@@ -3175,6 +3330,7 @@ impl Run<'_, '_> {
     ) -> Qwen4GpuForwardError {
         let steps = progress.abort_steps();
         let mut extra: Vec<String> = Vec::new();
+        self.forward.slowlink.set_sp_f16_moe(false);
         if steps.drain_ring {
             if let Err(drain) = self.rt.ring.drain(&*self.gpu) {
                 extra.push(format!("ring drain failed: {drain}"));
@@ -3260,7 +3416,8 @@ impl Run<'_, '_> {
                 _ => geo.band.start,
             });
         if sp_on {
-            self.sp_begin_window(&mut routes, progress)?;
+            let f16_moe = self.window_route(w) != self.profile.geometry.route;
+            self.sp_begin_window(&mut routes, progress, f16_moe)?;
         } else if touched_on {
             self.touched_begin_window()?;
         } else if prime_after.is_none() {
@@ -3510,7 +3667,7 @@ impl Run<'_, '_> {
         routes: Option<&mut dsp::PromptRouteStorage>,
     ) -> R<Option<(usize, usize, usize, usize, usize)>> {
         let geo = self.geo;
-        let window_route = self.profile.geometry.route;
+        let window_route = self.window_route(w);
         let tile = &w.tiles[ti];
         let n = tile.rows;
         if geo.ple_layer == Some(layer) {
@@ -3617,7 +3774,7 @@ impl Run<'_, '_> {
         routes: &dsp::PromptRouteStorage,
     ) -> R<()> {
         let geo = self.geo;
-        let window_route = self.profile.geometry.route;
+        let window_route = self.window_route(w);
         let tile = &w.tiles[ti];
         self.gpu
             .set_router_row_base(if tile.rows > 1 { tile.position } else { 0 });
@@ -3959,6 +4116,14 @@ pub(crate) fn try_run_prompt(
         outcome
     };
     forward.slowlink.runtime = Some(runtime);
+    // The route each window ran (the hybrid SP's windows run the F16 route on a
+    // symmetric-IU4 profile): the receipt's per-window route and tile counts follow it.
+    let window_routes = sp_window_routes(
+        profile.geometry.route,
+        forward.slowlink.sp.admitted.as_ref(),
+        &sp_verdicts,
+        plan.windows.len(),
+    );
     // The `sp` receipt object exists only with the knob on: with it off nothing
     // is built, so the request allocates and reports exactly what it did.
     let sp_receipt = forward
@@ -3976,6 +4141,7 @@ pub(crate) fn try_run_prompt(
                 .iter()
                 .map(|window| SpWindowEntry {
                     rows: window.rows,
+                    route: window_routes[window.index],
                     verdict: sp_verdicts.get(window.index).copied().unwrap_or(Ok(())),
                     report: sp_reports
                         .iter()
@@ -3990,6 +4156,7 @@ pub(crate) fn try_run_prompt(
                     tracing::debug!(
                         window = window.index,
                         rows = entry.rows,
+                        route = entry.route.label(),
                         engaged,
                         layers = entry.report.layers,
                         streamed_experts = entry.report.streamed_experts,
@@ -4025,7 +4192,15 @@ pub(crate) fn try_run_prompt(
         final_verified: forward.sym_iu4_coverage(),
         a4_sidecar_bytes: profile.census.a4_sidecars,
         window_rows: profile.window_rows,
-        tiles: moe_iu4_tile_counts(profile.geometry.route, &plan.tiles, geo.few_row_limit),
+        tiles: plan.windows.iter().zip(&window_routes).fold(
+            [0u64; 5],
+            |mut total, (window, &route)| {
+                let counts =
+                    moe_iu4_tile_counts(route, plan.window_tiles(window), geo.few_row_limit);
+                total.iter_mut().zip(counts).for_each(|(sum, n)| *sum += n);
+                total
+            },
+        ),
     });
     let receipt = |status: String| {
         let mut value = layer_major_receipt(&ReceiptInputs {

@@ -158,6 +158,24 @@ impl SpMode {
     }
 }
 
+/// The window route one window runs: the armed hybrid SP's route
+/// ([`SpProfile::window_route`]) when SP runs the window (`sp_ok`: its pre-mutation
+/// verdict qualified it), else the S1 profile's own `base` route. Touched-only never changes a
+/// window's route, and with SP not armed every window keeps `base`.
+pub fn sp_window_route(base: WindowRoute, sp: Option<&SpProfile>, sp_ok: bool) -> WindowRoute {
+    match sp {
+        Some(sp) if sp_ok && sp.mode == SpMode::Hybrid => sp.window_route,
+        _ => base,
+    }
+}
+
+/// The Gpu `qwen4_append_f16_moe_scope` of a tile scope: the agent-turn append route's own
+/// request, or a hybrid SP window running the F16 route on a symmetric-IU4 profile. Either
+/// one suppresses the symmetric IU4 MoE arm for that scope only.
+pub fn f16_moe_scope(append: bool, sp_f16_window: bool) -> bool {
+    append || sp_f16_window
+}
+
 /// The mode the knobs ask for, decided before admission and before the first
 /// window (pure truth table):
 ///
@@ -201,6 +219,13 @@ pub struct SpLoadFacts<'a> {
     pub force_all: bool,
     /// Pages of the S1 ring (a touched-only layer enqueues all its groups at once).
     pub pages: usize,
+    /// Everything the F16 `Aggregate` window route needs is present on a load whose S1
+    /// profile route is [`WindowRoute::AggregateSymIu4`]: the F16 WMMA grouped arm admits the
+    /// admitted tile's sealed call (the load-time dry run, [`WindowRoute::Aggregate`]-scoped)
+    /// and the F16 SP row layout fits the route region the profile charged. Read by the
+    /// hybrid mode on a symmetric-IU4 profile only; `true` is the caller's claim, not a
+    /// default.
+    pub f16_route_ready: bool,
     /// Rows of the admitted S1 window: the touched-only mode runs the S1 route
     /// layout, so its row cap is this, not the SP-layout fit.
     pub window_rows: usize,
@@ -233,6 +258,13 @@ pub struct SpLoadFacts<'a> {
 pub struct SpProfile {
     /// The armed mode.
     pub mode: SpMode,
+    /// The window route of the S1 profile (what every non-SP window runs).
+    pub base_route: WindowRoute,
+    /// The window route the SP-qualified windows run: the hybrid mode runs the F16
+    /// `Aggregate` route (its K2-ized tails and row table are designed for it), so on a
+    /// symmetric-IU4 profile it differs from [`Self::base_route`]; touched-only runs S1's own
+    /// route, always `base_route`.
+    pub window_route: WindowRoute,
     /// `min(SP_MAX_ROWS, region fit)` (hybrid); `min(SP_MAX_ROWS, S1 window
     /// rows)` (touched-only).
     pub sp_max_rows: usize,
@@ -272,6 +304,10 @@ pub enum SpDecline {
     /// The ring has fewer pages than the groups of a layer that touches every
     /// expert (touched-only enqueues a layer's groups all at once).
     Pages { pages: usize, need: usize },
+    /// The hybrid mode needs the F16 `Aggregate` window route on a symmetric-IU4 profile and
+    /// something it needs is absent (the F16 arm does not admit the tile, or the SP layout
+    /// does not fit the route region).
+    F16Route { route: WindowRoute },
 }
 
 impl SpDecline {
@@ -289,6 +325,7 @@ impl SpDecline {
             Self::PinnedFit { .. } => "pinned fit",
             Self::PrefixCache => "prefix cache",
             Self::Pages { .. } => "pages",
+            Self::F16Route { .. } => "f16 route",
         }
     }
 }
@@ -305,9 +342,9 @@ impl fmt::Display for SpDecline {
             Self::Route { route, mode } => match mode {
                 SpMode::Hybrid => write!(
                     f,
-                    " ({route:?}; the hybrid mode serves only {:?}; \
-                     HIPFIRE_QWEN4_MOE_SYM_IU4=0 selects it)",
-                    WindowRoute::Aggregate
+                    " ({route:?}; the hybrid mode serves {:?} and {:?})",
+                    WindowRoute::Aggregate,
+                    WindowRoute::AggregateSymIu4
                 ),
                 SpMode::TouchedOnly => write!(
                     f,
@@ -336,6 +373,13 @@ impl fmt::Display for SpDecline {
                 None => write!(f, " (the SP pinned bytes overflow; budget {budget})"),
             },
             Self::PrefixCache => write!(f, " (serve.prefix_cache is on)"),
+            Self::F16Route { route } => write!(
+                f,
+                " (the hybrid mode runs SP windows on {:?} but the {route:?} profile cannot host \
+                 it: the F16 WMMA arm or the SP layout in the charged route region is missing; \
+                 HIPFIRE_QWEN4_MOE_SYM_IU4=0 loads the F16 route instead)",
+                WindowRoute::Aggregate
+            ),
             Self::Pages { pages, need } => write!(
                 f,
                 " (the ring has {pages} pages; a layer touching every expert needs {need})"
@@ -348,8 +392,9 @@ impl fmt::Display for SpDecline {
 /// rule is the sticky reason. Pure.
 ///
 /// The knobs pick the mode ([`sp_mode_for`]). Both modes need an admitted S1
-/// profile, gfx1100, the `Aggregate` window route and at least
-/// [`SP_MIN_REGION_ROWS`] rows. The hybrid mode also needs 512 experts, CPU
+/// profile, gfx1100, an aggregate window route (the hybrid mode on a symmetric-IU4 profile
+/// additionally needs [`SpLoadFacts::f16_route_ready`]: its windows run the F16 `Aggregate`
+/// route) and at least [`SP_MIN_REGION_ROWS`] rows. The hybrid mode also needs 512 experts, CPU
 /// quants, the splice pool, the pinned-host fit and `serve.prefix_cache` off.
 /// The touched-only mode needs none of those (it runs no CPU arithmetic, binds
 /// no owner and leaves the numerics of S1 untouched); it needs the ring to hold
@@ -366,26 +411,27 @@ pub(crate) fn admit_sp(facts: &SpLoadFacts<'_>) -> Result<SpProfile, SpDecline> 
             arch: facts.arch.to_string(),
         });
     }
-    // The hybrid mode K2-izes the F32-tail tiles of the F16 route and carries its own row
-    // table; it serves `Aggregate` only. Touched-only runs S1's own panel pipeline, which
-    // serves every aggregate lowering the incumbent does: the F16 route and, since the
-    // gfx1100 default turned the symmetric IU4 route on, `AggregateSymIu4`.
-    let served = match mode {
-        SpMode::Hybrid => route == WindowRoute::Aggregate,
-        SpMode::TouchedOnly => {
-            matches!(route, WindowRoute::Aggregate | WindowRoute::AggregateSymIu4)
+    // Touched-only runs S1's own panel pipeline, which serves every aggregate lowering the
+    // incumbent does: the F16 route and the symmetric IU4 route (the gfx1100 default). The
+    // hybrid mode K2-izes F32-tail tiles and carries its own row table, which are designed
+    // for the F16 `Aggregate` route: on a symmetric-IU4 profile its windows run that route
+    // (a per-window override) when everything it needs is present.
+    match (mode, route) {
+        (_, WindowRoute::Aggregate) => {}
+        (SpMode::TouchedOnly, WindowRoute::AggregateSymIu4) => {}
+        (SpMode::Hybrid, WindowRoute::AggregateSymIu4) if facts.f16_route_ready => {}
+        (SpMode::Hybrid, WindowRoute::AggregateSymIu4) => {
+            return Err(SpDecline::F16Route { route });
         }
-    };
-    if !served {
-        return Err(SpDecline::Route { route, mode });
+        _ => return Err(SpDecline::Route { route, mode }),
     }
     match mode {
-        SpMode::Hybrid => admit_hybrid(facts),
-        SpMode::TouchedOnly => admit_touched_only(facts),
+        SpMode::Hybrid => admit_hybrid(facts, route),
+        SpMode::TouchedOnly => admit_touched_only(facts, route),
     }
 }
 
-fn admit_hybrid(facts: &SpLoadFacts<'_>) -> Result<SpProfile, SpDecline> {
+fn admit_hybrid(facts: &SpLoadFacts<'_>, base_route: WindowRoute) -> Result<SpProfile, SpDecline> {
     if facts.n_exp != SP_N_EXPERTS {
         return Err(SpDecline::ExpertCount { n_exp: facts.n_exp });
     }
@@ -414,6 +460,8 @@ fn admit_hybrid(facts: &SpLoadFacts<'_>) -> Result<SpProfile, SpDecline> {
             }
             Ok(SpProfile {
                 mode: SpMode::Hybrid,
+                base_route,
+                window_route: WindowRoute::Aggregate,
                 sp_max_rows,
                 s_cap: sp_max_rows * SP_S_CAP_FACTOR,
                 workers,
@@ -430,7 +478,10 @@ fn admit_hybrid(facts: &SpLoadFacts<'_>) -> Result<SpProfile, SpDecline> {
 /// Experts one S1 transport group (ring page) holds.
 const TOUCHED_EXPERTS_PER_PAGE: usize = 32;
 
-fn admit_touched_only(facts: &SpLoadFacts<'_>) -> Result<SpProfile, SpDecline> {
+fn admit_touched_only(
+    facts: &SpLoadFacts<'_>,
+    base_route: WindowRoute,
+) -> Result<SpProfile, SpDecline> {
     if facts.window_rows < SP_MIN_REGION_ROWS {
         return Err(SpDecline::RegionFit {
             fit_rows: facts.window_rows,
@@ -446,6 +497,8 @@ fn admit_touched_only(facts: &SpLoadFacts<'_>) -> Result<SpProfile, SpDecline> {
     }
     Ok(SpProfile {
         mode: SpMode::TouchedOnly,
+        base_route,
+        window_route: base_route,
         sp_max_rows: SP_MAX_ROWS.min(facts.window_rows),
         s_cap: 0,
         workers: 0,
@@ -1051,6 +1104,7 @@ mod tests {
             touched_knob: false,
             force_all: false,
             pages: 18,
+            f16_route_ready: true,
             window_rows: 16_896,
             s1_route: Some(WindowRoute::Aggregate),
             arch: "gfx1100",
@@ -1125,14 +1179,14 @@ mod tests {
                 },
             ),
             (
-                "route sym iu4",
+                "route sym iu4, no F16 route",
                 SpLoadFacts {
                     s1_route: Some(WindowRoute::AggregateSymIu4),
+                    f16_route_ready: false,
                     ..facts()
                 },
-                SpDecline::Route {
+                SpDecline::F16Route {
                     route: WindowRoute::AggregateSymIu4,
-                    mode: SpMode::Hybrid,
                 },
             ),
             (
@@ -1326,6 +1380,8 @@ mod tests {
             ok,
             SpProfile {
                 mode: SpMode::TouchedOnly,
+                base_route: WindowRoute::Aggregate,
+                window_route: WindowRoute::Aggregate,
                 sp_max_rows: SP_MAX_ROWS,
                 s_cap: 0,
                 workers: 0,
@@ -1431,18 +1487,20 @@ mod tests {
     /// Regression (card job vt): on the gfx1100 default the S1 window route is the symmetric
     /// IU4 aggregate (`A4 sidecars` in the load line). Touched-only admission demanded the F16
     /// `Aggregate` route, declined `sp: route` silently, and the request ran stream-all S1.
-    /// Touched-only runs S1's own pipeline and now serves both aggregate routes; the hybrid
-    /// mode (K2-ized F16 tails, its own row table) still declines the IU4 route by name, and the
-    /// decline text names the kill switch that selects the F16 route.
+    /// Touched-only runs S1's own pipeline and serves both aggregate routes; the hybrid mode
+    /// runs its windows on the F16 route (a per-window override) when the profile can host it
+    /// and otherwise declines by name.
     #[test]
-    fn touched_only_is_armed_on_the_default_sym_iu4_route_and_hybrid_declines_it_by_name() {
+    fn both_modes_arm_on_the_default_sym_iu4_route_and_the_hybrid_declines_by_name() {
         for route in [WindowRoute::Aggregate, WindowRoute::AggregateSymIu4] {
-            let profile = admit_sp(&SpLoadFacts {
+            let touched = admit_sp(&SpLoadFacts {
                 s1_route: Some(route),
                 ..touched_facts()
             })
             .unwrap_or_else(|d| panic!("{route:?}: {d}"));
-            assert_eq!(profile.mode, SpMode::TouchedOnly, "{route:?}");
+            assert_eq!(touched.mode, SpMode::TouchedOnly, "{route:?}");
+            // Touched-only never overrides a window's route.
+            assert_eq!((touched.base_route, touched.window_route), (route, route));
             // The forced placement k = U reaches the same mode on the same route.
             let forced = admit_sp(&SpLoadFacts {
                 s1_route: Some(route),
@@ -1451,18 +1509,87 @@ mod tests {
             })
             .unwrap();
             assert_eq!(forced.mode, SpMode::TouchedOnly, "{route:?}");
+            // The hybrid mode always runs its windows on the F16 route.
+            let hybrid = admit_sp(&SpLoadFacts {
+                s1_route: Some(route),
+                ..facts()
+            })
+            .unwrap_or_else(|d| panic!("{route:?}: {d}"));
+            assert_eq!(hybrid.mode, SpMode::Hybrid, "{route:?}");
+            assert_eq!(hybrid.base_route, route);
+            assert_eq!(hybrid.window_route, WindowRoute::Aggregate);
         }
+        // Everything the F16 route needs missing on the symmetric profile: a named decline.
         let declined = admit_sp(&SpLoadFacts {
             s1_route: Some(WindowRoute::AggregateSymIu4),
+            f16_route_ready: false,
             ..facts()
         })
         .unwrap_err();
-        assert_eq!(declined.label(), "route");
+        assert_eq!(declined.label(), "f16 route");
         let text = declined.to_string();
         assert!(
-            text.contains("AggregateSymIu4") && text.contains("HIPFIRE_QWEN4_MOE_SYM_IU4=0"),
+            text.starts_with("sp: f16 route")
+                && text.contains("AggregateSymIu4")
+                && text.contains("HIPFIRE_QWEN4_MOE_SYM_IU4=0"),
             "{text}"
         );
+        // The readiness fact is irrelevant on the F16 profile and to touched-only.
+        assert!(admit_sp(&SpLoadFacts {
+            f16_route_ready: false,
+            ..facts()
+        })
+        .is_ok());
+        assert!(admit_sp(&SpLoadFacts {
+            s1_route: Some(WindowRoute::AggregateSymIu4),
+            f16_route_ready: false,
+            ..touched_facts()
+        })
+        .is_ok());
+        // The slab route is neither mode's.
+        for knobs in [facts(), touched_facts()] {
+            assert_eq!(
+                admit_sp(&SpLoadFacts {
+                    s1_route: Some(WindowRoute::SlabIu4),
+                    ..knobs
+                })
+                .unwrap_err()
+                .label(),
+                "route"
+            );
+        }
+    }
+
+    #[test]
+    fn per_window_route_is_the_sp_route_for_sp_windows_only() {
+        let sym = WindowRoute::AggregateSymIu4;
+        let f16 = WindowRoute::Aggregate;
+        let hybrid = admit_sp(&SpLoadFacts {
+            s1_route: Some(sym),
+            ..facts()
+        })
+        .unwrap();
+        let touched = admit_sp(&SpLoadFacts {
+            s1_route: Some(sym),
+            ..touched_facts()
+        })
+        .unwrap();
+        // (profile route, SP profile, window qualified) -> window route
+        assert_eq!(sp_window_route(sym, Some(&hybrid), true), f16);
+        assert_eq!(sp_window_route(sym, Some(&hybrid), false), sym);
+        assert_eq!(sp_window_route(sym, None, true), sym);
+        assert_eq!(sp_window_route(sym, Some(&touched), true), sym);
+        assert_eq!(sp_window_route(f16, Some(&hybrid), true), f16);
+        assert_eq!(sp_window_route(f16, None, false), f16);
+        // The F16 MoE scope: the append route's or a hybrid SP window's, nothing else.
+        for (append, window, want) in [
+            (false, false, false),
+            (true, false, true),
+            (false, true, true),
+            (true, true, true),
+        ] {
+            assert_eq!(f16_moe_scope(append, window), want);
+        }
     }
 
     #[test]
