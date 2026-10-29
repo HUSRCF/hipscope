@@ -2836,23 +2836,23 @@ fn run_command(paths: &Paths, args: RunArgs) -> Result<()> {
         Some(&model_path),
     )?;
     engine.ping()?;
-    let mut params = load_params(
+    let mut params = load_params_with_overrides(
         &resolved,
         entry,
         &paths.models,
         &model_path,
         max_tokens,
-        args.kv_mode.as_deref(),
-        args.kv_backend.as_deref(),
         canonical.as_deref(),
-        args.model_draft.is_some(),
-        args.head.as_deref(),
+        &LoadOverrides {
+            kv_mode: args.kv_mode.as_deref(),
+            kv_backend: args.kv_backend.as_deref(),
+            kv_k: args.kv_k.as_deref(),
+            kv_v: args.kv_v.as_deref(),
+            speculation: args.speculation.as_deref(),
+            head: args.head.as_deref(),
+            explicit_draft: args.model_draft.is_some(),
+        },
     )?;
-    apply_kv_axis_overrides(&mut params, args.kv_k.as_deref(), args.kv_v.as_deref())?;
-    let selector = args
-        .speculation
-        .clone()
-        .unwrap_or(config_string(&resolved, "speculation.mode")?);
     // Tensor-parallel load: forward `tp` like `bench --tp` / `serve --tp` so the
     // daemon takes the EP/dense-TP route instead of the single-GPU one.
     if let Some(tp) = args.tp.filter(|&tp| tp > 1) {
@@ -2862,10 +2862,6 @@ fn run_command(paths: &Paths, args: RunArgs) -> Result<()> {
     if let Some(max_seq) = args.max_seq {
         params["max_seq"] = serde_json::json!(max_seq);
     }
-    apply_speculation_selector(&mut params, &selector)?;
-    // Final effective selector wins: re-project inherited draft only when DFlash
-    // remains enabled (config-off + `run --spec dflash` must still carry draft).
-    project_dflash_draft(&mut params, developer_dflash_draft(&resolved));
     if let Some(draft) = &args.model_draft {
         params["draft"] = serde_json::json!(draft.display().to_string());
         if args.speculation.is_none() {
@@ -5076,6 +5072,70 @@ pub(crate) fn load_params(
     Ok(params)
 }
 
+/// One-shot per-load overrides layered over the resolved config: the flags
+/// `hipfire run` and `hipfire fit` share, so a dry-run admission and a real
+/// load build their params through one sequence.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct LoadOverrides<'a> {
+    pub kv_mode: Option<&'a str>,
+    pub kv_backend: Option<&'a str>,
+    pub kv_k: Option<&'a str>,
+    pub kv_v: Option<&'a str>,
+    /// `--spec`; absent means the resolved `speculation.mode`.
+    pub speculation: Option<&'a str>,
+    pub head: Option<&'a str>,
+    /// A CLI `--model-draft` will be projected by the caller.
+    pub explicit_draft: bool,
+}
+
+/// The speculation selector one load applies: the one-shot `--spec` value,
+/// else the resolved `speculation.mode`.
+pub(crate) fn effective_speculation_selector(
+    resolved: &hipfire_config::ResolvedConfig,
+    speculation: Option<&str>,
+) -> Result<String> {
+    match speculation {
+        Some(selector) => Ok(selector.to_owned()),
+        None => config_string(resolved, "speculation.mode"),
+    }
+}
+
+/// `load_params` plus the one-shot overrides `hipfire run` applies before it
+/// hands the params to the daemon: `--kv-k`/`--kv-v` axes, the effective
+/// speculation selector, and the DFlash draft projection that selector
+/// leaves enabled (config-off + `--spec dflash` must still carry the draft).
+/// Registry sidecar resolution for the final selector stays with the caller
+/// ([`resolve_dflash_sidecar`], [`resolve_mtp_sidecar`]).
+pub(crate) fn load_params_with_overrides(
+    resolved: &hipfire_config::ResolvedConfig,
+    entry: Option<&ModelEntry>,
+    models_dir: &Path,
+    model_path: &Path,
+    max_tokens: u64,
+    tag: Option<&str>,
+    overrides: &LoadOverrides<'_>,
+) -> Result<serde_json::Value> {
+    let mut params = load_params(
+        resolved,
+        entry,
+        models_dir,
+        model_path,
+        max_tokens,
+        overrides.kv_mode,
+        overrides.kv_backend,
+        tag,
+        overrides.explicit_draft,
+        overrides.head,
+    )?;
+    apply_kv_axis_overrides(&mut params, overrides.kv_k, overrides.kv_v)?;
+    let selector = effective_speculation_selector(resolved, overrides.speculation)?;
+    apply_speculation_selector(&mut params, &selector)?;
+    // Final effective selector wins: re-project inherited draft only when DFlash
+    // remains enabled.
+    project_dflash_draft(&mut params, developer_dflash_draft(resolved));
+    Ok(params)
+}
+
 /// Load params for the non-chat `embed` verb.
 ///
 /// The encoder consumes the vision ladder and an authored sequence bound;
@@ -5138,15 +5198,63 @@ pub(crate) fn resolve_dflash_sidecar(
     model_path: &Path,
     tag: Option<&str>,
 ) -> Result<()> {
+    match locate_dflash_sidecar(params, entry, models_dir, model_path)? {
+        DflashSidecar::Unresolved => {}
+        DflashSidecar::Found(candidate) => {
+            params["draft"] = serde_json::json!(candidate.display().to_string());
+        }
+        DflashSidecar::NotPulled(file) => {
+            if params["dflash_mode"].as_str() == Some("on") {
+                bail!(dflash_draft_not_pulled(&file, tag));
+            }
+            eprintln!(
+                "[hipfire] DFlash draft {file} not pulled; no paired draft, speculation falls back — `hipfire pull {}`",
+                tag.unwrap_or("<model>")
+            );
+        }
+    }
+    Ok(())
+}
+
+/// What [`locate_dflash_sidecar`] found for the final DFlash mode.
+pub(crate) enum DflashSidecar {
+    /// Nothing to wire: the final mode is `off`, a draft is already
+    /// projected, or the artifact declares no sidecar under `auto`.
+    Unresolved,
+    /// The declared sidecar is on disk.
+    Found(PathBuf),
+    /// The registry declares this sidecar file but it is not pulled.
+    NotPulled(String),
+}
+
+/// The `on`-mode refusal for a declared DFlash draft that is not pulled, worded
+/// once for the load and for `hipfire fit`.
+pub(crate) fn dflash_draft_not_pulled(file: &str, tag: Option<&str>) -> String {
+    format!(
+        "DFlash draft {file} is not pulled; run `hipfire pull {}` or set developer.dflash_draft",
+        tag.unwrap_or("<model>")
+    )
+}
+
+/// The lookup half of [`resolve_dflash_sidecar`], with no side effects: where
+/// the registry DFlash draft is (or that it is declared but not pulled) for
+/// the params' final `dflash_mode`. Errs exactly where the load refuses a
+/// DFlash `on` that has no declared draft at all.
+pub(crate) fn locate_dflash_sidecar(
+    params: &serde_json::Value,
+    entry: Option<&ModelEntry>,
+    models_dir: &Path,
+    model_path: &Path,
+) -> Result<DflashSidecar> {
     if !matches!(params["dflash_mode"].as_str(), Some("auto" | "on")) {
-        return Ok(());
+        return Ok(DflashSidecar::Unresolved);
     }
     if params
         .get("draft")
         .and_then(serde_json::Value::as_str)
         .is_some_and(|draft| !draft.is_empty())
     {
-        return Ok(());
+        return Ok(DflashSidecar::Unresolved);
     }
     let Some(sidecar) = entry.and_then(|entry| entry.dflash.as_ref()) else {
         if params["dflash_mode"].as_str() == Some("on") && model_path.is_file() {
@@ -5155,7 +5263,7 @@ pub(crate) fn resolve_dflash_sidecar(
                 model_path.display()
             );
         }
-        return Ok(());
+        return Ok(DflashSidecar::Unresolved);
     };
     let beside_target: Vec<PathBuf> = trunk_locations(model_path)
         .iter()
@@ -5170,22 +5278,10 @@ pub(crate) fn resolve_dflash_sidecar(
         .chain(beside_target.iter().map(PathBuf::as_path))
         .map(|dir| dir.join(&sidecar.file))
         .find(|candidate| candidate.is_file());
-    if let Some(candidate) = candidate {
-        params["draft"] = serde_json::json!(candidate.display().to_string());
-        return Ok(());
-    }
-    let tag = tag.unwrap_or("<model>");
-    if params["dflash_mode"].as_str() == Some("on") {
-        bail!(
-            "DFlash draft {} is not pulled; run `hipfire pull {tag}` or set developer.dflash_draft",
-            sidecar.file
-        );
-    }
-    eprintln!(
-        "[hipfire] DFlash draft {} not pulled; no paired draft, speculation falls back — `hipfire pull {tag}`",
-        sidecar.file
-    );
-    Ok(())
+    Ok(match candidate {
+        Some(candidate) => DflashSidecar::Found(candidate),
+        None => DflashSidecar::NotPulled(sidecar.file.clone()),
+    })
 }
 
 /// Resolve the Qwen MTP head sidecar into `params["mtp"]`.

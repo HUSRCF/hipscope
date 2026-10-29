@@ -27,6 +27,11 @@ use std::io::Write as _;
 use std::path::Path;
 use types::{gib, Finding, FitDevice, FitHost, PlacementPlan, Verdict};
 
+/// `plan.basis` in the JSON report.
+const PLAN_BASIS: &str = "pre-load";
+/// The text plan's `basis` line: what its numbers are, and what the load adds.
+const PLAN_BASIS_TEXT: &str = "pre-load estimate from file headers + sysfs; the load re-measures free VRAM after weights, drafts and scratch (max_seq fit) and may admit less";
+
 #[derive(Args, Debug)]
 pub(crate) struct FitArgs {
     /// Installed model, alias, file, path, or registry tag.
@@ -43,6 +48,72 @@ pub(crate) struct FitArgs {
     /// Also print the source-cited derivation lines (always in --json).
     #[arg(short = 'v', long)]
     pub verbose: bool,
+    /// One-shot KV format for this load, validated as `run --kv-mode` does.
+    #[arg(long)]
+    pub kv_mode: Option<String>,
+    /// Qwen-only K-format override (same values as `run --kv-k`).
+    #[arg(long = "kv-k")]
+    pub kv_k: Option<String>,
+    /// Qwen-only V-format override (same values as `run --kv-v`).
+    #[arg(long = "kv-v")]
+    pub kv_v: Option<String>,
+    /// Speculation selector for this load, as `run --spec`: off, auto, ngram,
+    /// dflash, mtp, or dspark. Overrides `speculation.mode`.
+    #[arg(
+        long = "spec",
+        alias = "speculation",
+        value_parser = ["off", "auto", "ngram", "dflash", "mtp", "dspark"]
+    )]
+    pub spec: Option<String>,
+}
+
+impl FitArgs {
+    /// The same one-shot overrides `hipfire run` layers over the config.
+    fn load_overrides(&self) -> crate::LoadOverrides<'_> {
+        crate::LoadOverrides {
+            kv_mode: self.kv_mode.as_deref(),
+            kv_k: self.kv_k.as_deref(),
+            kv_v: self.kv_v.as_deref(),
+            speculation: self.spec.as_deref(),
+            ..Default::default()
+        }
+    }
+}
+
+/// The one-shot overrides this fit applied, echoed in the report (`null` =
+/// not set, the config decides).
+#[derive(Serialize)]
+struct OverridesEcho {
+    kv_mode: Option<String>,
+    kv_k: Option<String>,
+    kv_v: Option<String>,
+    spec: Option<String>,
+}
+
+impl From<&FitArgs> for OverridesEcho {
+    fn from(args: &FitArgs) -> Self {
+        Self {
+            kv_mode: args.kv_mode.clone(),
+            kv_k: args.kv_k.clone(),
+            kv_v: args.kv_v.clone(),
+            spec: args.spec.clone(),
+        }
+    }
+}
+
+impl OverridesEcho {
+    /// The flags as `hipfire run` would take them, each led by a space.
+    fn flags(&self) -> String {
+        [
+            ("--kv-mode", &self.kv_mode),
+            ("--kv-k", &self.kv_k),
+            ("--kv-v", &self.kv_v),
+            ("--spec", &self.spec),
+        ]
+        .iter()
+        .filter_map(|(flag, value)| value.as_deref().map(|value| format!(" {flag} {value}")))
+        .collect()
+    }
 }
 
 fn parse_context(raw: &str) -> std::result::Result<usize, String> {
@@ -72,6 +143,9 @@ struct Route {
 
 #[derive(Serialize)]
 struct Plan {
+    /// Where the plan's numbers come from: `pre-load` (file headers and
+    /// sysfs; the load re-measures before it admits).
+    basis: &'static str,
     device_index: usize,
     topology: String,
     kv_backend: String,
@@ -83,6 +157,9 @@ struct Plan {
     projection: Option<Value>,
     placement: PlacementPlan,
     decode_route: String,
+    /// Why the load takes that route (the setting that selected it, or the
+    /// one that kept AR).
+    decode_reason: String,
     routes: Vec<Route>,
 }
 
@@ -99,6 +176,8 @@ struct Report {
     schema: &'static str,
     hipfire: Value,
     input: String,
+    /// The one-shot load overrides this report was computed with.
+    overrides: OverridesEcho,
     model: ModelInfo,
     machine: FitHost,
     plan: Option<Plan>,
@@ -208,14 +287,7 @@ pub(crate) fn fit_command(paths: &crate::Paths, args: FitArgs) -> Result<()> {
         ));
     }
     supply_visible_device_count(process, &machine);
-    let analysis = analyze_model(
-        paths,
-        registry,
-        &args.model,
-        args.ctx,
-        args.no_fetch,
-        &machine,
-    )?;
+    let analysis = analyze_model(paths, registry, &args.model, &args, &machine)?;
     let mut tiers = Vec::new();
     let family = crate::pull_select::family_tiers(registry, &analysis.model.tag);
     // Every other tier runs the same admission concurrently: each one walks its
@@ -229,10 +301,9 @@ pub(crate) fn fit_command(paths: &crate::Paths, args: FitArgs) -> Result<()> {
                 .map(|tier| {
                     let tag = tier.tag;
                     let machine = &machine;
+                    let args = &args;
                     (tag != analysis.model.tag).then(|| {
-                        scope.spawn(move || {
-                            analyze_model(paths, registry, tag, args.ctx, args.no_fetch, machine)
-                        })
+                        scope.spawn(move || analyze_model(paths, registry, tag, args, machine))
                     })
                 })
                 .collect();
@@ -328,6 +399,7 @@ pub(crate) fn fit_command(paths: &crate::Paths, args: FitArgs) -> Result<()> {
         schema: "hipfire-fit-1",
         hipfire: json!({"version": env!("HIPFIRE_BUILD_VERSION"), "commit": crate::BUILD_COMMIT}),
         input: safe_name(&args.model),
+        overrides: OverridesEcho::from(&args),
         model: analysis.model,
         machine,
         plan: analysis.plan,
@@ -381,8 +453,7 @@ fn analyze_model(
     paths: &crate::Paths,
     registry: &RegistryV1,
     input: &str,
-    ctx: Option<usize>,
-    no_fetch: bool,
+    args: &FitArgs,
     machine: &FitHost,
 ) -> Result<Analysis> {
     let card = crate::model_card(paths, registry, input);
@@ -415,7 +486,7 @@ fn analyze_model(
         Some(path) => path,
         None => {
             let entry = entry.expect("registry entry checked above");
-            if no_fetch {
+            if args.no_fetch {
                 result.findings.push(missing_header(
                     tag,
                     "not installed; fit needs the model header",
@@ -446,8 +517,12 @@ fn analyze_model(
         .ok()
         .map(|m| m.len())
         .or(result.model.size_bytes);
-    let params = match model_params(paths, input, Some(tag), entry, &path, ctx) {
-        Ok(params) => params,
+    let FitLoad {
+        params,
+        selector,
+        draft_missing,
+    } = match model_params(paths, input, Some(tag), entry, &path, args) {
+        Ok(load) => load,
         Err(error) => {
             let detail = error.to_string();
             result
@@ -456,6 +531,9 @@ fn analyze_model(
             return Ok(result);
         }
     };
+    if let Some(missing) = &draft_missing {
+        report_missing_draft(&mut result, &params, tag, missing);
+    }
     let Some(device) = machine.devices.first() else {
         return Ok(result);
     };
@@ -480,7 +558,21 @@ fn analyze_model(
         .as_ref()
         .map(|s| s.model_ctx)
         .or_else(|| source_context(&admitted.source));
+    let decode = decode_plan(
+        &params,
+        &DecodeFacts {
+            selector: &selector,
+            from_flag: args.spec.is_some(),
+            // The carrier's own declaration. Unknown across ranks: the load
+            // attaches MTP there only on an explicit request.
+            mtp_measured_ar_floor: matches!(admitted.topology, EffectiveTopology::Single)
+                .then(|| admitted.carrier.map(|c| c.mtp_measured_ar_floor()))
+                .flatten(),
+            draft_missing: draft_missing.as_ref(),
+        },
+    );
     let mut plan = Plan {
+        basis: PLAN_BASIS,
         device_index: device.index,
         topology: topology_key(admitted.topology),
         kv_backend: admitted.kv_backend.as_str().into(),
@@ -517,7 +609,8 @@ fn analyze_model(
             host_mapped_bytes: Some(0),
             decided_at_load: false,
         },
-        decode_route: decode_route(&params),
+        decode_route: decode.route,
+        decode_reason: decode.reason,
         routes: link_routes(device),
     };
     match admitted.topology {
@@ -630,30 +723,63 @@ fn missing_header(tag: &str, detail: &str) -> Finding {
     )
 }
 
+/// The load parameters fit admits, plus what only fit explains.
+struct FitLoad {
+    params: Value,
+    /// The effective speculation selector: `--spec`, else `speculation.mode`.
+    selector: String,
+    /// A registry DFlash draft the final mode wants that is not installed.
+    draft_missing: Option<MissingDraft>,
+}
+
+struct MissingDraft {
+    file: String,
+    /// The registry's size for the draft; fit never fetches it.
+    size_bytes: Option<u64>,
+}
+
 fn model_params(
     paths: &crate::Paths,
     input: &str,
     tag: Option<&str>,
     entry: Option<&ModelEntry>,
     path: &Path,
-    ctx: Option<usize>,
-) -> Result<Value> {
+    args: &FitArgs,
+) -> Result<FitLoad> {
     let resolved = crate::resolved_for_model(paths, input, tag, entry)?;
-    let mut params = crate::load_params(
+    let overrides = args.load_overrides();
+    // The one sequence `hipfire run` builds its params with: config, `--kv-mode`,
+    // `--kv-k`/`--kv-v`, the effective `--spec` selector, the draft it keeps.
+    let mut params = crate::load_params_with_overrides(
         &resolved,
         entry,
         &paths.models,
         path,
         0,
-        None,
-        None,
         tag,
-        false,
-        None,
+        &overrides,
     )?;
+    let selector = crate::effective_speculation_selector(&resolved, overrides.speculation)?;
+    // run_command's resolve_dflash_sidecar for the final selector (config-off +
+    // `--spec dflash` is only visible here). It refuses a missing draft; fit
+    // keeps the plan and reports the missing draft itself.
+    let mut draft_missing = match crate::locate_dflash_sidecar(&params, entry, &paths.models, path)?
+    {
+        crate::DflashSidecar::Unresolved => None,
+        crate::DflashSidecar::Found(draft) => {
+            params["draft"] = json!(draft.display().to_string());
+            None
+        }
+        crate::DflashSidecar::NotPulled(file) => Some(MissingDraft {
+            size_bytes: entry
+                .and_then(|entry| entry.dflash.as_ref())
+                .and_then(|sidecar| sidecar.size_bytes),
+            file,
+        }),
+    };
     // main.rs run_command forwards --max-seq after load_params, without any
     // max_tokens inflation; --ctx has precisely that same precedence.
-    if let Some(ctx) = ctx {
+    if let Some(ctx) = args.ctx {
         params["max_seq"] = json!(ctx);
     }
     // daemon/main.rs:1675-1693 and vision_ladder.rs:49-59: sample the
@@ -665,6 +791,10 @@ fn model_params(
     ] {
         if let Ok(value) = hipfire_config::developer_var(variable) {
             params[key] = json!(value);
+            if key == "draft" {
+                // The ladder names the draft (or opts out): none is missing.
+                draft_missing = None;
+            }
         }
     }
     // daemon/main.rs:1813-1820 and :1845-1862 use these process fallbacks
@@ -704,7 +834,45 @@ fn model_params(
     // admission inputs. Keep environmental resolution outside the pure mapper.
     let mut message = json!({"params": params});
     hipfire_config::topology::resolve_load_pp(&mut message).map_err(anyhow::Error::msg)?;
-    Ok(message["params"].take())
+    Ok(FitLoad {
+        params: message["params"].take(),
+        selector,
+        draft_missing,
+    })
+}
+
+/// A registry DFlash draft that the final mode wants and the machine lacks.
+/// `on` is a load refusal (the engine's own text), so an installed model
+/// does not fit; for a model fit only read the header of, `hipfire pull`
+/// fetches the draft with it, so the answer is open. `auto` runs without the
+/// draft. Fit never downloads the draft: the size is the registry's.
+fn report_missing_draft(result: &mut Analysis, params: &Value, tag: &str, missing: &MissingDraft) {
+    let size = missing
+        .size_bytes
+        .map(|bytes| {
+            format!(
+                " ({} per the registry; fit does not download it)",
+                gib(bytes)
+            )
+        })
+        .unwrap_or_else(|| " (fit does not download it)".into());
+    if params["dflash_mode"].as_str() == Some("on") {
+        let detail = format!(
+            "{}{size}",
+            crate::dflash_draft_not_pulled(&missing.file, Some(tag))
+        );
+        let fix = format!("`hipfire pull {tag}` (it fetches the draft), or choose another --spec");
+        result.findings.push(if result.model.installed {
+            Finding::fails("draft", detail, fix)
+        } else {
+            Finding::undetermined("draft", detail, Some(fix))
+        });
+    } else {
+        result.notes.push(format!(
+            "DFlash draft {} is not installed{size}; speculation.dflash = auto runs without it, `hipfire pull {tag}` fetches it",
+            missing.file
+        ));
+    }
 }
 
 fn source_context(source: &ModelSource) -> Option<usize> {
@@ -727,18 +895,149 @@ fn topology_key(topology: EffectiveTopology) -> String {
     }
 }
 
-fn decode_route(params: &Value) -> String {
-    if params["draft"].as_str().is_some_and(|v| !v.is_empty())
-        && params["dflash_mode"].as_str() != Some("off")
-    {
-        "dflash".into()
-    } else {
-        match params["mtp_mode"].as_str().unwrap_or("auto") {
-            "on" => "mtp".into(),
-            "auto" => "mtp / ar (auto; weights and route decided at load)".into(),
-            _ => "ar".into(),
+/// The facts besides the params that decide which route the load takes.
+struct DecodeFacts<'a> {
+    /// The effective speculation selector, and whether `--spec` set it.
+    selector: &'a str,
+    from_flag: bool,
+    /// The architecture's declared measured autoregressive floor
+    /// (`Carrier::mtp_measured_ar_floor`), which lets `auto` MTP attach;
+    /// `None` when the carrier is not resolved before load.
+    mtp_measured_ar_floor: Option<bool>,
+    draft_missing: Option<&'a MissingDraft>,
+}
+
+struct DecodePlan {
+    route: String,
+    reason: String,
+}
+
+/// Every decode route the params select and why. The load installs one
+/// speculator, the first armed of DSpark, DFlash, MTP, n-gram
+/// (`hipfire_loader::spec_build::build_speculator`, and the carrier's DSpark
+/// arm before it); with none armed it decodes autoregressively.
+fn decode_plan(params: &Value, facts: &DecodeFacts<'_>) -> DecodePlan {
+    let dflash_mode = params["dflash_mode"].as_str().unwrap_or("auto");
+    let mtp = hipfire_config::MtpMode::parse(params["mtp_mode"].as_str().unwrap_or("auto"));
+    // What armed a route: the flag, the config selector, or its own setting.
+    let chosen = |name: &str, setting: String| -> String {
+        match (facts.selector == name, facts.from_flag) {
+            (true, true) => format!("`--spec {name}`"),
+            (true, false) => format!("speculation.mode = {name}"),
+            (false, _) => setting,
         }
+    };
+    let mut armed: Vec<(String, String)> = Vec::new();
+    if params["dspark_mode"].as_str() == Some("on") {
+        armed.push((
+            "dspark".into(),
+            format!(
+                "DSpark drafter ({}); its sidecar and architecture support are checked at load",
+                chosen("dspark", "dspark_mode = on".into())
+            ),
+        ));
     }
+    let setting = format!("speculation.dflash = {dflash_mode}");
+    match (
+        (dflash_mode != "off")
+            .then(|| str_param(params, "draft"))
+            .flatten(),
+        facts.draft_missing.filter(|_| dflash_mode == "on"),
+    ) {
+        (Some(draft), _) => {
+            let file = safe_name(draft);
+            armed.push((
+                format!("dflash (draft {file})"),
+                format!(
+                    "DFlash draft {file} attached ({})",
+                    chosen("dflash", setting)
+                ),
+            ));
+        }
+        (None, Some(missing)) => armed.push((
+            format!("dflash (draft {} not installed)", missing.file),
+            format!(
+                "DFlash is on ({}) but its draft is not installed: the load refuses",
+                chosen("dflash", setting)
+            ),
+        )),
+        (None, None) => {}
+    }
+    match mtp {
+        hipfire_config::MtpMode::On => armed.push((
+            "mtp".into(),
+            format!(
+                "MTP head attached ({}), also over host-mapped experts; a missing head refuses at load",
+                chosen("mtp", "speculation.mtp = on".into())
+            ),
+        )),
+        hipfire_config::MtpMode::Auto if facts.mtp_measured_ar_floor == Some(true) => {
+            armed.push((
+                "mtp (auto)".into(),
+                format!(
+                    "speculation.mtp = auto: this architecture declares a measured AR floor, so the head attaches at load; it stays AR when the head is absent or experts are host-mapped ({})",
+                    hipfire_config::mtp_host_spill_reason()
+                ),
+            ))
+        }
+        _ => {}
+    }
+    if params["ngram_draft"].as_bool() == Some(true) {
+        armed.push((
+            "ngram".into(),
+            format!(
+                "model-free n-gram drafter ({}); only architectures with an n-gram speculator arm it, the rest stay AR",
+                chosen("ngram", "speculation.ngram = on".into())
+            ),
+        ));
+    }
+    if mtp == hipfire_config::MtpMode::Auto && facts.mtp_measured_ar_floor.is_none() {
+        armed.push((
+            "mtp / ar (auto; decided at load)".into(),
+            "speculation.mtp = auto attaches the head only where the architecture declares a measured AR floor and experts are not host-mapped; both are decided at load for this topology".into(),
+        ));
+    }
+    let mut armed = armed.into_iter();
+    let Some((route, mut reason)) = armed.next() else {
+        let reason = if facts.selector == "off" {
+            format!(
+                "{} disables every speculative route",
+                if facts.from_flag {
+                    "`--spec off`"
+                } else {
+                    "speculation.mode = off (config)"
+                }
+            )
+        } else {
+            let dflash = match (dflash_mode, facts.draft_missing) {
+                ("off", _) => "dflash off".to_owned(),
+                (_, Some(missing)) => format!(
+                    "dflash {dflash_mode} runs without its draft {} (not installed)",
+                    missing.file
+                ),
+                _ => format!("dflash {dflash_mode} has no draft for this artifact"),
+            };
+            let mtp = match mtp {
+                hipfire_config::MtpMode::Auto => {
+                    "mtp auto keeps AR (this architecture declares no measured AR floor; `--spec mtp` opts in)"
+                }
+                _ => "mtp off",
+            };
+            format!("no speculative route is enabled: {dflash}, {mtp}, ngram off")
+        };
+        return DecodePlan {
+            route: "ar".into(),
+            reason,
+        };
+    };
+    let rest: Vec<String> = armed.map(|(route, _)| route).collect();
+    if !rest.is_empty() {
+        reason.push_str(&format!(
+            "; also enabled, not installed ahead of it: {}",
+            rest.join(", ")
+        ));
+    }
+    DecodePlan { route, reason }
 }
 
 fn link_routes(device: &FitDevice) -> Vec<Route> {
@@ -841,10 +1140,15 @@ fn context_finding(p: Qwen35CardProjection, requested: usize, automatic: bool) -
 fn admission_fix(message: &str) -> String {
     if message.contains("max_seq") || message.contains("context") {
         "lower --ctx (or `hipfire config set memory.max_seq 512`), free GPU memory, or pick a smaller tier; apply any bound named above".into()
+    } else if ["DFlash", "MTP", "DSpark", "n-gram", "speculat"]
+        .iter()
+        .any(|word| message.contains(word))
+    {
+        "choose another speculation mode (`--spec off|auto|ngram|mtp|dflash|dspark`, or `hipfire config set speculation.mode off`), or provide the sidecar the message names".into()
     } else if message.contains("reload without") || message.contains("set ") {
         format!("apply the setting or reload change named above: {message}")
     } else if message.contains("kv") || message.contains("KV") {
-        "select a KV mode/backend supported by this model and GPU using `hipfire config set memory.kv_cache q8` and `hipfire config set memory.kv_backend vmm`; apply the admission message if it names a different required mode".into()
+        "change `--kv-mode`/`--kv-k`/`--kv-v`, or select a KV mode/backend supported by this model and GPU using `hipfire config set memory.kv_cache q8` and `hipfire config set memory.kv_backend vmm`; apply the admission message if it names a different required mode".into()
     } else if message.contains("topology") || message.contains("pp=") || message.contains("tp=") {
         "use a supported topology (`hipfire config set topology.pp 1` and `hipfire config set topology.ep 1`) or select the model/topology named above".into()
     } else {
@@ -1022,9 +1326,11 @@ fn render_text(report: &Report, verbose: bool) -> String {
     if let Some(plan) = &report.plan {
         let _ = writeln!(
             out,
-            "plan (what `hipfire run` would load on GPU{})",
+            "plan (what `hipfire run{}` would load on GPU{})",
+            report.overrides.flags(),
             plan.device_index
         );
+        let _ = writeln!(out, "  basis      {PLAN_BASIS_TEXT}");
         let _ = writeln!(
             out,
             "  topology   {}",
@@ -1049,10 +1355,11 @@ fn render_text(report: &Report, verbose: bool) -> String {
         );
         if let Some(p) = &plan.projection {
             let n = |key: &str| p[key].as_u64().unwrap_or(0);
-            let _ = writeln!(out, "  capacity   up to {} tokens ({} free - {} weights - {} prefill scratch - {} rounding; {} B/token)", n("card_cap"), gib(n("free")), gib(n("weights")), gib(n("scratch")), gib(n("page_rounding")), n("bytes_per_token"));
+            let _ = writeln!(out, "  capacity   up to {} tokens (pre-load estimate: {} free - {} weights - {} prefill scratch - {} rounding; {} B/token)", n("card_cap"), gib(n("free")), gib(n("weights")), gib(n("scratch")), gib(n("page_rounding")), n("bytes_per_token"));
         }
         let _ = writeln!(out, "  placement  {}", plan.placement.summary);
         let _ = writeln!(out, "  decode     {}", plan.decode_route);
+        let _ = writeln!(out, "               {}", plan.decode_reason);
         for route in &plan.routes {
             let _ = writeln!(
                 out,
@@ -1480,6 +1787,12 @@ mod tests {
             schema: "hipfire-fit-1",
             hipfire: json!({"version": "0.4.3", "commit": "test"}),
             input: "example:mq4".into(),
+            overrides: OverridesEcho {
+                kv_mode: None,
+                kv_k: None,
+                kv_v: None,
+                spec: None,
+            },
             model: ModelInfo {
                 tag: "example:mq4".into(),
                 file: Some("example.mq4".into()),
@@ -1498,6 +1811,7 @@ mod tests {
                 devices: vec![device()],
             },
             plan: Some(Plan {
+                basis: PLAN_BASIS,
                 device_index: 0,
                 topology: "single".into(),
                 kv_backend: "vmm".into(),
@@ -1514,6 +1828,7 @@ mod tests {
                     decided_at_load: false,
                 },
                 decode_route: "ar".into(),
+                decode_reason: "no speculative route is enabled".into(),
                 routes: vec![Route {
                     name: "prefill_chunk".into(),
                     value: "512".into(),
@@ -1799,6 +2114,8 @@ mod tests {
             "routes",
             "verdict: DOES NOT FIT",
             "expected speed",
+            "basis      pre-load estimate",
+            "(pre-load estimate:",
         ] {
             assert!(text.contains(line), "missing {line}");
         }
@@ -1819,6 +2136,14 @@ mod tests {
         assert_eq!(value["model"]["file"], "example.mq4");
         assert_eq!(value["plan"]["topology"], "single");
         assert_eq!(value["verdict"], "does-not-fit");
+        assert_eq!(value["plan"]["basis"], "pre-load");
+        assert_eq!(value["plan"]["decode_route"], "ar");
+        assert!(value["plan"]["decode_reason"].is_string());
+        assert_eq!(value["input"], "example:mq4");
+        assert_eq!(
+            value["overrides"],
+            json!({"kv_mode": null, "kv_k": null, "kv_v": null, "spec": null})
+        );
         let encoded = serde_json::to_string(&value).unwrap();
         assert!(!encoded.contains("/home/"));
         assert!(!encoded.contains("private-user"));
@@ -1875,5 +2200,395 @@ mod tests {
         let fix = finding.fix.unwrap();
         assert!(fix.contains("hipfire pull example:mq4"));
         assert!(fix.contains("without --no-fetch"));
+    }
+
+    fn fit_args(flags: &[&str]) -> FitArgs {
+        let mut argv = vec!["hipfire", "fit", "example:mq4"];
+        argv.extend(flags);
+        match crate::Cli::try_parse_from(argv).unwrap().command {
+            Some(crate::Commands::Fit(args)) => args,
+            _ => panic!("fit dispatch variant missing"),
+        }
+    }
+
+    /// A private home holding one model file; `model_params` never opens it.
+    fn fixture(label: &str) -> (crate::Paths, std::path::PathBuf) {
+        let root = std::env::temp_dir().join(format!("hipfire-fit-{label}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let config = hipfire_config::ConfigPaths::under(&root);
+        std::fs::create_dir_all(&config.models).unwrap();
+        let model = config.models.join("example.mq4");
+        std::fs::write(&model, b"params never open the model file").unwrap();
+        let paths = crate::Paths {
+            models: config.models.clone(),
+            registry: hipfire_registry::RegistryPaths {
+                cache: root.join("registry.cache.json"),
+            },
+            root,
+            config,
+        };
+        (paths, model)
+    }
+
+    /// A registry whose one model declares a DFlash draft (0.5 GiB).
+    fn declared_registry() -> RegistryV1 {
+        RegistryV1::parse(
+            r#"{"schema_version":1,"generated_at":"2026-09-01T00:00:00Z","models":{
+                "example:mq4":{"repo":"x","file":"example.mq4","size_gb":1,"min_vram_gb":1,"desc":"x",
+                    "dflash":{"file":"example-dflash.hfq","size_bytes":557265920}}},"aliases":{}}"#,
+            "test",
+        )
+        .unwrap()
+    }
+
+    fn analysis(installed: bool) -> Analysis {
+        Analysis {
+            model: ModelInfo {
+                tag: "example:mq4".into(),
+                file: None,
+                installed,
+                replica: !installed,
+                size_bytes: None,
+                arch_id: None,
+                quant: None,
+            },
+            plan: None,
+            findings: Vec::new(),
+            notes: Vec::new(),
+            details: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn clap_fit_accepts_run_kv_and_spec_overrides() {
+        let args = fit_args(&[
+            "--kv-mode",
+            "q8",
+            "--kv-k",
+            "fwht3",
+            "--kv-v",
+            "q8",
+            "--spec",
+            "mtp",
+        ]);
+        let o = args.load_overrides();
+        assert_eq!(
+            (o.kv_mode, o.kv_k, o.kv_v, o.speculation),
+            (Some("q8"), Some("fwht3"), Some("q8"), Some("mtp"))
+        );
+        assert_eq!(
+            OverridesEcho::from(&args).flags(),
+            " --kv-mode q8 --kv-k fwht3 --kv-v q8 --spec mtp"
+        );
+        assert_eq!(
+            fit_args(&["--speculation", "dflash"]).spec.as_deref(),
+            Some("dflash")
+        );
+        for spec in ["off", "auto", "ngram", "dflash", "mtp", "dspark"] {
+            assert!(fit_args(&["--spec", spec]).spec.as_deref() == Some(spec));
+        }
+        assert!(
+            crate::Cli::try_parse_from(["hipfire", "fit", "example", "--spec", "turbo"]).is_err()
+        );
+        let none = fit_args(&[]);
+        assert!(none.kv_mode.is_none() && none.kv_k.is_none() && none.spec.is_none());
+        assert_eq!(OverridesEcho::from(&none).flags(), "");
+    }
+
+    #[test]
+    fn model_params_thread_overrides_exactly_like_run() {
+        let (paths, model) = fixture("thread");
+        let args = fit_args(&[
+            "--kv-mode",
+            "q8",
+            "--kv-k",
+            "fwht3",
+            "--kv-v",
+            "q8",
+            "--spec",
+            "mtp",
+        ]);
+        let load = model_params(&paths, "example:mq4", None, None, &model, &args).unwrap();
+        let p = &load.params;
+        assert_eq!(load.selector, "mtp");
+        assert_eq!(
+            (
+                p["kv_mode"].as_str(),
+                p["kv_k"].as_str(),
+                p["kv_v"].as_str()
+            ),
+            (Some("q8"), Some("fwht3"), Some("q8"))
+        );
+        assert_eq!(
+            (
+                p["mtp_mode"].as_str(),
+                p["dflash_mode"].as_str(),
+                p["ngram_draft"].as_bool(),
+                p["dspark_mode"].as_str()
+            ),
+            (Some("on"), Some("off"), Some(false), Some("off"))
+        );
+        // The admission inputs carry the overrides, so the engine's own
+        // refusal (an unsupported KV pair, MTP without a head) is the finding.
+        let a = admission_inputs(p);
+        assert!(a.error.is_none());
+        assert_eq!(
+            (a.kv_mode, a.kv_k, a.kv_v),
+            (Some("q8"), Some("fwht3"), Some("q8"))
+        );
+        assert_eq!(a.options.spec.mtp, Some(true));
+        assert_eq!(a.hints(&device()).kv_k, Some("fwht3"));
+        // And the same helper `hipfire run` calls builds the same params.
+        let resolved = crate::resolved_for_model(&paths, "example:mq4", None, None).unwrap();
+        let run = crate::load_params_with_overrides(
+            &resolved,
+            None,
+            &paths.models,
+            &model,
+            0,
+            None,
+            &args.load_overrides(),
+        )
+        .unwrap();
+        for key in [
+            "kv_mode",
+            "kv_k",
+            "kv_v",
+            "mtp_mode",
+            "dflash_mode",
+            "ngram_draft",
+            "dspark_mode",
+        ] {
+            assert_eq!(p[key], run[key], "{key}");
+        }
+    }
+
+    #[test]
+    fn model_params_without_overrides_follow_the_config_selector() {
+        let (paths, model) = fixture("config");
+        let resolved = crate::resolved_for_model(&paths, "example:mq4", None, None).unwrap();
+        let load = model_params(&paths, "example:mq4", None, None, &model, &fit_args(&[])).unwrap();
+        assert_eq!(
+            load.selector,
+            crate::effective_speculation_selector(&resolved, None).unwrap()
+        );
+        assert!(load.params.get("kv_k").is_none() && load.params.get("kv_v").is_none());
+        assert!(load.draft_missing.is_none());
+    }
+
+    #[test]
+    fn model_params_refuse_what_run_refuses() {
+        let (paths, model) = fixture("refuse");
+        let refused = |flags: &[&str]| {
+            model_params(&paths, "example:mq4", None, None, &model, &fit_args(flags))
+                .err()
+                .map(|error| error.to_string())
+                .unwrap_or_default()
+        };
+        assert!(refused(&["--kv-mode", "bogus"]).contains("invalid value for memory.kv_cache"));
+        assert!(refused(&["--kv-k", "bogus"]).starts_with("--kv-k bogus:"));
+        // `--spec dflash` on an artifact with no declared draft: run's refusal.
+        assert!(refused(&["--spec", "dflash"]).starts_with("DFlash needs a draft model:"));
+        // Every refusal reaches the plan as an `admission` finding whose fix
+        // names the flag.
+        assert!(admission_fix("DFlash needs a draft model: x").contains("--spec"));
+    }
+
+    #[test]
+    fn spec_dflash_reports_a_missing_draft_and_never_fetches_it() {
+        let (paths, model) = fixture("draft");
+        let registry = declared_registry();
+        let (_, entry) = registry.model("example:mq4").unwrap();
+        let args = fit_args(&["--spec", "dflash"]);
+        let load = || {
+            model_params(
+                &paths,
+                "example:mq4",
+                Some("example:mq4"),
+                Some(entry),
+                &model,
+                &args,
+            )
+            .ok()
+            .unwrap()
+        };
+        let missing_load = load();
+        let missing = missing_load
+            .draft_missing
+            .as_ref()
+            .expect("draft not installed");
+        assert_eq!(
+            (missing.file.as_str(), missing.size_bytes),
+            ("example-dflash.hfq", Some(557_265_920))
+        );
+        assert!(str_param(&missing_load.params, "draft").is_none());
+        let facts = |selector, missing| DecodeFacts {
+            selector,
+            from_flag: true,
+            mtp_measured_ar_floor: Some(false),
+            draft_missing: missing,
+        };
+        let plan = decode_plan(&missing_load.params, &facts("dflash", Some(missing)));
+        assert_eq!(
+            plan.route,
+            "dflash (draft example-dflash.hfq not installed)"
+        );
+        assert!(plan.reason.contains("`--spec dflash`") && plan.reason.contains("refuses"));
+        // An installed model that lacks the draft does not load: run's text.
+        let mut result = analysis(true);
+        report_missing_draft(&mut result, &missing_load.params, "example:mq4", missing);
+        let finding = &result.findings[0];
+        assert_eq!(
+            (finding.id, finding.verdict),
+            ("draft", Verdict::DoesNotFit)
+        );
+        assert!(finding.detail.starts_with(&crate::dflash_draft_not_pulled(
+            "example-dflash.hfq",
+            Some("example:mq4")
+        )));
+        assert!(finding.detail.contains("0.5 GiB per the registry"));
+        assert!(finding
+            .fix
+            .as_deref()
+            .is_some_and(|fix| fix.contains("hipfire pull example:mq4")));
+        // A header replica is not installed: `hipfire pull` brings both.
+        let mut replica = analysis(false);
+        report_missing_draft(&mut replica, &missing_load.params, "example:mq4", missing);
+        assert_eq!(replica.findings[0].verdict, Verdict::Undetermined);
+        // `auto` runs without the draft: a note, never a finding.
+        let mut auto = analysis(true);
+        report_missing_draft(
+            &mut auto,
+            &json!({"dflash_mode": "auto"}),
+            "example:mq4",
+            missing,
+        );
+        assert!(auto.findings.is_empty());
+        assert!(auto.notes[0].contains("example-dflash.hfq") && auto.notes[0].contains("auto"));
+        // Once the draft is on disk the route names it.
+        std::fs::write(paths.models.join("example-dflash.hfq"), b"draft").unwrap();
+        let found = load();
+        assert!(found.draft_missing.is_none());
+        assert!(
+            str_param(&found.params, "draft").is_some_and(|d| d.ends_with("example-dflash.hfq"))
+        );
+        let plan = decode_plan(&found.params, &facts("dflash", None));
+        assert_eq!(plan.route, "dflash (draft example-dflash.hfq)");
+    }
+
+    fn spec_params(dflash: &str, mtp: &str, ngram: bool, dspark: &str) -> Value {
+        json!({"dflash_mode": dflash, "mtp_mode": mtp, "ngram_draft": ngram, "dspark_mode": dspark})
+    }
+
+    fn plan_for(
+        params: &Value,
+        selector: &str,
+        from_flag: bool,
+        floor: Option<bool>,
+    ) -> DecodePlan {
+        decode_plan(
+            params,
+            &DecodeFacts {
+                selector,
+                from_flag,
+                mtp_measured_ar_floor: floor,
+                draft_missing: None,
+            },
+        )
+    }
+
+    #[test]
+    fn decode_route_ar_says_why() {
+        let off = spec_params("off", "off", false, "off");
+        let flag = plan_for(&off, "off", true, Some(false));
+        assert_eq!(flag.route, "ar");
+        assert!(flag.reason.contains("`--spec off`"));
+        let config = plan_for(&off, "off", false, Some(false));
+        assert!(config.reason.contains("speculation.mode = off (config)"));
+        // The default: MTP `auto` on an architecture with no measured AR floor.
+        let auto = plan_for(
+            &spec_params("off", "auto", false, "auto"),
+            "auto",
+            false,
+            Some(false),
+        );
+        assert_eq!(auto.route, "ar");
+        assert!(auto.reason.contains("no measured AR floor") && auto.reason.contains("--spec mtp"));
+        assert!(auto.reason.contains("dflash off") && auto.reason.contains("ngram off"));
+    }
+
+    #[test]
+    fn decode_route_names_every_armed_route() {
+        let mtp = plan_for(
+            &spec_params("off", "on", false, "off"),
+            "mtp",
+            true,
+            Some(false),
+        );
+        assert_eq!(mtp.route, "mtp");
+        assert!(mtp.reason.contains("`--spec mtp`") && mtp.reason.contains("host-mapped"));
+        let configured = plan_for(
+            &spec_params("off", "on", false, "auto"),
+            "auto",
+            false,
+            Some(false),
+        );
+        assert!(configured.reason.contains("speculation.mtp = on"));
+        // MTP `auto` attaches only where the architecture declares an AR floor,
+        // and never over host-mapped experts.
+        let auto = spec_params("off", "auto", false, "auto");
+        let floor = plan_for(&auto, "auto", false, Some(true));
+        assert_eq!(floor.route, "mtp (auto)");
+        assert!(floor
+            .reason
+            .contains(hipfire_config::mtp_host_spill_reason()));
+        let unknown = plan_for(&auto, "auto", false, None);
+        assert!(unknown.route.starts_with("mtp / ar (auto"));
+        let ngram = plan_for(
+            &spec_params("off", "off", true, "off"),
+            "ngram",
+            true,
+            Some(false),
+        );
+        assert_eq!(ngram.route, "ngram");
+        assert!(ngram.reason.contains("`--spec ngram`"));
+        let dspark = plan_for(
+            &spec_params("off", "off", false, "on"),
+            "dspark",
+            true,
+            Some(false),
+        );
+        assert_eq!(dspark.route, "dspark");
+        let mut drafted = spec_params("on", "off", true, "off");
+        drafted["draft"] = json!("/models/qwen35-9b-dflash-mq4.hfq");
+        let dflash = plan_for(&drafted, "auto", false, Some(false));
+        assert_eq!(dflash.route, "dflash (draft qwen35-9b-dflash-mq4.hfq)");
+        assert!(dflash.reason.contains("also enabled") && dflash.reason.contains("ngram"));
+        // `--spec auto` and the registry draft with DFlash off: the mode wins.
+        drafted["dflash_mode"] = json!("off");
+        assert_eq!(plan_for(&drafted, "off", true, Some(false)).route, "ngram");
+    }
+
+    #[test]
+    fn text_plan_states_its_basis_overrides_and_decode_reason() {
+        let mut report = report();
+        report.overrides = OverridesEcho {
+            kv_mode: Some("q8".into()),
+            kv_k: None,
+            kv_v: None,
+            spec: Some("mtp".into()),
+        };
+        let text = render_text(&report, false);
+        assert!(
+            text.contains("plan (what `hipfire run --kv-mode q8 --spec mtp` would load on GPU0)")
+        );
+        assert!(text.contains("  basis      pre-load estimate from file headers + sysfs; the load re-measures free VRAM after weights, drafts and scratch (max_seq fit) and may admit less"));
+        assert!(text.contains("  capacity   up to 200000 tokens (pre-load estimate: "));
+        assert!(text.contains("  decode     ar\n               no speculative route is enabled"));
+        let value = json_report(&report).unwrap();
+        assert_eq!(
+            value["overrides"],
+            json!({"kv_mode": "q8", "kv_k": null, "kv_v": null, "spec": "mtp"})
+        );
     }
 }

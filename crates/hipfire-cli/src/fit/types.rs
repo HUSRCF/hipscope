@@ -61,7 +61,7 @@ impl Verdict {
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub(crate) struct Finding {
     /// Stable id: `preflight`, `admission`, `vram`, `context`, `experts`,
-    /// `host_ram`, `gtt`, `weights`.
+    /// `host_ram`, `gtt`, `weights`, `draft`.
     pub id: &'static str,
     pub verdict: Verdict,
     /// What was found, with the numbers it was decided on.
