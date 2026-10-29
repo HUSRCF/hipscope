@@ -1700,6 +1700,8 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_GFX942_MQ2_DOWN_ALLRANKS` | docs/investigations/evidence/ds4-mi300x-cdna-test-fail/raw/a1-m0/run-det.sh | harness |
 | `HIPFIRE_GFX942_RMSNORM_SPLIT` | crates/hipfire-config/src/lib.rs, crates/rdna-compute/src/feature_flags.rs | experimental |
 | `HIPFIRE_GFX942_ROTATE_VALIDATE_LIVE` | crates/rdna-compute/src/gemv.rs | developer |
+| `HIPFIRE_GGUF_A8_EMU` | crates/hipfire-arch-qwen35/src/gguf_source.rs | developer |
+| `HIPFIRE_GGUF_CODEC_ONLY` | crates/hipfire-arch-qwen35/src/gguf_source.rs | developer |
 | `HIPFIRE_GGUF_NATIVE` | crates/hipfire-loader/src/carriers.rs, crates/hipfire-loader/src/gguf_native.rs | developer |
 | `HIPFIRE_GITHUB_URL` | scripts/install.sh, scripts/test_install_revision.py | harness |
 | `HIPFIRE_GLIMMER` | crates/hipfire-runtime/examples/build_kld_ref_native_glimmer.rs, crates/hipfire-runtime/examples/eval_hipfire_glimmer.rs | harness |

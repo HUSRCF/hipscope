@@ -4099,6 +4099,10 @@ pub(crate) fn is_batchable_la(dt: DType, arch: &str) -> bool {
         // them in the same change -- see the all-together rule in
         // docs/plans/mq-lloyd-batched-prefill-followup.md.
         | DType::TQ2G128 | DType::BQ1G128
+        // GGUF-native block formats: unrotated unfused plain-GEMM prefill
+        // (`run_plain_gemm_key` dequantises each weight); lockstep with the
+        // `is_lowbit` / `qkv_all_ggml` widenings in hipfire-dispatch.
+        | DType::GgmlQ4K | DType::GgmlQ5K | DType::GgmlQ6K | DType::GgmlQ8_0 | DType::GgmlIQ4XS
         // Phase 1.5 (PARO): wqkv/wz/wo are ParoQ4G128, w_alpha/w_beta are F32
         // on shisa-Qwen3.6-A3B-PARO. Dispatch in the DeltaNetMoe LA matcher
         // routes these through gemm_hfq4g128 (with per-weight Givens
@@ -5565,7 +5569,7 @@ pub(crate) fn batch_chunk_embed_tokens(
         && !pre_embedded
         && matches!(
             weights.embd_format,
-            EmbeddingFormat::HFQ4G256 | EmbeddingFormat::Q8_0
+            EmbeddingFormat::HFQ4G256 | EmbeddingFormat::Q8_0 | EmbeddingFormat::Ggml(_)
         )
     {
         if !pre_uploaded {
@@ -5607,6 +5611,14 @@ pub(crate) fn batch_chunk_embed_tokens(
                         len,
                         dim,
                     ),
+                    EmbeddingFormat::Ggml(dtype) => gpu.ggml_embedding_lookup_batched(
+                        dtype,
+                        &weights.token_embd,
+                        &output,
+                        &token_ids,
+                        len,
+                        dim,
+                    ),
                     _ => unreachable!(),
                 }
             })?;
@@ -5620,6 +5632,14 @@ pub(crate) fn batch_chunk_embed_tokens(
                     dim,
                 )?,
                 EmbeddingFormat::Q8_0 => gpu.embedding_lookup_q8_batched(
+                    &weights.token_embd,
+                    &pbs.x_batch,
+                    &pbs.tokens,
+                    n,
+                    dim,
+                )?,
+                EmbeddingFormat::Ggml(dtype) => gpu.ggml_embedding_lookup_batched(
+                    dtype,
                     &weights.token_embd,
                     &pbs.x_batch,
                     &pbs.tokens,
@@ -5644,6 +5664,9 @@ pub(crate) fn batch_chunk_embed_tokens(
                 }
                 EmbeddingFormat::F32 => {
                     gpu.embedding_lookup(&weights.token_embd, &s.x, tok, dim)?
+                }
+                EmbeddingFormat::Ggml(dtype) => {
+                    gpu.ggml_embedding_lookup(dtype, &weights.token_embd, &s.x, tok, dim)?
                 }
                 _ => panic!("unsupported embedding format"),
             }

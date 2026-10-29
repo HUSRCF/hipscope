@@ -1139,7 +1139,10 @@ pub(crate) fn dispatch_batched_gemm_epilogue(
     let is_mq3 = matches!(w.dtype, DType::MQ3G256);
     let is_fp4 = matches!(w.dtype, DType::HFP4G32 | DType::MFP4G32);
     let is_q8 = matches!(w.dtype, DType::Q8_0);
-    let is_lowbit = matches!(w.dtype, DType::TQ2G128 | DType::BQ1G128);
+    // GGUF-native (`DType::Ggml*`) weights take the same unfused plain-GEMM
+    // strategy: `run_plain_gemm_key` dequantises the weight and runs the
+    // engine's F16 / F32 GEMM on it.
+    let is_lowbit = matches!(w.dtype, DType::TQ2G128 | DType::BQ1G128) || w.dtype.is_ggml();
     match epilogue {
         BatchEpilogue::Residual => {
             if is_6bit {
@@ -1471,6 +1474,12 @@ pub fn run_plain_gemm_key(
     k: usize,
     n: usize,
 ) -> HipResult<()> {
+    // GGUF-native weight: dequantise into the persistent prefill scratch (F16,
+    // or BF16-rounded F32 for the codec-only tier) and run the engine's GEMM
+    // on it; `HIPFIRE_GGUF_A8_EMU=1` first rounds the activations through q8_1.
+    if w_dtype.is_ggml() {
+        return gpu.ggml_prefill_gemm(w_dtype, w_buf, m, k, x, y, n);
+    }
     use crate::families::gemm::GemmParams;
     let ctx = DispatchCtx::new(gpu);
     let w = WeightRef {
@@ -1923,7 +1932,8 @@ fn swiglu_ffn_gate_up_batched(
     // the same UNFUSED plain-GEMM strategy as Q8 rather than falling through
     // to the HFQ4 arm, which would read these packed blocks at the wrong
     // stride and produce fluent-but-wrong tokens.
-    let ffn_is_lowbit = matches!(layer.w_gate.dtype, DType::TQ2G128 | DType::BQ1G128);
+    let ffn_is_lowbit = matches!(layer.w_gate.dtype, DType::TQ2G128 | DType::BQ1G128)
+        || layer.w_gate.dtype.is_ggml();
     // qt=52 re-arm anchor: gate+up both Lloyd → FP8-LUT launcher.
     let ffn_is_mq4v2_lloyd = all_mq4v2_lloyd(&[layer.w_gate.dtype, layer.w_up.dtype]);
     let a8_prep = if layer.w_gate.dtype == DType::MQ4G256V2 && layer.w_up.dtype == DType::MQ4G256V2

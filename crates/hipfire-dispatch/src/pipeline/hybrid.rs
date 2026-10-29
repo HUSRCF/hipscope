@@ -423,6 +423,30 @@ pub fn normed_projection<const N: usize>(
 ) -> Result<(), DispatchError> {
     const { assert!(N >= 1 && N <= 4) };
     let first = &projections[0].0;
+    if first.dtype.is_ggml() {
+        // GGUF-native: plain RMSNorm into `normed`, ONE q8_1 producer launch
+        // shared by every projection of this window, one mmvq per projection
+        // (numeric contract `ggml.a8q81.<type>`). No fusion table row exists
+        // for the ggml dtypes.
+        if projections
+            .iter()
+            .any(|(w, _)| !w.dtype.is_ggml() || w.k != first.k)
+        {
+            return Err(DispatchError::Hip(
+                "normed projection: ggml weights cannot share a window with other formats or widths"
+                    .into(),
+            ));
+        }
+        gpu.rmsnorm_f32(x, norm, normed, eps).map_err(hip)?;
+        let q81 = gpu
+            .ggml_quantize_activation(normed, first.k, None)
+            .map_err(hip)?;
+        for (w, out) in &projections {
+            gpu.ggml_gemv_quantized(w.dtype, w.buf, w.m, w.k, &q81, out, false)
+                .map_err(hip)?;
+        }
+        return Ok(());
+    }
     let rotation = dtype_rotation_plan(first.dtype);
     let givens = rotation == RotationPlan::Givens;
     // The AWQ scale is consumed by the norm, never by the GEMV.

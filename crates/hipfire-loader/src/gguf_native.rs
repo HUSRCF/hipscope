@@ -159,6 +159,10 @@ pub struct GgufManifest {
     pub bpw: f64,
     /// Whether the file carries the NextN/MTP block.
     pub mtp_present: bool,
+    /// Named reason the MTP block cannot be served natively (a tensor of a type
+    /// this build does not serve, e.g. Q4_0 in bartowski files). The trunk
+    /// still loads and serves AR; an MTP request refuses with this reason.
+    pub mtp_refusal: Option<String>,
 }
 
 impl GgufManifest {
@@ -386,6 +390,7 @@ pub fn analyze(gguf: &GgufFile, check_extents: bool) -> GgufAnalysis {
     let mut entries: Vec<GgufManifestEntry> = Vec::new();
     let mut embed_entry: Option<(String, DType)> = None;
     let mut have_output = false;
+    let mut mtp_refusal: Option<String> = None;
     for e in &map.tensors {
         let Some(info) = present.get(e.gguf_name.as_str()).copied() else {
             continue;
@@ -399,6 +404,15 @@ pub fn analyze(gguf: &GgufFile, check_extents: bool) -> GgufAnalysis {
                     have_output = true;
                 }
                 entries.push(entry);
+            }
+            // A NextN/MTP tensor of a type this build does not serve (Q4_0 in
+            // plain imatrix files) makes the MTP block unservable, not the
+            // trunk unloadable: AR serves, MTP refuses with this reason.
+            Err(r) if e.group == TensorGroup::Mtp && r.kind == RefusalKind::Type => {
+                mtp_refusal.get_or_insert(format!(
+                    "MTP is not served from this GGUF: {}",
+                    r.message.trim_start_matches("load refused: ")
+                ));
             }
             Err(r) => a.refusals.push(r),
         }
@@ -443,6 +457,7 @@ pub fn analyze(gguf: &GgufFile, check_extents: bool) -> GgufAnalysis {
             census: a.census.clone(),
             bpw,
             mtp_present,
+            mtp_refusal,
         });
     }
     a
@@ -604,6 +619,10 @@ impl GgufNativeModel {
             manifest.census.total_params,
             if manifest.mtp_present { ", MTP block present" } else { "" },
         );
+        eprintln!("  {}", GgufBadge::of(&manifest).line());
+        if let Some(reason) = &manifest.mtp_refusal {
+            eprintln!("  [gguf] {reason}; the trunk serves AR only");
+        }
         Ok(Self {
             path: path.to_path_buf(),
             arch_id: manifest.arch_id,
@@ -658,6 +677,67 @@ impl GgufNativeModel {
             chat_template_source,
             arch_id: self.arch_id,
         })
+    }
+
+    /// Load the dense trunk onto `gpu` (single device): every tensor stays in
+    /// its ggml block bytes (`DType::Ggml*`), the exporter's data edits are
+    /// undone by [`hipfire_arch_qwen35::gguf_source::GgufSource`]. The NextN/MTP
+    /// block is never loaded.
+    pub fn load_qwen35_weights(
+        &self,
+        gpu: &mut rdna_compute::Gpu,
+    ) -> Result<hipfire_arch_qwen35::qwen35::Qwen35Weights, String> {
+        use hipfire_arch_qwen35::qwen35::{load_weights, Layout};
+        let mut src =
+            hipfire_arch_qwen35::gguf_source::GgufSource::new(&self.gguf, &self.hparams);
+        let layout = Layout::single(self.hparams.config.n_layers);
+        load_weights(&mut src, std::slice::from_mut(gpu), &layout)
+            .map_err(|e| format!("load_weights: {e:?}"))
+    }
+
+    /// The named reason an MTP request refuses on this file, if any: either the
+    /// file has no MTP block, or its block holds a tensor type this build does
+    /// not serve. GGUF-native serving is AR-only; MTP is never loaded.
+    pub fn mtp_refusal(&self) -> String {
+        match (&self.manifest.mtp_present, &self.manifest.mtp_refusal) {
+            (_, Some(reason)) => reason.clone(),
+            (true, None) => "MTP from GGUF files is not served by the GGUF-native route yet: the \
+                NextN block is a sidecar head with its own tensor contract; the trunk serves AR"
+                .to_string(),
+            (false, None) => "this GGUF has no NextN/MTP block; the trunk serves AR".to_string(),
+        }
+    }
+}
+
+/// The G3 badge fields of a GGUF-native model: measured bits per weight, the
+/// numeric route its linears run on and the quality class (`UNMEASURED` until
+/// a KLD campaign registers one).
+#[derive(Debug, Clone, PartialEq)]
+pub struct GgufBadge {
+    pub bpw: f64,
+    pub route: &'static str,
+    pub kld_class: &'static str,
+}
+
+/// Numeric route of the decode linears (`ggml.a8q81.<type>`: q8_1 activations,
+/// int8 block dots, f32 scale fold).
+pub const GGUF_ROUTE: &str = "ggml.a8q81";
+
+impl GgufBadge {
+    pub fn of(manifest: &GgufManifest) -> Self {
+        GgufBadge {
+            bpw: manifest.bpw,
+            route: GGUF_ROUTE,
+            kld_class: "UNMEASURED",
+        }
+    }
+
+    /// The one-line form used by the load log and `hipfire inspect`.
+    pub fn line(&self) -> String {
+        format!(
+            "[gguf] badge: bpw={:.4} route={} kld_class={}",
+            self.bpw, self.route, self.kld_class
+        )
     }
 }
 
@@ -755,6 +835,12 @@ pub fn inspect_report(path: &Path, native_enabled: bool) -> Result<String, Strin
                 ""
             }
         );
+        if let Some(m) = &analysis.manifest {
+            let _ = writeln!(out, "{}", GgufBadge::of(m).line());
+            if let Some(reason) = &m.mtp_refusal {
+                let _ = writeln!(out, "mtp:           {reason}");
+            }
+        }
     } else {
         let counts = analysis
             .refusal_counts()
@@ -778,11 +864,10 @@ pub fn inspect_report(path: &Path, native_enabled: bool) -> Result<String, Strin
             let _ = writeln!(out, "  ... and {} more", ordered.len() - 20);
         }
     }
-    let _ =
-        writeln!(
+    let _ = writeln!(
         out,
-        "native load:   {} ({GGUF_NATIVE_ENV}=1 {}; no ggml kernel is wired yet, so this build \
-         parses and plans but cannot run GGUF weights)",
+        "native load:   {} ({GGUF_NATIVE_ENV}=1 {}; admitted files serve AR on gfx1201: decode \
+         GEMV on q8_1 activations, prefill by dequantisation to F16)",
         if native_enabled { "switch ON" } else { "switch OFF" },
         if native_enabled { "set" } else { "required" },
     );

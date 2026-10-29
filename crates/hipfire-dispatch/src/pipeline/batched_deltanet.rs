@@ -477,7 +477,10 @@ pub fn batch_chunk_delta_net_input_projection(
     // the same UNFUSED plain-GEMM strategy as Q8 rather than falling through
     // to the HFQ4 arm, which would read these packed blocks at the wrong
     // stride and produce fluent-but-wrong tokens.
-    let is_lowbit = matches!(layer.wqkv.dtype, DType::TQ2G128 | DType::BQ1G128);
+    // GGUF-native weights (`DType::Ggml*`) take the same unfused plain-GEMM
+    // strategy (dequantise + F16 / F32 GEMM inside `run_plain_gemm_key`).
+    let is_lowbit = matches!(layer.wqkv.dtype, DType::TQ2G128 | DType::BQ1G128)
+        || layer.wqkv.dtype.is_ggml();
     // qt=52 re-arm anchor: all four LA projections Lloyd → FP8-LUT launcher.
     // Mixed Lloyd/uniform is a fail-closed HipError at the dispatch arm.
     let is_mq4v2_lloyd = all_mq4v2_lloyd(&[
