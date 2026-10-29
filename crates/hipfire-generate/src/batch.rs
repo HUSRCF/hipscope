@@ -5113,6 +5113,7 @@ pub fn drive_qwen_vmm_continuous_batch(
                     crate::vmm_conv::checkpoint(
                         &mut ctl[idx].checkpoints,
                         &st.dn,
+                        &st.kv,
                         gpu,
                         st.position,
                     );

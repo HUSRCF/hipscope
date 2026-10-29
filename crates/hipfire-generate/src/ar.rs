@@ -4830,6 +4830,7 @@ pub fn generate(
                     speculative::take_dn_checkpoint(
                         &mut m.prefill_checkpoints,
                         dn,
+                        kv,
                         gpu,
                         m.seq_pos,
                         ckpt_interval(),
@@ -5362,6 +5363,7 @@ pub fn generate(
                 speculative::take_dn_checkpoint(
                     &mut m.prefill_checkpoints,
                     dn,
+                    kv,
                     gpu,
                     m.seq_pos,
                     ckpt_interval(),

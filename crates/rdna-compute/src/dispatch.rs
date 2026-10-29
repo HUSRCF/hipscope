@@ -1579,6 +1579,10 @@ pub struct Gpu {
     pub flags: Arc<FeatureFlags>,
     pub arch_caps: crate::arch_caps::ArchCaps,
     pub device_id: i32,
+    /// Memory the admitted context still needs, set by the loader after a
+    /// measured post-load fit so optional per-request allocations (DeltaNet
+    /// checkpoints beyond the charged one) yield to it. `None` = no floor.
+    pub kv_fit_floor: Option<KvFitFloor>,
     /// Monotonic aggregate-MoE launch census ([`Gpu::moe_route_launch_census`]); plain adds,
     /// no locking, bumped after a successful launch submission.
     pub(crate) moe_route_census: crate::gemm::MoeRouteLaunchCensus,
@@ -1829,6 +1833,15 @@ pub struct Gpu {
     /// is suppressed so the MoE takes the F16 WMMA grouped arm, exactly as
     /// `HIPFIRE_QWEN4_MOE_SYM_IU4=0` does, for that tile only.
     pub qwen4_append_f16_moe_scope: bool,
+}
+
+/// See [`Gpu::kv_fit_floor`]: plain data, no behaviour.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct KvFitFloor {
+    /// The published (admitted) context in tokens.
+    pub admitted_tokens: usize,
+    /// The fit's full per-request reserve (prefill + charged checkpoints + MTP).
+    pub reserve_bytes: usize,
 }
 /// Per-256-block XX^T accumulator for ONE weight tensor (one expert), keyed
 /// inside [`HessianCapture`] by the full safetensors name. Byte-for-byte the
@@ -2900,6 +2913,7 @@ impl Gpu {
             modules: HashMap::new(),
             functions: HashMap::new(),
             pool: crate::pool::GpuPool::new(),
+            kv_fit_floor: None,
             dflash_gdn_replay_scratch: HashMap::new(),
             vmm_arenas: HashMap::new(),
             vmm_generations: HashMap::new(),

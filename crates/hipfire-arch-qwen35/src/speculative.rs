@@ -13055,6 +13055,7 @@ pub fn spec_step_ddtree_batched(
 pub fn take_dn_checkpoint(
     cks: &mut Vec<(usize, DeltaNetSnapshot)>,
     dn: &DeltaNetState,
+    kv: &KvCache,
     gpu: &mut Gpu,
     pos: usize,
     interval: usize,
@@ -13068,7 +13069,12 @@ pub fn take_dn_checkpoint(
         Some(p) if p == pos => return,
         _ => {}
     }
-    let mut snap = if cks.len() >= cap {
+    // A new snapshot beyond the ring's first (the charged one) is allowed only
+    // from memory the admitted context does not need; otherwise the oldest is
+    // recycled, shrinking the ring to what fits.
+    let recycle = cks.len() >= cap
+        || (!cks.is_empty() && !checkpoint_fits_admitted_context(gpu, kv, dn));
+    let mut snap = if recycle {
         cks.remove(0).1
     } else {
         match DeltaNetSnapshot::new_for(gpu, dn) {
@@ -13087,6 +13093,28 @@ pub fn take_dn_checkpoint(
         return;
     }
     cks.push((pos, snap));
+}
+
+/// Whether one more DeltaNet snapshot can be allocated without eating what the
+/// admitted context still needs: `free_now >= snapshot + KV mapping growth to
+/// the admitted tokens + the fit's reserve`. No floor set => always true; a
+/// memory query or growth-plan error => false (do not allocate).
+fn checkpoint_fits_admitted_context(gpu: &Gpu, kv: &KvCache, dn: &DeltaNetState) -> bool {
+    let Some(floor) = gpu.kv_fit_floor else {
+        return true;
+    };
+    let Ok((free_now, _)) = gpu.device_mem_info() else {
+        return false;
+    };
+    let Ok(growth) = kv.planned_mapped_growth_bytes(gpu, floor.admitted_tokens) else {
+        return false;
+    };
+    let Ok(snapshot) = usize::try_from(DeltaNetSnapshot::bytes_for(dn)) else {
+        return false;
+    };
+    free_now >= snapshot
+        .saturating_add(growth)
+        .saturating_add(floor.reserve_bytes)
 }
 
 /// Outer chunk ceiling of the DFlash prompt seed ([`SeedPrefill::plan`]):
@@ -13482,7 +13510,15 @@ pub fn seed_target_hidden_from_prompt_abortable_parts(
                 seq_pos += piece;
             }
             if let Some(cks) = checkpoints.as_deref_mut() {
-                take_dn_checkpoint(cks, target.dn_state, gpu, seq_pos, ckpt_interval, ckpt_cap);
+                take_dn_checkpoint(
+                    cks,
+                    target.dn_state,
+                    target.kv_cache,
+                    gpu,
+                    seq_pos,
+                    ckpt_interval,
+                    ckpt_cap,
+                );
             }
         }
         Ok(false)
@@ -13574,7 +13610,15 @@ pub fn seed_target_hidden_suffix_abortable_parts(
                 off += piece;
             }
             if let Some(cks) = checkpoints.as_deref_mut() {
-                take_dn_checkpoint(cks, target.dn_state, gpu, pos, ckpt_interval, ckpt_cap);
+                take_dn_checkpoint(
+                    cks,
+                    target.dn_state,
+                    target.kv_cache,
+                    gpu,
+                    pos,
+                    ckpt_interval,
+                    ckpt_cap,
+                );
             }
         }
         Ok(false)

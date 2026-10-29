@@ -2136,7 +2136,7 @@ struct Qwen35PostLoadFit {
 /// for (they came out of the KV room as `hipMalloc` failures at fill).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct Qwen35LazyCharges {
-    /// DeltaNet checkpoint rings: `snapshot_bytes x cap x rings`.
+    /// DeltaNet checkpoint rings: one charged `snapshot_bytes` per ring.
     checkpoints: usize,
     /// Native MTP `MtpSpecState` (first request) + prompt-fill transient.
     mtp: usize,
@@ -2144,8 +2144,10 @@ struct Qwen35LazyCharges {
 
 /// Bytes of the checkpoint rings one load can populate at once.
 ///
-/// Each snapshot mirrors `dn_state` ([`DeltaNetSnapshot::bytes_for`]); a ring
-/// holds at most `cap` of them. Two rings can be live together: the AR
+/// Each snapshot mirrors `dn_state` ([`DeltaNetSnapshot::bytes_for`]); only the
+/// first of a ring is charged. `take_dn_checkpoint` adds further ones (up to
+/// the cap, `HIPFIRE_CACHE_CKPT_MAX`) only from memory the admitted context
+/// does not need (`Gpu::kv_fit_floor`). Two rings can be live together: the AR
 /// prefill ring (`LoadedModel.prefill_checkpoints`, gated by
 /// `HIPFIRE_CACHE_CKPT_RESUME` != 0, cap `ckpt_max()`) and, when a DFlash or
 /// native-MTP speculator is attached, that speculator's own ring (gated by
@@ -2160,9 +2162,7 @@ fn qwen35_checkpoint_ring_bytes(snapshot_bytes: usize, speculator_ring: bool) ->
         .as_deref()
         != Some("0");
     let rings = usize::from(ar_ring) + usize::from(speculator_ring && policy.checkpoint_resume);
-    snapshot_bytes
-        .saturating_mul(policy.checkpoint_cap)
-        .saturating_mul(rings)
+    snapshot_bytes.saturating_mul(rings)
 }
 
 /// [`Qwen35LazyCharges`] for this load. `mtp` is the native-MTP head (and the
@@ -2927,6 +2927,8 @@ fn finish_qwen35_load(
     // built (they are only larger than needed).
     let mut physical_cap = physical_cap;
     let mut fit_refusal: Option<String> = None;
+    // A later (or non-Qwen) load must never inherit a previous load's floor.
+    ctx.gpu.kv_fit_floor = None;
     if let Some(mut seq) = ctx.sequence {
         if bundle.kv_cache.uses_vmm_backend() {
             let lazy = lazy_charges.clone();
@@ -2978,6 +2980,11 @@ fn finish_qwen35_load(
                         "max_seq fit: measured after full load: free={} transient={} (prefill {} + checkpoints {} + mtp {}) kv_mapped_growth_per_token≈{per_token} drafts={drafts_attached} ; context {verdict}",
                         m.free, m.transient, m.prefill, m.checkpoints, m.mtp
                     );
+                    // Further DeltaNet checkpoints yield to the admitted context.
+                    ctx.gpu.kv_fit_floor = Some(rdna_compute::KvFitFloor {
+                        admitted_tokens: ctx.max_seq.min(physical_cap),
+                        reserve_bytes: m.transient,
+                    });
                 }
             }
         }
@@ -3959,6 +3966,8 @@ pub fn load_admitted_with_gemma4_drafter(
     } = admission;
     let carrier =
         carrier.ok_or_else(|| "single/pp admission must resolve a carrier".to_string())?;
+    // The admitted-context floor is per load: a later (non-Qwen) load never inherits it.
+    gpu.kv_fit_floor = None;
     ensure_vmm_ready_for_load(gpu)?;
     warn_kho_scratch_once(gpu.is_uma());
     let rec_sampling = match &source {
@@ -6231,6 +6240,7 @@ fn unload_qwen4_pp(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) -> Result<()
 }
 
 pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) -> Result<(), String> {
+    gpu.kv_fit_floor = None;
     // The next load (or none) starts lazy; a sealed route never outlives its model.
     if let Err(e) = gpu.abort_route_kernel_load() {
         eprintln!("  kernels: route reset on unload: {e}");

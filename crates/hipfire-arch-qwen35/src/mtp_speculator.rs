@@ -469,11 +469,12 @@ impl MtpDrafter for Qwen35MtpDrafter {
             fill_tokens,
             start_pos,
             prompt_route,
-            |gpu, dn_state, position| {
+            |gpu, dn_state, kv, position| {
                 if checkpoint_resume {
                     take_dn_checkpoint(
                         &mut checkpoints,
                         dn_state,
+                        kv,
                         gpu,
                         position,
                         checkpoint_interval,

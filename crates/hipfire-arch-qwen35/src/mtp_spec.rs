@@ -3618,7 +3618,7 @@ pub fn prefill_trunk_and_mtp_cache(
         prompt_tokens,
         start_pos,
         route,
-        |_gpu, _target, _committed_pos| Ok(()),
+        |_gpu, _target, _kv, _committed_pos| Ok(()),
     )
 }
 
@@ -3642,7 +3642,7 @@ pub fn prefill_trunk_and_mtp_cache_with_boundary<F>(
     on_committed_boundary: F,
 ) -> HipResult<TrunkSpinePrefillTimings>
 where
-    F: FnMut(&mut Gpu, &DeltaNetState, usize) -> HipResult<()>,
+    F: FnMut(&mut Gpu, &DeltaNetState, &KvCache, usize) -> HipResult<()>,
 {
     let mut parts = MtpPrefillTarget {
         weights: &target.weights,
@@ -3686,7 +3686,7 @@ pub fn prefill_trunk_and_mtp_cache_parts<F>(
     mut on_committed_boundary: F,
 ) -> HipResult<TrunkSpinePrefillTimings>
 where
-    F: FnMut(&mut Gpu, &DeltaNetState, usize) -> HipResult<()>,
+    F: FnMut(&mut Gpu, &DeltaNetState, &KvCache, usize) -> HipResult<()>,
 {
     let Some(head_rows) =
         mtp_prompt_fill_scratch_rows(prompt_tokens.len(), qwen35::prefill_max_batch(gpu))
@@ -3953,7 +3953,7 @@ where
             }
 
             // Committed boundary: trunk + MTP private KV now cover [0, committed_pos).
-            on_committed_boundary(gpu, target.dn_state, committed_pos)?;
+            on_committed_boundary(gpu, target.dn_state, &*target.kv_cache, committed_pos)?;
             off = end;
         }
 

@@ -914,8 +914,11 @@ the loader finds the largest context whose remaining KV mapping plus the
 per-request reserve fits the VRAM actually free. The reserve is the minimum
 prefill reserve (the minimum PBS, its 1 GiB headroom and 128 MiB of page
 rounding), plus the owners a request creates lazily after the load: the
-DeltaNet checkpoint rings (snapshot bytes x `HIPFIRE_CACHE_CKPT_MAX`, default
-8, for the AR ring and, with a DFlash/MTP speculator, its own ring) and, with
+DeltaNet checkpoint rings (one snapshot per ring, for the AR ring and, with a
+DFlash/MTP speculator, its own ring; further checkpoints up to
+`HIPFIRE_CACHE_CKPT_MAX`, default 8, are taken only while free VRAM still
+covers the admitted context's KV growth plus the reserve, else the ring recycles
+its oldest snapshot) and, with
 native MTP, the per-request `MtpSpecState` (head KV, scratch, verify buffers,
 trunk snapshot and PBS) and the prompt-fill transient. The loader logs one
 `max_seq fit: measured after full load: free=… transient=… (prefill … +
