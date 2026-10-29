@@ -10,5 +10,5 @@ serde_json.workspace = true
 thiserror.workspace = true
 ureq = "3"
 
-[dev-dependencies]
+[target.'cfg(unix)'.dev-dependencies]
 libc.workspace = true

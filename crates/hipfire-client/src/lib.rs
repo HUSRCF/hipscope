@@ -4782,10 +4782,12 @@ done
         server.join().unwrap();
     }
 
+    #[cfg(unix)]
     extern "C" fn noop_signal_handler(_: libc::c_int) {}
 
     /// Signals delivered (without SA_RESTART) while the client blocks reading
     /// the response must not surface EINTR as an HTTP error.
+    #[cfg(unix)]
     #[test]
     fn http_requests_survive_signals_during_blocking_read() {
         // SAFETY: installs a no-op handler for SIGUSR2 without SA_RESTART so
