@@ -158,11 +158,13 @@ kernels/src/ggml_*.hip.
   upstream terms (MIT) and are NOT relabelled Apache-2.0; they are excluded
   from scripts/governance/apply_spdx_headers.py (any `third_party/` path).
 
-- kernels/src/ggml_*.hip (currently ggml_mmvq_shim.hip) are hipfire shim
-  files (SPDX `Apache-2.0`) derived from ggml: they #include the pinned
-  upstream headers and loop upstream's `vec_dot_*_q8_1` device functions, and
-  carry a "Derived from ggml (MIT)" line. The compiled shim object
-  (kernels/ggml_mmvq_shim_gfx1201.co) contains code compiled from both.
+- kernels/src/ggml_*.hip are hipfire shim files (SPDX `Apache-2.0`) derived
+  from ggml: they #include the pinned upstream headers and loop or call
+  upstream's device functions (`vec_dot_*_q8_1` of the mmvq shims,
+  `dequantize_*` of ggml_convert_shim.hip, whose gather and dequantise kernel
+  bodies are transcriptions of upstream's convert.cu / getrows.cu kernels), and
+  carry a "Derived from ggml (MIT)" line. Each compiled shim object
+  (kernels/ggml_*_shim_gfx1201.co) contains code compiled from both.
 
 hipfire imports ggml's quantised-weight formats and kernels (MIT) as a
 library for GGUF-native serving; it is not a wrapper around llama.cpp: the
