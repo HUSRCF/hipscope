@@ -4795,7 +4795,10 @@ done
             action.sa_sigaction = noop_signal_handler as extern "C" fn(libc::c_int) as usize;
             action.sa_flags = 0;
             libc::sigemptyset(&mut action.sa_mask);
-            assert_eq!(libc::sigaction(libc::SIGUSR2, &action, std::ptr::null_mut()), 0);
+            assert_eq!(
+                libc::sigaction(libc::SIGUSR2, &action, std::ptr::null_mut()),
+                0
+            );
         }
 
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
