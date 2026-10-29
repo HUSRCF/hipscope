@@ -448,6 +448,14 @@ refused at load under PP; Single and EP session behavior is unchanged.
 | `HIPFIRE_EMBED_PHASE` | `1` prints the per-phase timing of one `embed` request | `assemble \| encode \| mask+normalize \| serialize+write`, on stderr. **Its own knob, deliberately not `HIPFIRE_EMBED_DEBUG`**: that one also arms the encoder's per-layer finite `trace()`, which syncs the GPU every layer and inflated the same measurement from 334 ms to 678 ms — the first reading of it was wrong for exactly that reason. |
 | `HIPFIRE_EMBED_DEBUG` | `1` traces the embedding encoder | Prints a per-layer finite-value trace of the residual stream (absmax + non-finite count) and the VRAM free/total after load. Downloads one tensor per call, so it is strictly a debugging path — it is what localized a weight-format bug that NaN'd the last rows of every projection. |
 
+### GGUF-native (dense Qwen3.5 / 3.6 / 3.8, gfx1201, developer, default off)
+
+| Variable | Default / sense | Notes |
+|---|---|---|
+| `HIPFIRE_GGUF_NATIVE` | `1` loads a `.gguf` in the dev tools (`eval_hipfire`, `bench_qwen35_mq4`, `gguf_native_gen`) as native ggml blocks | Unset refuses with a named reason. Weights stay in their ggml block bytes (IQ4_XS, Q4_K, Q5_K, Q6_K, Q8_0; F32/F16/BF16 float matrices are widened to F32). Decode is the `ggml.a8q81` route (q8_1 activation producer plus mmvq); prefill dequantises one weight per GEMM into F16 and runs the F16 WMMA GEMM. The NextN/MTP block is never loaded; a file whose MTP block holds a type outside the admitted set (for example Q4_0) loads AR-only with the named reason from `GgufNativeModel::mtp_refusal()`. The load log prints `bpw=… route=ggml.a8q81 kld_class=UNMEASURED`. |
+| `HIPFIRE_GGUF_CODEC_ONLY` | `1`: quality-measurement tier | Prefill and scoring only (decode always runs the shipped route). Weights are dequantised with BF16 rounding; activations stay F32-class (carried as an exact BF16 hi part plus an F16-rounded residual through the F16 WMMA GEMM, F32 accumulate); no q8_1 activation rounding. Isolates the file's quantiser from the arithmetic route. |
+| `HIPFIRE_GGUF_A8_EMU` | `1`: shipped-route measurement tier | Prefill and scoring only. Rounds every prefill GEMM input through q8_1 (per 32, f16 scale) before the multiply, so a prefill-mode KLD run charges the activation quantisation the decode route applies. The integer dot and f32 scale fold of the decode kernels are replaced by the F16 GEMM on dequantised weights. |
+
 ### Vision tower sidecar
 
 | Variable | Default / sense | Notes |
