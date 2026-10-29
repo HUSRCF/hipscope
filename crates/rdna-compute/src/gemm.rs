@@ -261,6 +261,11 @@ fn gfx12_bt_tile(batch_size: usize) -> usize {
     unreachable!("batch sizes below 64 returned above")
 }
 
+/// Waves per block of the gfx12 qt49 (MQ3G256V2) base WMMA kernels
+/// (`MQ3_KS` in the kernel sources): each wave owns every 4th K group and
+/// wave 0 reduces the partials through LDS. Must match the kernels.
+const MQ3_SPLITK_WAVES: u32 = 8;
+
 /// `HIPFIRE_QWEN4_F16_WMMA=0` keeps Qwen4 prefill on the bit-exact F32 arms
 /// (grouped MoE gate/up and down, BF16 dense projections).  The F16 WMMA arms
 /// are not bit-exact (F16 dequant/inputs); each was admitted by KLD against
@@ -46734,7 +46739,7 @@ impl Gpu {
         let result = self.launch_maybe_blob(
             &kname,
             [row_tiles as u32, batch_tiles as u32, 1],
-            [32, 1, 1],
+            [if bt_b == 1 { 32 * MQ3_SPLITK_WAVES } else { 32 }, 1, 1],
             0,
             &mut params,
             || {
@@ -46964,7 +46969,7 @@ impl Gpu {
         let result = self.launch_maybe_blob(
             func_name,
             [row_tiles as u32, batch_tiles as u32, 1],
-            [32, 1, 1],
+            [32 * MQ3_SPLITK_WAVES, 1, 1],
             0,
             &mut params,
             || {
@@ -47178,7 +47183,7 @@ impl Gpu {
         let result = self.launch_maybe_blob(
             kname,
             [row_tiles as u32, batch_tiles as u32, 1],
-            [32, 1, 1],
+            [if bt_b == 1 { 32 * MQ3_SPLITK_WAVES } else { 32 }, 1, 1],
             0,
             &mut params,
             || {
@@ -47362,7 +47367,7 @@ impl Gpu {
         let result = self.launch_maybe_blob(
             kname,
             [row_tiles as u32, batch_tiles as u32, 1],
-            [32, 1, 1],
+            [if bt_b == 1 { 32 * MQ3_SPLITK_WAVES } else { 32 }, 1, 1],
             0,
             &mut params,
             || {
