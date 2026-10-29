@@ -912,9 +912,10 @@ Caveats that are part of the fixture, not trivia:
   descriptor, row and resource admission; a request is not an active-route
   receipt. The gfx1100 default (regular prefill and the S1 `aggregate-sym-iu4`
   window read the same `Gpu::qwen4_moe_sym_iu4_requested`) was flipped on
-  with its numeric acceptance recorded in the CHANGELOG entry (TODO-evidence:
-  owner fills the job record: S1 context-mean KL against the limits above,
-  WT2/code24 BF16-teacher KLD deltas, pp8192/pp32768 A/B). FP8 KV and FA2 are
+  with its numeric acceptance recorded in the CHANGELOG entry (S1 context-mean
+  KL within the limits above; WT2/code24 BF16-teacher KLD deltas +0.0293 /
+  +0.0296 vs gfx1201 +0.0306 / +0.0285, the code24 excess of 0.0011 waived by
+  Kaden 2026-10-29; pp8192/pp32768 A/B +1.2 / +1.4%). FP8 KV and FA2 are
   independent, stackable choices; A3B H16/KV2/D256 FA2 work is not an applied
   Flash-Next H24/KV2/D256 QSA FA2 port or a Flash-Next performance gain.
   **Widened byte/state/ID and performance qualification is pending.** Before
