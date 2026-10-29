@@ -293,6 +293,10 @@ pub fn build_speculator(
         if eviction_is_none && matches!(arch_id, 5 | 6) {
             let max_n = mtp_requested_k(&spec);
             eprintln!("  qwen35 MTP speculator enabled (compressed-serial, K={max_n})");
+            hipfire_config::load_summary::note(
+                hipfire_config::load_summary::Facet::SpecOn,
+                format!("mtp K={max_n}"),
+            );
             return Some(hipfire_arch_qwen35::build_qwen35_mtp_speculator(
                 head,
                 max_n,
@@ -303,6 +307,10 @@ pub fn build_speculator(
         // must NOT load a head we'd decline (no `&mut Gpu` here to free it), so
         // this is unreachable in practice — drop it rather than leak silently.
         eprintln!("  qwen35 MTP head present but arm declined (eviction/arch) — ignored");
+        hipfire_config::load_summary::note(
+            hipfire_config::load_summary::Facet::SpecOff,
+            "MTP head present but arm declined (eviction/arch)",
+        );
         let _ = head;
     }
     // The CLI resolves per-model and global TOML into this per-load policy.
@@ -326,6 +334,10 @@ pub fn build_speculator(
             "  n-gram speculator enabled (model-free, K={}, min_count={})",
             block_size, min_count
         );
+        hipfire_config::load_summary::note(
+            hipfire_config::load_summary::Facet::SpecOn,
+            format!("ngram K={block_size} min={min_count}"),
+        );
         // `samples` = the target arch implements `SpecTarget::verify_block_sampled`
         // (qwen35 5/6 today). It drives the n-gram speculator's `requires_greedy()`
         // so a temp>0 request only takes the sampled n-gram path where the target
@@ -337,6 +349,14 @@ pub fn build_speculator(
             ctx_capacity,
             samples,
         )));
+    }
+    // Nothing armed: record the input that left the n-gram route off (the
+    // daemon records the DFlash draft decision, the loader the MTP head's).
+    if matches!(arch_id, 0 | 1 | 5 | 6 | 7 | 8 | 10 | 11 | 12) {
+        hipfire_config::load_summary::note(
+            hipfire_config::load_summary::Facet::SpecOff,
+            "ngram off: speculation.ngram=off",
+        );
     }
     None
 }

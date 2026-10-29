@@ -822,6 +822,24 @@ impl Carrier for Qwen4Carrier {
         self.admit_options(ctx.draft_path, options)?;
         // Admission checked the draft is present; DFlash2 replaces native MTP.
         let dflash_draft = ctx.draft_path.filter(|_| ctx.spec.dflash == Some(true));
+        if let Some(draft) = dflash_draft {
+            hipfire_config::load_summary::note(
+                hipfire_config::load_summary::Facet::SpecOn,
+                format!(
+                    "dflash (draft {})",
+                    std::path::Path::new(draft)
+                        .file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| draft.to_string())
+                ),
+            );
+            if native_mtp {
+                hipfire_config::load_summary::note(
+                    hipfire_config::load_summary::Facet::SpecOff,
+                    "MTP off: DFlash draft replaces native MTP",
+                );
+            }
+        }
         let native_mtp = native_mtp && dflash_draft.is_none();
         let meta = resolve_source_meta(&src, ctx.path)?;
         let shared = Qwen4RankShared {
@@ -1230,6 +1248,10 @@ fn qwen4_native_mtp_speculator(
     >,
 ) -> Box<dyn hipfire_runtime::spec::Speculator> {
     eprintln!("  qwen4 native MTP speculator enabled (K={max_k})");
+    hipfire_config::load_summary::note(
+        hipfire_config::load_summary::Facet::SpecOn,
+        format!("qwen4 native mtp K={max_k}"),
+    );
     if hipfire_config::mtp_sampled_enabled()
         && !hipfire_arch_qwen4::mtp_spec::qwen4_mtp_sampled_allowed(gdn)
     {
@@ -1241,6 +1263,10 @@ fn qwen4_native_mtp_speculator(
     let mut copy_lane = false;
     let ngram = if !ngram_modifier {
         eprintln!("  qwen4 native MTP n-gram: off (topology.pp)");
+        hipfire_config::load_summary::note(
+            hipfire_config::load_summary::Facet::CopyLane,
+            "n-gram copy lane off (topology.pp)",
+        );
         None
     } else {
         copy_lane = hipfire_config::mtp_ngram_copy_enabled_for_arch(arch, gpu_arch);
@@ -1255,6 +1281,14 @@ fn qwen4_native_mtp_speculator(
                     config.n_match,
                     config.n_min,
                     config.n_max
+                );
+                hipfire_config::load_summary::note(
+                    hipfire_config::load_summary::Facet::CopyLane,
+                    if ngram_on && copy_lane {
+                        "n-gram copy lane on"
+                    } else {
+                        "n-gram copy lane off"
+                    },
                 );
                 if ngram_on && copy_lane {
                     eprintln!(
@@ -4275,6 +4309,13 @@ fn load_qwen4_rank_scoped(
             "  qwen4 native MTP: off (profile {} has no MTP head)",
             receipt.config.profile.id()
         );
+        hipfire_config::load_summary::note(
+            hipfire_config::load_summary::Facet::SpecOff,
+            format!(
+                "MTP off: profile {} has no MTP head",
+                receipt.config.profile.id()
+            ),
+        );
     }
     if let Some(note) = crate::admission::qwen4_developer_ple_policy(
         receipt.config.profile.is_flash_next(),
@@ -5619,6 +5660,21 @@ fn load_qwen4_rank_scoped(
                 gib(ttm_pool)
             );
         }
+        hipfire_config::load_summary::note(
+            hipfire_config::load_summary::Facet::Placement,
+            match &resident_set {
+                Some(resident) => format!(
+                    "experts: {} layers in VRAM, {moved} tensors ({:.1} GiB) host-mapped",
+                    resident.len(),
+                    gib(host_bytes)
+                ),
+                None => format!(
+                    "experts: layers 0..{} in VRAM, {moved} tensors ({:.1} GiB) host-mapped",
+                    vram_layers.min(config.num_hidden_layers),
+                    gib(host_bytes)
+                ),
+            },
+        );
         if let Some(plan) = &whole_first_plan {
             let resident = residency::resident_routed_expert_bytes(&manifest.weights, bytes_of)
                 .map_err(|error| format!("qwen4: {error}"))?;
@@ -5637,7 +5693,21 @@ fn load_qwen4_rank_scoped(
                     &format!("on {}", ctx.gpu.arch),
                 )
             );
+            hipfire_config::load_summary::note(
+                hipfire_config::load_summary::Facet::SpecOff,
+                format!(
+                    "MTP off: {moved} expert tensors host-mapped on {} ({})",
+                    ctx.gpu.arch,
+                    hipfire_config::mtp_host_spill_reason()
+                ),
+            );
         }
+    }
+    if placement.is_none() && moe_layers > 0 {
+        hipfire_config::load_summary::note(
+            hipfire_config::load_summary::Facet::Placement,
+            "experts: fully resident",
+        );
     }
     if whole_first == hotsets::WholeFirstDecision::Active && placement.is_none() {
         if let Some(inputs) = &measured {
@@ -5679,6 +5749,14 @@ fn load_qwen4_rank_scoped(
                     host_bytes,
                     &format!("on {}", ctx.gpu.arch),
                 )
+            );
+            hipfire_config::load_summary::note(
+                hipfire_config::load_summary::Facet::SpecOff,
+                format!(
+                    "MTP off: {host_projections} expert tensors host-mapped on {} ({})",
+                    ctx.gpu.arch,
+                    hipfire_config::mtp_host_spill_reason()
+                ),
             );
         }
     }
@@ -7817,11 +7895,14 @@ fn resolve_qwen_kv_pair(
     )
     .map_err(|e| e.to_string())?;
     match pair {
-        KvPair::Native(k) => eprintln!(
-            "  KV cache: requested mode={mode_raw}, effective KV={} (site {})",
-            kv_mode::qwen_k_display_name(k),
-            policy.site
-        ),
+        KvPair::Native(k) => {
+            let name = kv_mode::qwen_k_display_name(k);
+            eprintln!(
+                "  KV cache: requested mode={mode_raw}, effective KV={name} (site {})",
+                policy.site
+            );
+            hipfire_config::load_summary::note(hipfire_config::load_summary::Facet::Kv, name);
+        }
         KvPair::Split(k, v) => {
             let k_name = kv_mode::qwen_k_display_name(k);
             let v_name = kv_mode::qwen_v_display_name(v);
@@ -7830,6 +7911,10 @@ fn resolve_qwen_kv_pair(
                 policy.site
             );
             eprintln!("  K={k_name} V={v_name}");
+            hipfire_config::load_summary::note(
+                hipfire_config::load_summary::Facet::Kv,
+                format!("K={k_name} V={v_name}"),
+            );
         }
     }
     Ok(pair)

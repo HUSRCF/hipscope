@@ -243,17 +243,55 @@ pub(crate) fn qwen4_native_mtp(
     tp: usize,
     ep: usize,
 ) -> Result<bool, String> {
+    use hipfire_config::load_summary::{note, Facet};
     if pp > 1 || ep > 1 {
-        return Ok(spec.mtp == Some(true));
+        let on = spec.mtp == Some(true);
+        if !on {
+            note(
+                Facet::SpecOff,
+                if spec.mtp == Some(false) {
+                    "MTP off: speculation.mtp=off"
+                } else {
+                    "MTP off: pp/ep topology (explicit --spec mtp arms it)"
+                },
+            );
+        }
+        return Ok(on);
     }
     let retained = hipfire_runtime::config::retained_redline_default(
         gpu_arch, "qwen4", path, pp, tp, ep, true,
     );
-    qwen4_native_mtp_for_floor(
-        spec.mtp,
-        retained,
-        hipfire_arch_qwen4::MTP_MEASURED_AR_FLOOR,
-    )
+    let floor = hipfire_arch_qwen4::MTP_MEASURED_AR_FLOOR;
+    let verdict = qwen4_native_mtp_for_floor(spec.mtp, retained, floor);
+    if verdict == Ok(false) {
+        note(
+            Facet::SpecOff,
+            format!(
+                "MTP off: {}",
+                qwen4_mtp_off_reason(spec.mtp, retained, floor)
+            ),
+        );
+    }
+    verdict
+}
+
+/// The reason [`qwen4_native_mtp_for_floor`] returned `Ok(false)`, for the
+/// load summary. Only the label of the arm that already decided; the policy
+/// itself stays in [`qwen4_native_mtp_for_floor`].
+fn qwen4_mtp_off_reason(
+    spec_mtp: Option<bool>,
+    retained: bool,
+    measured_ar_floor: bool,
+) -> &'static str {
+    if spec_mtp == Some(false) {
+        "speculation.mtp=off"
+    } else if retained {
+        ".mq4r retained replay path"
+    } else if !measured_ar_floor {
+        "no measured AR floor (speculation.mtp=auto)"
+    } else {
+        "declined by policy"
+    }
 }
 
 /// [`qwen4_native_mtp`]'s policy with the retained-Redline fact and the
@@ -6368,6 +6406,35 @@ mod qwen4_pp_admission_tests {
             "gfx1201",
             24
         ));
+    }
+
+    #[test]
+    fn qwen4_mtp_off_reason_labels_exactly_the_declined_arms() {
+        for mtp in [None, Some(true), Some(false)] {
+            for retained in [false, true] {
+                for floor in [false, true] {
+                    if qwen4_native_mtp_for_floor(mtp, retained, floor) == Ok(false) {
+                        let reason = qwen4_mtp_off_reason(mtp, retained, floor);
+                        assert_ne!(
+                            reason, "declined by policy",
+                            "unlabelled decline for ({mtp:?}, {retained}, {floor})"
+                        );
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            qwen4_mtp_off_reason(None, true, true),
+            ".mq4r retained replay path"
+        );
+        assert_eq!(
+            qwen4_mtp_off_reason(None, false, false),
+            "no measured AR floor (speculation.mtp=auto)"
+        );
+        assert_eq!(
+            qwen4_mtp_off_reason(Some(false), false, true),
+            "speculation.mtp=off"
+        );
     }
 
     #[test]

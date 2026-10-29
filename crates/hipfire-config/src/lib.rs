@@ -20,6 +20,7 @@ pub mod evidence;
 pub mod host_memory;
 pub mod http_auth;
 pub mod intent;
+pub mod load_summary;
 pub mod rocm;
 pub mod secret;
 pub mod tuning;

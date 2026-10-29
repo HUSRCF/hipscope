@@ -336,6 +336,11 @@ pub(crate) struct LoadedInfo {
     /// or before the first load ack. Published through `/health` without
     /// taking the runtime lock.
     pub(crate) swap: serde_json::Value,
+    /// The daemon's `load_summary` object from the load ack (`line`, `spec`,
+    /// `kv`, `context`, `placement`, `prefill`); `null` when the ack has none.
+    /// The daemon already prints the line to the stderr serve inherits, so
+    /// serve does not print it again.
+    pub(crate) load_summary: serde_json::Value,
 }
 
 /// Rollout switches for the VMM continuous-batching route (PLAN §6 Slice1C).
@@ -2482,6 +2487,10 @@ impl ServeRuntime {
                     .and_then(serde_json::Value::as_str)
                     .map(str::to_owned),
                 max_seq: loaded.get("max_seq").and_then(serde_json::Value::as_u64),
+                load_summary: loaded
+                    .get("load_summary")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null),
                 swap: loaded.get("swap").cloned().unwrap_or_else(|| {
                     configured_swap_json(&self.spawner.process_config, self.multi_slot_enabled)
                 }),

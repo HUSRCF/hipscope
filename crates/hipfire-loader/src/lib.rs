@@ -2505,6 +2505,10 @@ fn finish_qwen35_load(
         eprintln!(
             "  kv_adaptive engaged — suppressing generic speculator path (DSpark/DFlash/n-gram/bundled MTP-spec)"
         );
+        hipfire_config::load_summary::note(
+            hipfire_config::load_summary::Facet::SpecOff,
+            "kv_adaptive suppresses speculation",
+        );
     }
 
     // ── DSpark sidecar (wins over DFlash/MTP/n-gram) ───────────────
@@ -2567,6 +2571,10 @@ fn finish_qwen35_load(
                                         ctx.gpu,
                                     ) {
                                         Ok(body) => {
+                                            hipfire_config::load_summary::note(
+                                                hipfire_config::load_summary::Facet::SpecOn,
+                                                format!("dspark (block {block})"),
+                                            );
                                             Some(hipfire_runtime::dspark_core::build_dspark_speculator(
                                             body,
                                             dspark_weights,
@@ -2583,6 +2591,10 @@ fn finish_qwen35_load(
                                             eprintln!(
                                                 "  qwen35: DSpark body build failed: {e} — AR/other"
                                             );
+                                            hipfire_config::load_summary::note(
+                                                hipfire_config::load_summary::Facet::SpecOff,
+                                                format!("DSpark body build failed: {e}"),
+                                            );
                                             None
                                         }
                                     }
@@ -2591,16 +2603,28 @@ fn finish_qwen35_load(
                                     eprintln!(
                                         "  qwen35: DSpark sidecar {p:?} has no dspark_* metadata — skipping"
                                     );
+                                    hipfire_config::load_summary::note(
+                                        hipfire_config::load_summary::Facet::SpecOff,
+                                        "DSpark sidecar failed: no dspark_* metadata",
+                                    );
                                     None
                                 }
                                 Err(e) => {
                                     eprintln!("  qwen35: WARNING DSpark sidecar load failed: {e}");
+                                    hipfire_config::load_summary::note(
+                                        hipfire_config::load_summary::Facet::SpecOff,
+                                        format!("DSpark sidecar failed: {e}"),
+                                    );
                                     None
                                 }
                             }
                         }
                         Err(e) => {
                             eprintln!("  qwen35: WARNING cannot open DSpark sidecar {p:?}: {e}");
+                            hipfire_config::load_summary::note(
+                                hipfire_config::load_summary::Facet::SpecOff,
+                                format!("DSpark sidecar failed: cannot open: {e}"),
+                            );
                             None
                         }
                     }
@@ -2657,6 +2681,17 @@ fn finish_qwen35_load(
                     s.draft_config.block_size,
                     s.block_size
                 );
+                hipfire_config::load_summary::note(
+                    hipfire_config::load_summary::Facet::SpecOn,
+                    format!(
+                        "dflash (draft {}, block {})",
+                        Path::new(dp)
+                            .file_name()
+                            .map(|name| name.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| dp.to_string()),
+                        s.block_size
+                    ),
+                );
                 Some(s)
             }
             Err(e) => {
@@ -2673,6 +2708,10 @@ fn finish_qwen35_load(
                 eprintln!(
                     "  DFlash draft load failed ({}): {} — falling back to AR only",
                     dp, e
+                );
+                hipfire_config::load_summary::note(
+                    hipfire_config::load_summary::Facet::SpecOff,
+                    format!("DFlash draft load failed: {e}"),
                 );
                 None
             }
@@ -2717,6 +2756,20 @@ fn finish_qwen35_load(
     let cpu_deferred_moe = bundle.weights.has_cpu_deferred_experts();
     let (host_mapped_expert_blobs, host_mapped_expert_bytes) =
         hipfire_arch_qwen35::qwen35::host_mapped_expert_accounting(&bundle.weights.layers);
+    if host_mapped_expert_blobs > 0 {
+        hipfire_config::load_summary::note(
+            hipfire_config::load_summary::Facet::Placement,
+            format!(
+                "experts: {host_mapped_expert_blobs} expert blobs ({:.1} GiB) host-mapped ({})",
+                host_mapped_expert_bytes as f64 / (1u64 << 30) as f64,
+                if cpu_deferred_moe {
+                    "offload_exec=cpu"
+                } else {
+                    "offload_exec=pcie"
+                },
+            ),
+        );
+    }
     // Same shared policy as the slots arming site: `auto` (typed `None`)
     // declines over a host-mapped spill, `on` (`Some(true)`) arms, `off`
     // (`Some(false)`) stays AR via the gate below. qwen35's admitted list is
@@ -2757,6 +2810,18 @@ fn finish_qwen35_load(
                 },
             )
         );
+        hipfire_config::load_summary::note(
+            hipfire_config::load_summary::Facet::SpecOff,
+            format!(
+                "MTP off: {host_mapped_expert_blobs} expert blobs host-mapped ({:.2} GiB, {})",
+                host_mapped_expert_bytes as f64 / (1u64 << 30) as f64,
+                if cpu_deferred_moe {
+                    "offload_exec=cpu"
+                } else {
+                    "offload_exec=pcie"
+                },
+            ),
+        );
     }
     if mtp_floor_declined
         && !adaptive_blocks_generic_spec
@@ -2765,6 +2830,10 @@ fn finish_qwen35_load(
         && dspark_speculator.is_none()
     {
         eprintln!("{}", hipfire_config::mtp_no_floor_decline_line("qwen35"));
+        hipfire_config::load_summary::note(
+            hipfire_config::load_summary::Facet::SpecOff,
+            "MTP off: no measured AR floor (speculation.mtp=auto)",
+        );
     }
     // ── qwen35 MTP head (single resolver: bundled .mq4-mtp trailer then .mtp sidecar) ──
     // Precedence: DSpark > DFlash > MTP > n-gram. Gate: only arch 5/6, no adaptive/eviction,
@@ -2811,15 +2880,30 @@ fn finish_qwen35_load(
                         ctx.gpu,
                     ));
                 }
-                if !errors.is_empty() {
+                if errors.is_empty() {
+                    hipfire_config::load_summary::note(
+                        hipfire_config::load_summary::Facet::SpecOff,
+                        "MTP off: model has no MTP head (no bundled trailer or .mtp sidecar)",
+                    );
+                } else {
                     eprintln!(
                         "  MTP head not loaded: {} — falling back to AR/n-gram",
                         errors.join("; ")
+                    );
+                    hipfire_config::load_summary::note(
+                        hipfire_config::load_summary::Facet::SpecOff,
+                        format!("MTP head not loaded: {}", errors.join("; ")),
                     );
                 }
             }
             resolved
         };
+    if matches!(arch_id, 5 | 6) && ctx.spec.mtp == Some(false) {
+        hipfire_config::load_summary::note(
+            hipfire_config::load_summary::Facet::SpecOff,
+            "MTP off: speculation.mtp=off",
+        );
+    }
     if mtp.is_some() {
         if let Some(reason) = hipfire_arch_qwen35::qwen35::weights::native_mtp_refusal(
             &bundle.weights.layers,
@@ -2987,6 +3071,13 @@ fn finish_qwen35_load(
                     eprintln!(
                         "max_seq fit: measured after full load: free={} transient={} (prefill {} + checkpoints {} + mtp {}) kv_mapped_growth_per_token≈{per_token} drafts={drafts_attached} ; context {verdict}",
                         m.free, m.transient, m.prefill, m.checkpoints, m.mtp
+                    );
+                    hipfire_config::load_summary::note(
+                        hipfire_config::load_summary::Facet::ContextFit,
+                        match verdict.strip_suffix(" unchanged") {
+                            Some(_) => "measured fit unchanged".to_string(),
+                            None => format!("measured fit {verdict}"),
+                        },
                     );
                     // Further DeltaNet checkpoints yield to the admitted context.
                     ctx.gpu.kv_fit_floor = Some(rdna_compute::KvFitFloor {

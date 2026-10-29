@@ -253,6 +253,29 @@ HIPFIRE_LOCAL=1 hipfire run qwen3.5:4b "..."   # skip HTTP; always local spawn
 
 Local-forcing (skip a healthy serve): `HIPFIRE_LOCAL` truthy, `--image`, `--kv-mode`, `--kv-backend`, `--kv-k`, `--kv-v`, `--max-seq`, `--head`, `--tp` above 1, `--spec`/`--speculation`, `--model-draft`, `--vision`, `--draft-max`, or `--dspark-conf-threshold` (exact list: `run_should_force_local` in `crates/hipfire-cli/src/main.rs`). JSON and non-streaming responses are supported by the native HTTP service and do not by themselves force a local daemon.
 
+### Load summary
+
+Every model load prints exactly one INFO line on the daemon's stderr (which `hipfire run` and `hipfire serve` inherit, so it appears once in the terminal or serve log; `hipfire bench` is unchanged). It states what is on or off and why. Observed on one R9700 (Qwen3.8-27B, a config with `speculation.mtp`/`dflash`/`ngram` = `off` and `memory.max_seq = 262144`):
+
+```text
+$ hipfire run qwen3.8:27b "Hi"
+hipfire load summary: qwen3.8-27b.mq4r (qwen3_5) | spec: off (DFlash off: speculation.dflash=off; MTP off: speculation.mtp=off; ngram off: speculation.ngram=off) | kv: fp8 (vmm backend, automatic) | context: 262144 (user-set; model 262144, card 504465; measured fit unchanged) | placement: fully resident | prefill: per-prompt chunking
+$ hipfire run qwen3.8:27b --spec dflash --max-seq 16384 "Hi"
+hipfire load summary: qwen3.8-27b.mq4r (qwen3_5) | spec: dflash (draft qwen38-27b-dflash-mq4.hfq, block 16) | kv: fp8 (vmm backend, automatic) | context: 16384 (user-set; model 262144, card 447002; measured fit unchanged) | placement: fully resident | prefill: per-prompt chunking
+```
+
+A Flash-Next load whose experts spill to host memory reads, for example, `spec: off (MTP off: <N> expert tensors host-mapped on gfx1100 …)` and `placement: experts: layers 0..<k> in VRAM, <N> tensors (<X> GiB) host-mapped`.
+
+| Facet | Meaning |
+|---|---|
+| `spec` | The speculation route that armed (`mtp K=…`, `dflash (draft <file>, block N)`, `dspark (block N)`, `ngram K=… min=…`, `qwen4 native mtp K=…`, plus the MTP n-gram copy lane verdict) or `off (<reasons>)`. Reasons are recorded by the engine at the decision that declined each route: `speculation.dflash=off` / `speculation.mtp=off` / `speculation.ngram=off` (config or `--spec off`), no draft paired, no MTP head in the file, no measured AR floor under `speculation.mtp=auto`, host-mapped experts, `.mq4r` retained replay path, pp/ep topology, `kv_adaptive`, DSpark/DFlash load failure; with no recorded reason it reads `off (no speculator armed)`. |
+| `kv` | The KV layout the carrier resolved (`fp8`, `K=q8 V=q8`, …; the requested `auto` is resolved), the backend (`vmm` / `legacy`) and whether the backend was `automatic` or `explicit`. |
+| `context` | Admitted `max_seq` and what bound it (`auto: min(model N, card N)`, `user-set`), plus the measured post-load fit verdict for Qwen VMM loads (`measured fit unchanged`, `measured fit <requested> -> <fit>`). |
+| `placement` | Where the weights live: `fully resident`, the host-mapped expert census (layers in VRAM, tensors and GiB host-mapped), or the pipeline/expert-parallel topology. |
+| `prefill` | Load-time prefill decisions when the arch makes them (Qwen4 chunk rows, long-prefill expert staging, NPU trunk route); otherwise `per-prompt chunking`, meaning the ceiling is chosen per prompt. |
+
+The reasons are the engine's own decision outputs, not a second policy evaluation. The same facets ride the `loaded` ack as a `load_summary` object (`line`, `spec`, `kv`, `context`, `placement`, `prefill`); `hipfire serve` publishes it on the resident model's `/v1/models` entry ([SERVE.md](SERVE.md)).
+
 ### KV load flags (`run` / `serve` / `bench`)
 
 Shared by `hipfire run`, `hipfire serve`, and `hipfire bench` (including `--matrix`). Full config surface: [CONFIG.md](CONFIG.md#kv-cache).

@@ -1565,6 +1565,10 @@ impl Qwen4Bundle {
                 .unwrap_or_else(|| requested.min(1536)),
         };
         eprintln!("  qwen4 prefill chunk: {max_chunk} rows (requested {requested})");
+        hipfire_config::load_summary::note(
+            hipfire_config::load_summary::Facet::Prefill,
+            format!("chunk {max_chunk} rows"),
+        );
         let attempt = Qwen4GpuForward::new_inner(
             gpu,
             self,

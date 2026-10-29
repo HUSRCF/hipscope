@@ -5070,6 +5070,13 @@ impl Qwen4ExpertStage {
                         "  qwen4 long-prefill expert staging: off (dedicated tier stage buffers are not charged to placement on {} unless {QWEN4_EXPERT_STAGE_ENV}=1; zero-copy mapped reads)",
                         gpu.arch
                     );
+                    hipfire_config::load_summary::note(
+                        hipfire_config::load_summary::Facet::Prefill,
+                        format!(
+                            "long-prefill expert staging off (tier stage buffers not charged to placement on {})",
+                            gpu.arch
+                        ),
+                    );
                     Ok(None)
                 }
             };
@@ -5096,6 +5103,10 @@ impl Qwen4ExpertStage {
         }
         let off = |reason: &str| {
             eprintln!("  qwen4 long-prefill expert staging: off ({reason})");
+            hipfire_config::load_summary::note(
+                hipfire_config::load_summary::Facet::Prefill,
+                format!("long-prefill expert staging off ({reason})"),
+            );
             Ok(None)
         };
         // Resident layers are a prefix (`place_routed_experts`), so each
@@ -5301,6 +5312,13 @@ impl Qwen4ExpertStage {
             2 * layer_bytes >> 20,
             if stage.capture { "stage" } else { "mapped" },
             stage.min_rows_source.label()
+        );
+        hipfire_config::load_summary::note(
+            hipfire_config::load_summary::Facet::Prefill,
+            format!(
+                "long-prefill expert staging on (>= {} rows)",
+                stage.min_rows
+            ),
         );
         Ok(Some(stage))
     }

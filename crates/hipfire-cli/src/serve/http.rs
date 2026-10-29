@@ -903,6 +903,11 @@ fn model_entry(
             }
             entry["architecture"] = architecture;
         }
+        // The daemon's one-line "what is on/off and why" for this load;
+        // absent when the ack predates it.
+        if loaded.load_summary.is_object() {
+            entry["load_summary"] = loaded.load_summary.clone();
+        }
     }
     entry
 }
@@ -2948,6 +2953,36 @@ mod tests {
             ))),
             500
         );
+    }
+
+    #[test]
+    fn model_entry_publishes_the_load_summary_only_for_the_resident_model() {
+        let summary = serde_json::json!({
+            "line": "hipfire load summary: m (qwen3_5) | spec: off (no speculator armed)",
+            "spec": "off (no speculator armed)",
+            "kv": "fp8 (vmm, automatic)",
+            "context": "4096 (user-set; model 8192, card 8192)",
+            "placement": "fully resident",
+            "prefill": "per-prompt chunking",
+        });
+        let loaded = LoadedInfo {
+            n_embd: 2048,
+            load_summary: summary.clone(),
+            ..LoadedInfo::default()
+        };
+        let resident = model_entry("qwen3.5:2b", None, Some((&loaded, 4096)));
+        assert_eq!(resident["load_summary"], summary);
+        // A pre-summary daemon ack leaves the field absent, not null.
+        let old_ack = LoadedInfo {
+            n_embd: 2048,
+            ..LoadedInfo::default()
+        };
+        assert!(model_entry("qwen3.5:2b", None, Some((&old_ack, 4096)))
+            .get("load_summary")
+            .is_none());
+        assert!(model_entry("qwen3.6:27b", None, None)
+            .get("load_summary")
+            .is_none());
     }
 
     #[test]
