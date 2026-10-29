@@ -340,7 +340,13 @@ impl Gpu {
             self.copy_d2d(&input, &hi, nk * 4)?;
             self.bf16_round_trip_f32(&hi)?;
             self.copy_d2d(&hi, &lo, nk * 4)?;
-            self.scale_f32(&lo, -1.0)?;
+            crate::tensor_ops::scale_f32(
+                self,
+                &crate::tensor_ops::ScaleF32 {
+                    values: &lo,
+                    scale: -1.0,
+                },
+            )?;
             self.add_inplace_f32_raw(lo.buf.as_ptr(), input.buf.as_ptr(), nk)?;
             self.gemm_f16_wmma_mb8(&wh, &hi, y, m, k, n)?;
             self.gemm_f16_wmma_mb8(&wh, &lo, &y2, m, k, n)?;
