@@ -48,7 +48,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
-use hipfire_kernel_abi::families::{self, mq6_i8, qwen4_moe_sym as moe_abi};
+use hipfire_kernel_abi::families::{self, ggml_mmvq as ggml_abi, mq6_i8, qwen4_moe_sym as moe_abi};
 use hipfire_kernel_abi::{
     check_export, validate_invocation, AbiError, Arch, ArgEvidence, Drift, EvidenceSource,
     ExportEvidence, ExportV1, Expr, FormatId, InvocationV1, KernelAbiV1, ObjectRefV1,
@@ -70,7 +70,18 @@ use sha2::{Digest, Sha256};
 /// Embedded exports with no PeaceMaker generator path, as `(arch, symbol, reason)`. Exact: an
 /// export without a generator that is not listed here fails, and a listed export that gains a
 /// generator (or disappears) fails. Every embedded export currently has one.
-const NO_GENERATOR_PATH: &[(&str, &str, &str)] = &[];
+const NO_GENERATOR_PATH: &[(&str, &str, &str)] = &[
+    ("gfx1201", "ggml_mmvq_iq4_xs_gfx1201", GGML_SHIM_REASON),
+    ("gfx1201", "ggml_mmvq_q4_k_gfx1201", GGML_SHIM_REASON),
+    ("gfx1201", "ggml_mmvq_q6_k_gfx1201", GGML_SHIM_REASON),
+    ("gfx1201", "ggml_mmvq_q8_0_gfx1201", GGML_SHIM_REASON),
+    ("gfx1201", "ggml_q8_1_quantize_gfx1201", GGML_SHIM_REASON),
+];
+
+/// The ggml shim is hipcc-compiled from `kernels/src/ggml_mmvq_shim.hip`; PeaceMaker emits
+/// nothing for it, so its only offline evidence is the committed object's metadata.
+const GGML_SHIM_REASON: &str =
+    "hipcc-built from third_party/ggml upstream device code; no PeaceMaker generator";
 
 /// Every `HipccSource` export `(arch, symbol)`: no offline object, so no metadata evidence.
 const EXPECTED_HIPCC_EXPORTS: &[(&str, &str)] = &[
@@ -172,6 +183,15 @@ static OBJECTS: LazyLock<BTreeMap<&'static str, LiftedObject>> = LazyLock::new(|
         .collect()
 });
 
+/// Name of the contract's explicit field at `offset` (empty if there is none, so a metadata
+/// arg the contract lacks still drifts).
+fn unnamed_arg_name(export: &ExportV1, offset: u32) -> String {
+    families::find_export(export.arch, export.symbol)
+        .and_then(|(abi, _)| abi.fields.iter().find(|f| f.offset == offset))
+        .map(|f| f.name.to_string())
+        .unwrap_or_default()
+}
+
 /// `ExportEvidence` of `export` from the real metadata of its committed object.
 fn object_evidence(export: &ExportV1) -> Result<ExportEvidence, String> {
     let ObjectRefV1::Embedded { artifact, .. } = export.object else {
@@ -224,7 +244,13 @@ fn object_evidence(export: &ExportV1) -> Result<ExportEvidence, String> {
             .args
             .iter()
             .map(|a| ArgEvidence {
-                name: a.name.clone(),
+                // hipcc-built objects (the ggml shim) carry no `.name`: the contract's field
+                // name at the same offset stands in; offset, size and kind are still compared.
+                name: if a.name.is_empty() {
+                    unnamed_arg_name(export, a.offset)
+                } else {
+                    a.name.clone()
+                },
                 offset: a.offset,
                 size: a.size,
                 value_kind: a.value_kind.clone(),
@@ -1154,6 +1180,153 @@ fn broken_recipe_interchange_is_rejected_before_enqueue() {
             operand: "Y_grouped",
             expected: moe_abi::FORMAT_Y_DOWN_BF16,
             got: moe_abi::FORMAT_Y_GATE_UP_SWIGLU_BF16,
+        }
+    );
+}
+
+// ---- ggml shim: pin, object and invocation evidence -----------------------------------
+
+const GGML_IQ4_XS: &str = "ggml_mmvq_iq4_xs_gfx1201";
+
+/// Every `sha256  local-path  upstream-path` line of `third_party/ggml/PIN` names a file of the
+/// snapshot whose bytes hash to the pinned digest: an upstream re-pin without updating the PIN,
+/// or an edit inside the verbatim snapshot, fails here. Lines starting with `#` and
+/// `key=value` metadata lines (an `=` before the first space) are skipped.
+#[test]
+fn ggml_snapshot_matches_pin() {
+    let dir = repo_root().join("third_party/ggml");
+    let pin = std::fs::read_to_string(dir.join("PIN")).expect("third_party/ggml/PIN");
+    let mut checked = 0usize;
+    let mut failures = Vec::new();
+    for line in pin.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let first = line.split(' ').next().unwrap_or("");
+        if first.contains('=') {
+            continue;
+        }
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.len() != 3 || fields[0].len() != 64 {
+            failures.push(format!("malformed PIN line: {line:?}"));
+            continue;
+        }
+        let path = dir.join(fields[1]);
+        match std::fs::read(&path) {
+            Ok(bytes) => {
+                let got = hex(&Sha256::digest(&bytes));
+                if !got.eq_ignore_ascii_case(fields[0]) {
+                    failures.push(format!(
+                        "{}: sha256 is {got}, PIN pins {}",
+                        fields[1], fields[0]
+                    ));
+                }
+            }
+            Err(e) => failures.push(format!("{}: unreadable: {e}", path.display())),
+        }
+        checked += 1;
+    }
+    assert!(checked > 0, "PIN lists no files");
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// The ggml exports live in an offload bundle (`.co`), lifted by the same path as the `.hxaco`
+/// images: all five must be present in `embedded_objects_match_contracts`' evidence.
+#[test]
+fn ggml_exports_have_object_evidence() {
+    let mut n = 0;
+    for abi in ggml_abi::ABIS {
+        for export in abi.exports {
+            let evidence = object_evidence_ok(export);
+            assert_eq!(check_export(abi, export, &evidence), vec![], "{}", abi.id);
+            n += 1;
+        }
+    }
+    assert_eq!(n, 5);
+}
+
+/// Negative control: a ggml contract pinning another object hash drifts from the real object.
+#[test]
+fn broken_ggml_object_sha() {
+    const WRONG: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+    let real_abi = &ggml_abi::GGML_MMVQ_IQ4_XS;
+    let real = real_export(real_abi, Arch::Gfx1201, GGML_IQ4_XS);
+    let ObjectRefV1::Embedded {
+        module,
+        artifact,
+        sha256,
+    } = real.object
+    else {
+        panic!("{GGML_IQ4_XS} is not an embedded export");
+    };
+    let evidence = object_evidence_ok(real);
+    assert_eq!(check_export(real_abi, real, &evidence), vec![]);
+
+    let mut exports = real_abi.exports.to_vec();
+    for e in exports.iter_mut() {
+        e.object = ObjectRefV1::Embedded {
+            module,
+            artifact,
+            sha256: WRONG,
+        };
+    }
+    let leaked = leak_with_exports(real_abi, exports);
+    let leaked_export = real_export(leaked, Arch::Gfx1201, GGML_IQ4_XS);
+    assert_eq!(
+        check_export(leaked, leaked_export, &evidence),
+        vec![Drift::ObjectSha {
+            symbol: GGML_IQ4_XS.into(),
+            contract: WRONG.into(),
+            evidence: sha256.to_string(),
+        }]
+    );
+}
+
+/// `iq4_xs` mmvq at `M = 5120, K = 5120`: admitted with exact extents, rejected one weight
+/// byte short.
+#[test]
+fn ggml_iq4_xs_invocation_admission() {
+    let abi = &ggml_abi::GGML_MMVQ_IQ4_XS;
+    let params = [5120u64, 5120];
+    let operands = |weight_bytes: u64| {
+        [
+            OperandBinding {
+                address: 0x1000_0000,
+                bytes: Some(weight_bytes), // M * (K / 256) * 136
+                format: ggml_abi::FORMAT_IQ4_XS_136,
+            },
+            OperandBinding {
+                address: 0x4000_0000,
+                bytes: Some(5760), // K / 32 * 36
+                format: ggml_abi::FORMAT_Q8_1_MMVQ,
+            },
+            OperandBinding {
+                address: 0x5000_0000,
+                bytes: Some(20_480), // M * 4
+                format: ggml_abi::FORMAT_F32_M,
+            },
+        ]
+    };
+    let inv = |ops: &'static [OperandBinding]| InvocationV1 {
+        arch: Arch::Gfx1201,
+        symbol: GGML_IQ4_XS,
+        params: &params,
+        operands: ops,
+        grid: [5120, 1, 1],
+        block: [32, 8, 1],
+        dynamic_lds: 0,
+    };
+    let good: &'static [OperandBinding] = Box::leak(Box::new(operands(13_926_400)));
+    admitted(abi, &inv(good));
+    let short: &'static [OperandBinding] = Box::leak(Box::new(operands(13_926_399)));
+    assert_eq!(
+        rejected(abi, &inv(short)),
+        AbiError::Extent {
+            abi: "ggml_mmvq.iq4_xs.gfx1201",
+            operand: "vx",
+            need: 13_926_400,
+            have: 13_926_399,
         }
     );
 }
