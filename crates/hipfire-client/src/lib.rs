@@ -519,14 +519,88 @@ pub fn stream_openai_chat(
 }
 
 fn http_agent(timeout: Duration) -> ureq::Agent {
-    ureq::Agent::config_builder()
+    use ureq::unversioned::{
+        resolver::DefaultResolver,
+        transport::{Connector, DefaultConnector},
+    };
+    let config = ureq::Agent::config_builder()
         .timeout_global(Some(timeout))
         .timeout_recv_body(Some(Duration::from_secs(120)))
         .http_status_as_error(false)
         // Never forward the bearer to another origin.
         .max_redirects(0)
-        .build()
-        .into()
+        .build();
+    ureq::Agent::with_parts(
+        config,
+        DefaultConnector::new().chain(eintr::RetryInterrupted),
+        DefaultResolver::default(),
+    )
+}
+
+/// `read(2)` interrupted by a signal (EINTR) transfers no bytes and is safe to
+/// reissue, but std's `TcpStream::read` (used by ureq) surfaces it as an error.
+/// Any signal delivered to the process during a blocking response read would
+/// otherwise fail an in-flight request. Retrying only the interrupted syscall
+/// is not a client-side request retry: nothing is resent.
+mod eintr {
+    use ureq::unversioned::transport::{
+        Buffers, ConnectionDetails, Connector, NextTimeout, Transport,
+    };
+    use ureq::Error;
+
+    #[derive(Debug)]
+    pub(super) struct RetryInterrupted;
+
+    impl Connector<Box<dyn Transport>> for RetryInterrupted {
+        type Out = Box<dyn Transport>;
+
+        fn connect(
+            &self,
+            _: &ConnectionDetails,
+            chained: Option<Box<dyn Transport>>,
+        ) -> Result<Option<Self::Out>, Error> {
+            Ok(chained.map(|inner| Box::new(RetryTransport(inner)) as Box<dyn Transport>))
+        }
+    }
+
+    fn interrupted(error: &Error) -> bool {
+        matches!(error, Error::Io(e) if e.kind() == std::io::ErrorKind::Interrupted)
+    }
+
+    #[derive(Debug)]
+    struct RetryTransport(Box<dyn Transport>);
+
+    impl Transport for RetryTransport {
+        fn buffers(&mut self) -> &mut dyn Buffers {
+            self.0.buffers()
+        }
+
+        fn transmit_output(&mut self, amount: usize, timeout: NextTimeout) -> Result<(), Error> {
+            loop {
+                match self.0.transmit_output(amount, timeout) {
+                    Err(e) if interrupted(&e) => continue,
+                    other => return other,
+                }
+            }
+        }
+
+        fn await_input(&mut self, timeout: NextTimeout) -> Result<bool, Error> {
+            loop {
+                match self.0.await_input(timeout) {
+                    Err(e) if interrupted(&e) => continue,
+                    other => return other,
+                }
+            }
+        }
+
+        fn is_open(&mut self) -> bool {
+            self.0.is_open()
+        }
+
+        fn is_tls(&self) -> bool {
+            self.0.is_tls()
+        }
+    }
 }
 
 fn http_error_message(status: u16, text: &str) -> String {
@@ -4706,6 +4780,57 @@ done
             "{err}"
         );
         server.join().unwrap();
+    }
+
+    extern "C" fn noop_signal_handler(_: libc::c_int) {}
+
+    /// Signals delivered (without SA_RESTART) while the client blocks reading
+    /// the response must not surface EINTR as an HTTP error.
+    #[test]
+    fn http_requests_survive_signals_during_blocking_read() {
+        // SAFETY: installs a no-op handler for SIGUSR2 without SA_RESTART so
+        // blocking syscalls on the signalled thread return EINTR.
+        unsafe {
+            let mut action: libc::sigaction = std::mem::zeroed();
+            action.sa_sigaction = noop_signal_handler as extern "C" fn(libc::c_int) as usize;
+            action.sa_flags = 0;
+            libc::sigemptyset(&mut action.sa_mask);
+            assert_eq!(libc::sigaction(libc::SIGUSR2, &action, std::ptr::null_mut()), 0);
+        }
+
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let seen = read_request(&mut stream);
+            // Hold the response so the client sits in a blocking read.
+            thread::sleep(Duration::from_millis(400));
+            stream
+                .write_all(json_response("200 OK", r#"{"ok":true}"#).as_bytes())
+                .unwrap();
+            seen
+        });
+
+        // SAFETY: pthread_self has no preconditions.
+        let target = unsafe { libc::pthread_self() } as usize;
+        let done = Arc::new(AtomicBool::new(false));
+        let signaller = {
+            let done = Arc::clone(&done);
+            thread::spawn(move || {
+                while !done.load(Ordering::SeqCst) {
+                    // SAFETY: the target thread outlives this loop (joined below).
+                    unsafe { libc::pthread_kill(target as libc::pthread_t, libc::SIGUSR2) };
+                    thread::sleep(Duration::from_millis(2));
+                }
+            })
+        };
+
+        let endpoint = ServiceEndpoint::local("127.0.0.1", port, None).unwrap();
+        let result = http_get_json(&endpoint, "/health", Duration::from_secs(10));
+        done.store(true, Ordering::SeqCst);
+        signaller.join().unwrap();
+        server.join().unwrap();
+        assert_eq!(result.unwrap()["ok"], true);
     }
 
     #[test]
