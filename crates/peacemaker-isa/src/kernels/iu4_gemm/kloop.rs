@@ -20,8 +20,8 @@
 use super::{
     blocks, fold,
     publish::{self, ds_load},
-    Gen, IdleHalf, Lds, MetaD, MetaS, Mma, PayA, PayW, Staged, WaitPlace, Wg, Wv, EPI, K_LOOP,
-    K_LOOP_END,
+    FoldSched, Gen, IdleHalf, Lds, MetaD, MetaS, Mma, PayA, PayW, Staged, WaitPlace, Wg, Wv, EPI,
+    K_LOOP, K_LOOP_END,
 };
 use crate::kernels::common::{op, s, sr, v, vr};
 use crate::{
@@ -299,6 +299,10 @@ pub(crate) fn block_with(
     // (`WaitPlace`) writes the free next buffer, so it may precede the reads
     // of the current one.
     after_slab1_fetch(wg.isa())?;
+    // `FoldSched::Chain`: wave priority 2 over the block's WMMA groups (`fold::scale` drops it to 1).
+    if g.spec.tune.fold_sched == FoldSched::Chain {
+        fold::set_prio(wg.isa(), 2)?;
+    }
     if skippable {
         // The token-scale loads of `Window` issue right after the fragment loads, ahead
         // of the rendezvous, so phase B's post-rendezvous LDS burst carries two fewer loads.

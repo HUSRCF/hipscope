@@ -7,7 +7,7 @@
 //! CPU fold, bitwise, for SET (token and slab activations) and ADD.
 use iu4_emu::*;
 use peacemaker_isa::kernels::iu4_gemm::{
-    verify64_tune, ALayout, Epi, FetchPlace, IdleHalf, Spec, Tune, WaitPlace,
+    verify64_tune, ALayout, Epi, FetchPlace, FoldSched, IdleHalf, Spec, Tune, WaitPlace,
 };
 
 #[macro_use]
@@ -124,6 +124,50 @@ fn window_schedule_is_bit_identical_to_the_default() {
         }
     }
     assert_eq!(Tune::shipped_gate_up_slab().wait, WaitPlace::Window);
+}
+
+/// `FoldSched::Chain` (stage 1 of one accumulator between the WMMAs, rotated chained stage 2, wave priorities) is scheduling
+/// only: at every wait placement, SET and ADD on the slab layout, K = 256 (peeled group only), 512, 1024 and 5120 (a rolled
+/// loop of full trips), every result bit equals the default schedule's and the CPU fold's.
+#[test]
+fn chain_fold_is_bit_identical_to_the_default() {
+    require_rocm_tool!("llvm-mc");
+    for k in [256, 512, 1024, 5120] {
+        let p = Problem::synth(136, 40, k, 0x517c_c1b7_2722_0a95 ^ k as u64);
+        for epi in [Epi::Set, Epi::Add] {
+            let base = Spec {
+                act: ALayout::Slab,
+                ..control(epi)
+            };
+            let want = run_gemm(base, &p).unwrap();
+            assert_eq!(bitwise_eq(&want, &reference(&p, epi == Epi::Add)), 0);
+            for wait in [
+                WaitPlace::AfterMma,
+                WaitPlace::MidMma,
+                WaitPlace::BeforeMma,
+                WaitPlace::Window,
+            ] {
+                let got = run_gemm(
+                    Spec {
+                        tune: Tune {
+                            wait,
+                            fold_sched: FoldSched::Chain,
+                            ..Tune::default()
+                        },
+                        ..base
+                    },
+                    &p,
+                )
+                .unwrap();
+                assert_eq!(
+                    bitwise_eq(&got, &want),
+                    0,
+                    "{epi:?} K={k} wait={}: chain vs default",
+                    wait.name()
+                );
+            }
+        }
+    }
 }
 
 /// `Tune::idle` (skip the compute of the empty token half's waves) is scheduling only: for `skip` and `skiphi` (the wave

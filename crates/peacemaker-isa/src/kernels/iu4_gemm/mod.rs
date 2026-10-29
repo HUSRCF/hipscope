@@ -37,8 +37,8 @@ use peacemaker_author::{
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 pub use spec::{
-    ALayout, Cacc, Epi, FetchPlace, Fold, FoldOp, IdleHalf, Mma, QkvStore, RingDepth, Spec, Tile,
-    Tune, WaitPlace,
+    ALayout, Cacc, Epi, FetchPlace, Fold, FoldOp, FoldSched, IdleHalf, Mma, QkvStore, RingDepth,
+    Spec, Tile, Tune, WaitPlace,
 };
 
 /// The program's first label (the kernel entry); `Live` ranges start here.

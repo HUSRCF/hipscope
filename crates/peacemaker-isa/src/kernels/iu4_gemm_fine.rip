@@ -51,6 +51,16 @@ const ARCHES: &[&str] = &["gfx1201"];
 // the first rendezvous split around sub-block 1's WMMA group.
 const WAIT: &str = "after";
 
+// The fold schedule: "paired" (the shipped order) or "chain" (the generator's
+// `Tune { fold_sched: FoldSched::Chain }`, F3-01-lead1rot-prio: only the first
+// accumulator is unbiased between the WMMAs, pair-swapped; stage 2 runs in bundle order
+// with each accumulator's fmac packets carrying the rotated stage-1 subrevs of the next;
+// wave priority 2 from the block head, 1 from the fold on). `iu4::wmma` (fold = true) and
+// `iu4::fold_scale` emit the chained packets and the priority drop from the spec; the
+// block head's `s_setprio 2` below is the script's. With `WAIT = "window"` this is the
+// shipped 27B gate/up `_b1s` export.
+const FOLD: &str = "paired";
+
 // The depth of the A/W payload rings: 2 (the shipped kernel) or 3 (the generator's
 // `Tune { ring: RingDepth::Three }`: a third LDS slab, a second prefetch set, two
 // slabs published ahead; dense K128 variants except the fused GDN projection).
@@ -139,7 +149,8 @@ fn iu4_spec(variant: &str, arch: Arch) -> Result<Iu4Spec, String> {
         e => return Err(format!("variant `{variant}`: unknown epilogue `{e}` (set, add, addsigmoid, silu, silu-bf16, qkvzagdn)")),
     };
     let ring = if RING == 3 { RingDepth::Three } else { RingDepth::Two };
-    Ok(Iu4Spec { fold: fold, tile: tile, cacc: cacc, epi: epi, act: act, arch: arch, mma: mma, ring: ring })
+    let fold_sched = if FOLD == "chain" { FoldSched::Chain } else { FoldSched::Paired };
+    Ok(Iu4Spec { fold: fold, tile: tile, cacc: cacc, epi: epi, act: act, arch: arch, mma: mma, ring: ring, fold_sched: fold_sched })
 }
 
 // The Workgroup scope lives here, not in emit(): emit() mentions `b` again at
@@ -255,6 +266,10 @@ fn fine_block<T: Target>(wg: &mut Wg<T>, g: &Iu4Gen, tag: &str, h: usize, fetch_
     let lds = iu4::block_begin(wg, g, tag, h, end_label, entry_label, lds)?;
     if let Some(s) = step {
         iu4::step_descriptor(wg, g, s)?;
+    }
+    // Wave priority 2 over the block's WMMA groups; `iu4::fold_scale` drops it to 1.
+    if FOLD == "chain" {
+        op(wg.isa(), "s_setprio 2", vec![], vec![])?;
     }
     // Phase A: slab 0 from slot 0; slab 1 (fetched by the preceding block) is
     // published into slot 1.

@@ -23,7 +23,7 @@
 //! non-load, undeclared effects, an unowned register).
 
 use peacemaker_isa::kernels::iu4_gemm::{
-    self, ALayout, Cacc, Epi, Fold, Mma, RingDepth, Spec, Tile, Tune, WaitPlace,
+    self, ALayout, Cacc, Epi, Fold, FoldSched, Mma, RingDepth, Spec, Tile, Tune, WaitPlace,
 };
 use peacemaker_isa::Arch;
 
@@ -69,6 +69,12 @@ fn with_wait(place: &str) -> String {
     let from = "const WAIT: &str = \"after\";";
     assert!(FINE.contains(from), "the fine twin no longer has `{from}`");
     FINE.replacen(from, &format!("const WAIT: &str = \"{place}\";"), 1)
+}
+
+fn with_fold(src: &str, sched: &str) -> String {
+    let from = "const FOLD: &str = \"paired\";";
+    assert!(src.contains(from), "the fine twin no longer has `{from}`");
+    src.replacen(from, &format!("const FOLD: &str = \"{sched}\";"), 1)
 }
 
 fn edit(src: &str, from: &str, to: &str) -> String {
@@ -164,9 +170,49 @@ fn a_wait_moved_script_equals_the_generators_tune() {
     );
 }
 
-/// The shipped `_b1s` module's 27B gate/up export (`gemm_mq4g256v2_gate_up_silu_mmq_iu4_b1s`) is the `WAIT = "window"`
-/// twin: the module emission's symbol equals the script's bytes, and every other symbol of that module equals the
-/// `WAIT = "after"` script's.
+/// `FOLD = "chain"` (every `WAIT` placement) emits exactly the generator's `Tune { fold_sched: Chain }` bytes for every
+/// dense variant that has a chain generator (the k128 128x128x8 cacc1 dense K-loops), and changes the schedule.
+#[test]
+fn a_chain_fold_script_equals_the_generators_tune() {
+    let mut chained = 0;
+    for (place, wait) in [
+        ("after", WaitPlace::AfterMma),
+        ("mid", WaitPlace::MidMma),
+        ("before", WaitPlace::BeforeMma),
+        ("window", WaitPlace::Window),
+    ] {
+        let src = with_fold(&with_wait(place), "chain");
+        for spec in dense_specs() {
+            let name = spec.variant_name();
+            let tuned = Spec {
+                tune: Tune {
+                    wait,
+                    fold_sched: FoldSched::Chain,
+                    ..Tune::default()
+                },
+                ..spec
+            };
+            if tuned.validate().is_err() {
+                assert!(build(&src, &name).is_err(), "{name} wait={place}");
+                continue;
+            }
+            let want = iu4_gemm::emit(tuned).unwrap_or_else(|e| panic!("{name} {place}: {e}"));
+            let got = build(&src, &name).unwrap_or_else(|e| panic!("{name} {place}: {e}"));
+            assert_same(&format!("{name} wait={place} fold=chain"), &want, &got);
+            let paired = build(&with_wait(place), &name).unwrap();
+            assert!(
+                got.s_text != paired.s_text,
+                "{name}: chain must change the schedule"
+            );
+            chained += 1;
+        }
+    }
+    assert!(chained > 0, "no variant took the chain fold");
+}
+
+/// The shipped `_b1s` module's 27B gate/up export (`gemm_mq4g256v2_gate_up_silu_mmq_iu4_b1s`) is the `WAIT = "window"`,
+/// `FOLD = "chain"` twin: the module emission's symbol equals the script's bytes, and every other symbol of that module equals the
+/// `WAIT = "after"` script's (but for the `_qkvzaset` and `_v64` exports, whose knobs the script has no field for).
 #[test]
 fn the_shipped_gate_up_export_is_the_window_twin() {
     let (emitted, _, _) = iu4_gemm::emit_module(
@@ -177,10 +223,17 @@ fn the_shipped_gate_up_export_is_the_window_twin() {
         Arch::Gfx1201,
     )
     .unwrap();
-    let window = with_wait("window");
+    let window = with_fold(&with_wait("window"), "chain");
     let mut windowed = 0;
+    let mut skipped = 0;
     for e in &emitted {
-        let (src, name) = if e.proof.variant == "k128-128x128x8-cacc1-slab-silu-wwindow" {
+        // The `_qkvzaset` and small-N `_v64` exports carry tune knobs (`qkv`, `n64`, `idle`, `fetch`) the
+        // twin script has no field for; their bytes are pinned by `iu4_gemm_digests.rs`.
+        if e.proof.variant.ends_with("-qset") || e.proof.variant.contains("-n64") {
+            skipped += 1;
+            continue;
+        }
+        let (src, name) = if e.proof.variant == "k128-128x128x8-cacc1-slab-silu-wwindow-fschain" {
             windowed += 1;
             (&window, "k128-128x128x8-cacc1-slab-silu")
         } else {
@@ -190,6 +243,10 @@ fn the_shipped_gate_up_export_is_the_window_twin() {
         assert_same(&e.proof.variant, e, &rip);
     }
     assert_eq!(windowed, 1, "exactly the gate/up slab export is windowed");
+    assert_eq!(
+        skipped, 5,
+        "the qkvzaset export and the four _v64 exports are not twinned"
+    );
 }
 
 fn with_ring(src: &str) -> String {
