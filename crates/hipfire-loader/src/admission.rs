@@ -1545,6 +1545,104 @@ pub const QWEN35_MIN_AUTO_CONTEXT: usize = 512;
 /// VMM page rounding reserved across the K/V owners in the projection.
 const QWEN35_VMM_PAGE_ROUNDING_BYTES: usize = 128 << 20;
 
+/// Largest context `t` in `[0, cap]` whose mapped-KV growth plus the
+/// per-request prefill `transient` fits in `free` bytes. Measured after the
+/// whole Qwen load (weights, KV owners' initial prefix, DeltaNet, scratch,
+/// drafts) so every load-time owner is already charged in `free`. `growth(t)`
+/// is the physical bytes still to map to hold `t` tokens; it is monotone in
+/// `t`, which makes the answer a binary search. Returns 0 when not even the
+/// empty context fits; a `growth` error propagates unchanged.
+pub fn qwen35_measured_fit(
+    free: usize,
+    transient: usize,
+    cap: usize,
+    mut growth: impl FnMut(usize) -> Result<usize, String>,
+) -> Result<usize, String> {
+    let mut fits = |t: usize| -> Result<bool, String> {
+        Ok(growth(t)?.saturating_add(transient) <= free)
+    };
+    if !fits(0)? {
+        return Ok(0);
+    }
+    // Invariant: `lo` fits; `hi` is the largest candidate.
+    let (mut lo, mut hi) = (0usize, cap);
+    while lo < hi {
+        let mid = lo + (hi - lo).div_ceil(2);
+        if fits(mid)? {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    Ok(lo)
+}
+
+#[cfg(test)]
+mod qwen35_measured_fit_tests {
+    use super::qwen35_measured_fit;
+
+    /// Linear growth with 100 B/token, mapped in whole 1000 B chunks above a
+    /// 500 B already-mapped prefix (monotone step function).
+    fn stepped(t: usize) -> Result<usize, String> {
+        let need = t * 100;
+        Ok(if need <= 500 {
+            0
+        } else {
+            (need - 500).div_ceil(1000) * 1000
+        })
+    }
+
+    #[test]
+    fn qwen35_measured_fit_exact_boundary() {
+        // free - transient = 3000 -> growth <= 3000 -> need <= 3500 -> t = 35.
+        assert_eq!(qwen35_measured_fit(3200, 200, 10_000, stepped), Ok(35));
+        // One byte short of the boundary drops a whole chunk (t = 25).
+        assert_eq!(qwen35_measured_fit(3199, 200, 10_000, stepped), Ok(25));
+        // Linear growth: exact byte boundary, no rounding.
+        assert_eq!(
+            qwen35_measured_fit(1000, 0, 10_000, |t| Ok(t * 10)),
+            Ok(100)
+        );
+        assert_eq!(
+            qwen35_measured_fit(999, 0, 10_000, |t| Ok(t * 10)),
+            Ok(99)
+        );
+    }
+
+    #[test]
+    fn qwen35_measured_fit_is_bounded_by_cap() {
+        assert_eq!(
+            qwen35_measured_fit(usize::MAX, 0, 777, |t| Ok(t * 10)),
+            Ok(777)
+        );
+        assert_eq!(qwen35_measured_fit(1 << 40, 0, 0, |t| Ok(t)), Ok(0));
+    }
+
+    #[test]
+    fn qwen35_measured_fit_nothing_fits_is_zero() {
+        // Transient alone exceeds free.
+        assert_eq!(qwen35_measured_fit(100, 101, 4096, |_| Ok(0)), Ok(0));
+        // Growth of even the empty context exceeds free.
+        assert_eq!(qwen35_measured_fit(100, 0, 4096, |_| Ok(101)), Ok(0));
+        assert_eq!(qwen35_measured_fit(0, 0, 4096, |t| Ok(t + 1)), Ok(0));
+    }
+
+    #[test]
+    fn qwen35_measured_fit_propagates_growth_error() {
+        let err = qwen35_measured_fit(1 << 30, 0, 4096, |_| Err("boom".to_string()));
+        assert_eq!(err, Err("boom".to_string()));
+        // An error raised only deep in the search still surfaces.
+        let err = qwen35_measured_fit(1 << 30, 0, 4096, |t| {
+            if t > 1000 {
+                Err("late".to_string())
+            } else {
+                Ok(0)
+            }
+        });
+        assert_eq!(err, Err("late".to_string()));
+    }
+}
+
 /// Only Qwen's single-card cache has the matching VMM KV-row accounting.
 /// The HFQ file is a lower bound on loaded weights; include 12.5% for
 /// expanded raw tensors/runtime state and 512 MiB for allocator/transients.

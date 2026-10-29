@@ -221,7 +221,7 @@ Stable/default-on and safety controls:
 | `fusions.npu_trunk` | `"auto"` | Flash-Next (Qwen4) trunk projection engine: `off\|auto\|on\|emulate` (case-insensitive). `auto` (default) resolves silently to `off` on every arch except gfx1151, with no NPU I/O or allocation. On gfx1151 it arms only when the load is eligible (Flash-Next, K=2560, stock MQ6G256V2 trunk projections, a single device without EP, the full 8192-row prefill scratch rung and enough free memory for it), the NPU firmware is readable, and the calibration matches the device/build/model identity and selects a nonempty family set (the built-in calibration is the normal path and applies on any Halo kernel/firmware/GPU PCI address, keyed by arch/build/model/epilogue/route; under `auto` each request picks its NPU family subset and pair plan from GPU/NPU rate scales learned live in this process, see [live rate scales](npu/npu-trunk.md#live-rate-scales-auto)); any refusal logs one `npu-trunk: off (reason)` line (prefixed `WARN` when the load qualifies but the NPU fails to arm) and the load continues GPU-only. The armed trunk pins 1,053,843,456 B of userptr arenas against `RLIMIT_MEMLOCK`; grant a bounded limit of 1,318,060,032 B (`LimitMEMLOCK=1318060032`, `ulimit -l 1287168`), see [host memlock limit](npu/npu-trunk.md#host-memlock-limit). `off` is the kill switch. `on` requires the NPU and `emulate` runs the bit-identical GPU emulation of the NPU numerics: both refuse an ineligible load or arch instead of falling back, and both tolerate a missing or mismatched calibration (logged as `calibration=none (forced)`; every family is used). |
 | `fusions.npu_trunk_calibration` | `""` | Empty resolves to `<hipfire home>/npu-trunk/calibration.json`; alias `npu_trunk_calibration`, env `HIPFIRE_QWEN4_NPU_TRUNK_CAL` (a non-empty path replaces the default). A calibration is `schema_version` 4 JSON that rejects unknown fields. A file at the path wins; only a **missing** file uses the compiled-in measured Halo calibration (stock route, or the overlay route of the load's trunk overlay), so an unreadable or invalid file is an error and never falls back to the built-in. A calibration file is an optional strict override and passes a strict key check (arch, GPU PCI address, NPU firmware, build, kernel release, model-index hash, epilogue, trunk route); `auto` treats a mismatch as GPU-only and never recalibrates. No file is required: the built-in calibration binds on the hard key fields only (arch, build, model-index hash, epilogue, trunk route) and applies on any Halo kernel, NPU firmware and GPU PCI address at margin 0.0; when those differ from the record the load logs one `npu-trunk: built-in Halo calibration (measured on kernel <k>, NPU firmware <fw>, GPU <bdf>) applies by arch/model/route; this host ...` line. Live rate scales correct its speed for the host (see [NPU trunk](npu/npu-trunk.md#live-rate-scales-auto)). Armed logs include `cal_source=file\|builtin`. No calibration/index I/O when effectively off. See [NPU trunk](npu/npu-trunk.md). |
 | `speculation.dflash_tree` | `false` | Enable DDTree tree-SWOR verification. |
-| `memory.oom_guard` | `auto` | Memory preflight OOM guard — see [Memory](#memory). Gates only the host available-memory headroom check (`MemAvailable` minus the CMA region); the R9700 deployment-target VRAM-budget check always runs. Env: `HIPFIRE_OOM_GUARD`. |
+| `memory.oom_guard` | `auto` | Memory preflight OOM guard — see [Memory](#memory). Gates the host available-memory headroom check (`MemAvailable` minus the CMA region) and, only when explicitly `off`, the load-time VRAM fit refusal of an explicit single-card Qwen VMM `max_seq`; the R9700 deployment-target VRAM-budget check always runs. Env: `HIPFIRE_OOM_GUARD`. |
 
 The following default-off keys are experimental kernel-route overrides. They
 are typed booleans, process-scoped, and visible in `hipfire config list` with
@@ -906,6 +906,18 @@ Only full-attention layers carry KV (16 of 64 for Qwen3.8-27B), so card capacity
 divides that remaining memory by the selected K+V token stride. VMM reserves
 virtual space to `max_seq` and maps physical pages on demand; without eviction,
 `physical_cap == max_seq`, while deprecated CASK eviction can make `physical_cap < max_seq`.
+The carrier's cap is provisional (it also charges the DFlash/MTP draft reserve):
+it sizes the VMM reservation and the draft structures before the drafts, DeltaNet
+state and scratch exist. So the automatic context is **re-measured after the
+whole load** (KV prefix, DeltaNet state, scratch, DFlash/MTP/DSpark, eviction):
+the loader finds the largest context whose remaining KV mapping plus the minimum
+prefill reserve (the minimum PBS, its 1 GiB headroom and 128 MiB of page
+rounding) fits the VRAM actually free, logs one `max_seq fit: measured after
+full load: free=… transient=… kv_mapped_growth_per_token≈… drafts=… ; context
+A -> B` line, and lowers the published context (and `card_cap`) to it; below 512
+the load is refused. An explicit `max_seq` that does not fit is refused at load,
+naming the largest fitting value; with `memory.oom_guard` off it loads and only
+warns.
 Larger prefill PBS allocations are lazy: each request chooses the widest rung
 that fits currently free VRAM after mapped (not virtually reserved) KV. When
 future KV growth needs the memory, widened PBS reuse is released between
@@ -1198,7 +1210,7 @@ aliases.
 Compat env: `HIPFIRE_OOM_GUARD`. Used by `kv_slots::preflight_alloc`, the
 `SlotPool` arena check, and the CLI bench-sweep headroom path.
 
-Two checks exist; only one is gated:
+Three checks exist; only two are gated:
 
 - **Host available-memory headroom** (`MemAvailable` minus the CMA region) — gated
   by `memory.oom_guard`. Default
@@ -1217,6 +1229,13 @@ Two checks exist; only one is gated:
   `preflight_alloc`) — **always runs**, on every arch, whether the host
   headroom guard is active or not. A configuration that does not fit the
   deployment target is refused regardless of this box's RAM.
+- **VRAM fit of an explicit single-card Qwen VMM `max_seq`** — after the whole
+  load (weights, drafts, scratch) the loader measures the largest context that
+  fits free VRAM with the minimum prefill reserve; an explicit `max_seq` above
+  it is refused at load naming that value. Gated only by an explicit `off`
+  (`false`/`0`), which prints the same message as a warning
+  (`memory.oom_guard off: loading anyway`) and keeps the requested context;
+  `auto` and `on` both refuse.
 
 `scripts/run-bounded.sh` (`HIPFIRE_MEM_CAP`) remains the hard cgroup backstop.
 
@@ -1248,6 +1267,28 @@ Two checks exist; only one is gated:
   approximation `> 0` counts as swap and **disables** the guard; `0` or an
   unavailable query **enables** it. The arch overrides apply unchanged
   (unified APU → on, discrete → off).
+
+### Spill warning
+
+On Linux with amdgpu, `hipfire serve`, `hipfire run` and `hipfire bench`
+(standard path) watch for VRAM spilling into system RAM (GTT), which keeps
+the model running but 2-3x slower with no error. The card is the one the
+bench's `power_device` report names (`hardware.devices`, else
+`ROCR_VISIBLE_DEVICES`, else the first ROCr agent of the daemon's arch). A
+baseline of `mem_info_gtt_used` is taken right after the model loads; after
+each finished request (each generation for `run`/`bench`) the monitor warns
+once on stderr when GTT grew by at least 256 MiB over it while
+`mem_info_vram_used` is within 512 MiB of `mem_info_vram_total`:
+
+```
+WARNING: GPU memory is spilling to system RAM: GTT +N MiB since load while VRAM is full (U/T MiB). Decode/prefill can be 2-3x slower. Lower memory.max_seq, use a smaller KV mode (kv_cache), a smaller tier, or turn speculation off.
+```
+
+It repeats only after GTT grows another 256 MiB. `hipfire bench --json` adds a
+per-run `spill` array of objects (`baseline_gtt`, `gtt`, `vram_used`,
+`vram_total` in bytes, and `spilled`) when the card is known. Unreadable
+counters (no amdgpu, no permission) disable the monitor silently; it is a
+no-op off Linux.
 
 ### Partial GPU offload (`memory.gpu_layer_budget` / `memory.moe_expert_budget` / `memory.offload_exec`)
 
