@@ -2387,11 +2387,15 @@ impl Qwen4MtpGpu {
         config: &Qwen4Config,
         max_seq: usize,
         backend: Qwen4KvBackend,
-        ep: Option<(Qwen4EpPlacement, &Qwen4EpDummyExpert)>,
+        ep: Option<(
+            Qwen4EpPlacement,
+            &Qwen4EpDummyExpert,
+            &crate::ep_seal::Qwen4EpRankSeal,
+        )>,
         head_d2: bool,
     ) -> Result<Self, MtpGpuError> {
         admit_mtp(weights, config)?;
-        if weights.ep_placement() != ep.map(|(placement, _)| placement) {
+        if weights.ep_placement() != ep.map(|(placement, _, _)| placement) {
             return Err(invalid(
                 "the MTP head's EP binding must be the forward's placement the weights were loaded with (EP weights are rank-compact)",
             ));
@@ -2424,7 +2428,8 @@ impl Qwen4MtpGpu {
         let moe = match head.ffn.moe() {
             Some(moe_weights) => {
                 let built = match ep {
-                    Some((placement, dummy)) => Qwen4MoeLayerRuntime::from_moe_ep(
+                    // The head's sealed expert group follows the trunk layers.
+                    Some((placement, dummy, seal)) => Qwen4MoeLayerRuntime::from_moe_ep(
                         gpu,
                         weights,
                         moe_weights,
@@ -2432,6 +2437,8 @@ impl Qwen4MtpGpu {
                         config,
                         placement,
                         dummy,
+                        seal,
+                        config.num_hidden_layers,
                     ),
                     None => Qwen4MoeLayerRuntime::from_moe_untiered(
                         gpu,
