@@ -482,6 +482,9 @@ mod tests {
             vram_total: free,
             free,
             link: None,
+            capacity: None,
+            env_selector: "0".into(),
+            config_selector: "GPU-0".into(),
         }
     }
 

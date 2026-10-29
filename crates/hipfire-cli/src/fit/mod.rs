@@ -6,12 +6,14 @@
 //! decision using machine counters and published receipts. Never initialize HIP
 //! or start a daemon here; GPU-dependent placement remains explicitly bounded.
 
+mod capacity;
 mod host;
 mod qwen4;
 mod remote;
 pub(crate) mod types;
 
 use anyhow::Result;
+use capacity::{BestDevice, GpuCapacity};
 use clap::Args;
 use hipfire_loader::admission::{
     admit_source_with_options, qwen4_kv_adaptive_requested, qwen_default_q8_enabled,
@@ -155,6 +157,20 @@ struct Plan {
     bound: String,
     model_ctx: Option<usize>,
     projection: Option<Value>,
+    /// The visible GPU that holds the most context (additive; set when more
+    /// than one GPU is visible and the plan is a checked single-GPU one).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    best_device: Option<BestDevice>,
+    /// Every visible GPU's projection, for the machine rows, the best-GPU line
+    /// and the tier table.
+    #[serde(skip)]
+    gpus: Vec<GpuCapacity>,
+    /// The context was left automatic (the loader's own minimum applies).
+    #[serde(skip)]
+    automatic: bool,
+    /// `hardware.devices` is set, so it alone selects a GPU.
+    #[serde(skip)]
+    devices_pinned: bool,
     placement: PlacementPlan,
     decode_route: String,
     /// Why the load takes that route (the setting that selected it, or the
@@ -169,6 +185,9 @@ struct TierRow {
     size_bytes: Option<u64>,
     verdict: Verdict,
     summary: String,
+    /// The GPU the tier's capacity was projected on (its best one).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    best_gpu: Option<usize>,
 }
 
 #[derive(Serialize)]
@@ -228,6 +247,37 @@ fn supply_visible_device_count(process: &hipfire_config::ProcessConfig, machine:
     std::env::set_var(hipfire_config::devices::ROCR_VISIBLE_DEVICES, all);
 }
 
+/// `hardware.devices` is set: it alone selects the GPU (it wins over
+/// `HIP_VISIBLE_DEVICES`, hipfire_config::devices).
+fn devices_pinned() -> bool {
+    hipfire_config::active_process_config()
+        .and_then(|process| process.legacy_value("HIPFIRE_DEVICES"))
+        .is_some_and(|spec| !spec.trim().is_empty())
+}
+
+/// The admission projection on every visible GPU, from the same facts and
+/// function the plan's own device uses.
+fn visible_gpu_capacities(
+    source: &ModelSource,
+    inputs: &AdmissionInputs<'_>,
+    machine: &FitHost,
+) -> Vec<GpuCapacity> {
+    machine
+        .devices
+        .iter()
+        .map(|device| {
+            GpuCapacity::new(
+                device,
+                hipfire_loader::admission::qwen35_card_projection(
+                    source,
+                    &device.arch,
+                    inputs.hints(device),
+                ),
+            )
+        })
+        .collect()
+}
+
 fn fold_findings(findings: &[Finding]) -> Verdict {
     findings.iter().fold(Verdict::Fits, |v, f| v.and(f.verdict))
 }
@@ -260,7 +310,7 @@ pub(crate) fn fit_command(paths: &crate::Paths, args: FitArgs) -> Result<()> {
         Ok(hipfire_config::devices::Claim::Claimed)
     })
     .err();
-    let (machine, host_notes) = host::detect_with_notes(paths);
+    let (mut machine, host_notes) = host::detect_with_notes(paths);
     let mut findings = preflight_findings(paths);
     if let Some(error) = visibility_error {
         findings.push(Finding::fails("admission", error.to_string(),
@@ -337,39 +387,67 @@ pub(crate) fn fit_command(paths: &crate::Paths, args: FitArgs) -> Result<()> {
                     size_bytes: tier.entry.size_bytes,
                     verdict: Verdict::Undetermined,
                     summary: format!("not evaluated: {error:#}"),
+                    best_gpu: None,
                 });
                 continue;
             }
         };
         // The tier's own fit: machine-level blockers (the runtime preflight,
         // device visibility) are reported once above and apply to every tier.
-        let verdict = fold_findings(&evaluated.findings);
-        // A tier that does not fit is summarized by the first term that fails;
-        // otherwise by its capacity and placement.
-        let failing = evaluated
-            .findings
-            .iter()
-            .find(|f| f.verdict == Verdict::DoesNotFit);
-        let mut summary = match failing {
-            Some(finding) => format!("{}: {}", finding.id, finding.detail),
-            None => evaluated
-                .plan
-                .as_ref()
-                .map(|p| {
-                    p.projection
+        // A tier whose context was projected per GPU is judged on its best GPU
+        // (its largest context, or that its weights do not fit anywhere).
+        let on_best = evaluated
+            .plan
+            .as_ref()
+            .filter(|p| !p.gpus.is_empty())
+            .and_then(|p| {
+                capacity::tier_on_best_gpu(
+                    &p.gpus,
+                    p.max_seq,
+                    p.automatic,
+                    machine.devices.len() > 1,
+                )
+            });
+        let (verdict, mut summary, best_gpu) = match on_best {
+            Some(best) => {
+                let rest = evaluated
+                    .findings
+                    .iter()
+                    .filter(|f| f.id != "context")
+                    .fold(Verdict::Fits, |v, f| v.and(f.verdict));
+                (rest.and(best.verdict), best.summary, Some(best.gpu))
+            }
+            None => {
+                let verdict = fold_findings(&evaluated.findings);
+                // A tier that does not fit is summarized by the first term that
+                // fails; otherwise by its capacity and placement.
+                let failing = evaluated
+                    .findings
+                    .iter()
+                    .find(|f| f.verdict == Verdict::DoesNotFit);
+                let summary = match failing {
+                    Some(finding) => format!("{}: {}", finding.id, finding.detail),
+                    None => evaluated
+                        .plan
                         .as_ref()
-                        .and_then(|v| v["card_cap"].as_u64())
-                        .map(|cap| format!("up to {cap} tokens; {}", p.placement.summary))
-                        .unwrap_or_else(|| p.placement.summary.clone())
-                })
-                .unwrap_or_else(|| {
-                    evaluated
-                        .findings
-                        .iter()
-                        .map(|f| f.detail.as_str())
-                        .collect::<Vec<_>>()
-                        .join("; ")
-                }),
+                        .map(|p| {
+                            p.projection
+                                .as_ref()
+                                .and_then(|v| v["card_cap"].as_u64())
+                                .map(|cap| format!("up to {cap} tokens; {}", p.placement.summary))
+                                .unwrap_or_else(|| p.placement.summary.clone())
+                        })
+                        .unwrap_or_else(|| {
+                            evaluated
+                                .findings
+                                .iter()
+                                .map(|f| f.detail.as_str())
+                                .collect::<Vec<_>>()
+                                .join("; ")
+                        }),
+                };
+                (verdict, summary, None)
+            }
         };
         let differs = crate::resolved_for_model(paths, tier.tag, Some(tier.tag), Some(tier.entry))
             .ok()
@@ -386,7 +464,17 @@ pub(crate) fn fit_command(paths: &crate::Paths, args: FitArgs) -> Result<()> {
             size_bytes: evaluated.model.size_bytes,
             verdict,
             summary,
+            best_gpu,
         });
+    }
+    // Each visible GPU's projected capacity for the fitted model, beside its
+    // memory facts in `machine`.
+    if let Some(plan) = &analysis.plan {
+        for gpu in &plan.gpus {
+            if let Some(device) = machine.devices.iter_mut().find(|d| d.index == gpu.index) {
+                device.capacity = gpu.capacity().map(|tokens| tokens as u64);
+            }
+        }
     }
     let published = matching_receipts(&analysis.model.tag, &machine, analysis.plan.as_ref());
     findings.extend(analysis.findings);
@@ -540,12 +628,17 @@ fn analyze_model(
     let inputs = admission_inputs(&params);
     let admitted = match inputs.admit(&path, device) {
         Ok(admitted) => admitted,
-        Err(detail) => {
-            result
-                .findings
-                .push(Finding::fails("admission", &detail, admission_fix(&detail)));
-            return Ok(result);
-        }
+        Err(detail) => match inputs.capacity_refusal(&path, device) {
+            // An automatic context refused for lack of room is a capacity
+            // answer (per GPU, per tier), not a setting to correct.
+            Some(admitted) => admitted,
+            None => {
+                result
+                    .findings
+                    .push(Finding::fails("admission", &detail, admission_fix(&detail)));
+                return Ok(result);
+            }
+        },
     };
     result.model.arch_id = Some(admitted.arch_id);
     if entry.is_none() {
@@ -603,6 +696,10 @@ fn analyze_model(
             .into(),
         model_ctx,
         projection: None,
+        best_device: None,
+        gpus: Vec::new(),
+        automatic: inputs.max_seq == 0,
+        devices_pinned: devices_pinned(),
         placement: PlacementPlan {
             summary: "fully resident".into(),
             expert_layers_resident: None,
@@ -636,13 +733,26 @@ fn analyze_model(
                 // The projection admission itself refused on: the load's own
                 // context check, so its verdict is the fit verdict.
                 Some(projection) => {
-                    result.findings.push(context_finding(
+                    let automatic = inputs.max_seq == 0;
+                    let gpus = visible_gpu_capacities(&admitted.source, &inputs, machine);
+                    let best = capacity::best_gpu(&gpus);
+                    let better = best.filter(|b| {
+                        b.index != device.index
+                            && b.capacity().is_some_and(|c| c > projection.card_cap)
+                    });
+                    result.findings.push(capacity::context_finding(
                         projection,
                         admitted.max_seq,
-                        inputs.max_seq == 0,
+                        automatic,
+                        device,
+                        better,
                     ));
                     plan.model_ctx = Some(projection.model_ctx);
                     plan.projection = Some(projection_json(projection));
+                    if machine.devices.len() > 1 {
+                        plan.best_device = best.and_then(capacity::best_device);
+                    }
+                    plan.gpus = gpus;
                 }
                 // No stored projection (MoE on a discrete GPU, or legacy KV):
                 // the daemon does not check this context before load, so fit
@@ -1091,49 +1201,13 @@ fn unchecked_context_finding(
                 gib(p.scratch as u64),
                 gib(p.page_rounding as u64),
             ),
-            (max_seq > p.card_cap).then(|| {
-                format!(
-                    "lower --ctx to at most {} (`hipfire config set memory.max_seq {}`) or free GPU memory",
-                    p.card_cap, p.card_cap
-                )
-            }),
+            (max_seq > p.card_cap).then(|| capacity::context_fix(p.card_cap, None)),
         ),
         Err(error) => Finding::undetermined(
             "context",
             format!("the daemon does not check this context before load ({reason}); no projection: {error}"),
             None,
         ),
-    }
-}
-
-fn context_finding(p: Qwen35CardProjection, requested: usize, automatic: bool) -> Finding {
-    let charges = format!(
-        "free {} - weights {} - prefill scratch {} - page rounding {}",
-        gib(p.free as u64),
-        gib(p.weights as u64),
-        gib(p.scratch as u64),
-        gib(p.page_rounding as u64)
-    );
-    let fix = format!("lower --ctx to at most {} (`hipfire config set memory.max_seq {}`), free GPU memory, or pick a smaller tier", p.card_cap, p.card_cap);
-    if automatic && p.card_cap < QWEN35_MIN_AUTO_CONTEXT {
-        return Finding::fails(
-            "context",
-            format!(
-                "projected card capacity {} is below the minimum automatic context {} ({charges})",
-                p.card_cap, QWEN35_MIN_AUTO_CONTEXT
-            ),
-            "free GPU memory or pick a smaller tier to provide the minimum automatic context",
-        );
-    }
-    if automatic {
-        Finding::fits("context", format!("automatic context: min(trained window {}, card capacity measured after weights load); projected {} tokens ({charges})", p.model_ctx, p.card_cap))
-    } else {
-        let detail = format!("a {requested}-token context needs {requested} x {} bytes of KV; the projection leaves room for {} tokens ({charges})", p.bytes_per_token, p.card_cap);
-        if requested <= p.card_cap {
-            Finding::fits("context", detail)
-        } else {
-            Finding::fails("context", detail, fix)
-        }
     }
 }
 
@@ -1278,9 +1352,15 @@ fn render_text(report: &Report, verbose: bool) -> String {
         let link = device.link.as_ref().map(|l| l.detail.as_str()).unwrap_or(
             "not calibrated: run `hipfire calibrate` (the engine probes the link at load)",
         );
+        // Per-GPU capacity of the fitted model, only where it tells GPUs apart.
+        let cap_text = device
+            .capacity
+            .filter(|_| report.machine.devices.len() > 1)
+            .map(|tokens| format!("  capacity: {}", capacity::device_capacity_text(tokens)))
+            .unwrap_or_default();
         let _ = writeln!(
             out,
-            "  GPU{} {}  {free} free of {total}  link: {link}",
+            "  GPU{} {}  {free} free of {total}{cap_text}  link: {link}",
             device.index, device.arch
         );
     }
@@ -1354,8 +1434,29 @@ fn render_text(report: &Report, verbose: bool) -> String {
                 .unwrap_or_else(|| "decided at load".into())
         );
         if let Some(p) = &plan.projection {
-            let n = |key: &str| p[key].as_u64().unwrap_or(0);
-            let _ = writeln!(out, "  capacity   up to {} tokens (pre-load estimate: {} free - {} weights - {} prefill scratch - {} rounding; {} B/token)", n("card_cap"), gib(n("free")), gib(n("weights")), gib(n("scratch")), gib(n("page_rounding")), n("bytes_per_token"));
+            let device = report
+                .machine
+                .devices
+                .iter()
+                .find(|d| d.index == plan.device_index);
+            let mut lines = capacity::capacity_lines(p, device).into_iter();
+            if let Some(first) = lines.next() {
+                let _ = writeln!(out, "  capacity   {first}");
+            }
+            for line in lines {
+                let _ = writeln!(out, "               {line}");
+            }
+        }
+        // The best visible GPU, when it is not the one this plan loads on.
+        if let Some(best) = plan
+            .best_device
+            .as_ref()
+            .filter(|best| best.index != plan.device_index)
+            .and_then(|best| plan.gpus.iter().find(|g| g.index == best.index))
+        {
+            if let Some(line) = capacity::best_gpu_line(best, plan.devices_pinned) {
+                let _ = writeln!(out, "  best GPU   {line}");
+            }
         }
         let _ = writeln!(out, "  placement  {}", plan.placement.summary);
         let _ = writeln!(out, "  decode     {}", plan.decode_route);
@@ -1396,7 +1497,12 @@ fn render_text(report: &Report, verbose: bool) -> String {
     if !report.tiers.is_empty() {
         let _ = writeln!(
             out,
-            "quant tiers (model fit only; pull default: {})",
+            "quant tiers (model fit only{}; pull default: {})",
+            if report.machine.devices.len() > 1 {
+                ", on each tier's best GPU"
+            } else {
+                ""
+            },
             report.model.tag
         );
         for tier in &report.tiers {
@@ -1423,8 +1529,13 @@ fn render_text(report: &Report, verbose: bool) -> String {
             out,
             "largest tier that fits at {context}: {}",
             largest
-                .map(|t| t.tag.as_str())
-                .unwrap_or("none established")
+                .map(|t| match t.best_gpu {
+                    Some(gpu) if report.machine.devices.len() > 1 => {
+                        format!("{} (on GPU{gpu})", t.tag)
+                    }
+                    _ => t.tag.clone(),
+                })
+                .unwrap_or_else(|| "none established".into())
         );
     }
     let _ = writeln!(
@@ -1527,6 +1638,15 @@ impl AdmissionInputs<'_> {
         path: &Path,
         device: &FitDevice,
     ) -> std::result::Result<SourceAdmission, String> {
+        self.admit_at(path, device, self.max_seq)
+    }
+
+    fn admit_at(
+        &self,
+        path: &Path,
+        device: &FitDevice,
+        max_seq: usize,
+    ) -> std::result::Result<SourceAdmission, String> {
         if let Some(error) = &self.error {
             return Err(error.clone());
         }
@@ -1541,10 +1661,32 @@ impl AdmissionInputs<'_> {
             self.vision,
             self.vision_mode,
             self.head,
-            self.max_seq,
+            max_seq,
             self.hints(device),
             self.options,
         )
+    }
+
+    /// The admission of an automatic context the loader refused because the
+    /// projection leaves less than its minimum (`resolve_sequence`), taken at
+    /// the minimum explicit context so the projection it refused on is
+    /// available; the sequence is then what the automatic load would resolve
+    /// (trained window, pending the measured capacity). `None` when this is
+    /// not that refusal.
+    fn capacity_refusal(&self, path: &Path, device: &FitDevice) -> Option<SourceAdmission> {
+        if self.max_seq != 0 {
+            return None;
+        }
+        let mut admitted = self.admit_at(path, device, QWEN35_MIN_AUTO_CONTEXT).ok()?;
+        let sequence = admitted.sequence.as_mut()?;
+        let projection = sequence.projection?;
+        if projection.card_cap >= QWEN35_MIN_AUTO_CONTEXT {
+            return None;
+        }
+        sequence.max_seq = projection.model_ctx;
+        sequence.bound = "pending";
+        admitted.max_seq = projection.model_ctx;
+        Some(admitted)
     }
 }
 
@@ -1759,6 +1901,9 @@ mod tests {
             vram_total: Some(32 << 30),
             free: Some(31 << 30),
             link: None,
+            capacity: None,
+            env_selector: "0".into(),
+            config_selector: "GPU-0".into(),
         }
     }
 
@@ -1821,6 +1966,10 @@ mod tests {
                 bound: "user".into(),
                 model_ctx: Some(p.model_ctx),
                 projection: Some(projection_json(p)),
+                best_device: None,
+                gpus: Vec::new(),
+                automatic: false,
+                devices_pinned: false,
                 placement: PlacementPlan {
                     summary: "fully resident".into(),
                     expert_layers_resident: None,
@@ -1837,7 +1986,7 @@ mod tests {
             }),
             findings: vec![
                 Finding::fits("preflight", "runtime preflight ok"),
-                context_finding(p, 65_536, false),
+                capacity::context_finding(p, 65_536, false, &device(), None),
                 Finding::fails(
                     "host_ram",
                     "host RAM gate failed",
@@ -1993,10 +2142,10 @@ mod tests {
     #[test]
     fn context_user_fits_and_exceeds() {
         assert_eq!(
-            context_finding(projection(), 65_536, false).verdict,
+            capacity::context_finding(projection(), 65_536, false, &device(), None).verdict,
             Verdict::Fits
         );
-        let failure = context_finding(projection(), 262_144, false);
+        let failure = capacity::context_finding(projection(), 262_144, false, &device(), None);
         assert_eq!(failure.verdict, Verdict::DoesNotFit);
         assert!(failure.detail.contains("49152 bytes"));
         assert!(failure.fix.unwrap().contains("200000"));
@@ -2004,14 +2153,14 @@ mod tests {
 
     #[test]
     fn context_automatic_and_minimum_floor() {
-        let automatic = context_finding(projection(), 0, true);
+        let automatic = capacity::context_finding(projection(), 0, true, &device(), None);
         assert_eq!(automatic.verdict, Verdict::Fits);
         assert!(automatic
             .detail
             .contains("automatic context: min(trained window"));
         let mut p = projection();
         p.card_cap = QWEN35_MIN_AUTO_CONTEXT - 1;
-        let failure = context_finding(p, 0, true);
+        let failure = capacity::context_finding(p, 0, true, &device(), None);
         assert_eq!(failure.verdict, Verdict::DoesNotFit);
         assert!(!failure.fix.unwrap().is_empty());
     }
@@ -2590,5 +2739,64 @@ mod tests {
             value["overrides"],
             json!({"kv_mode": "q8", "kv_k": null, "kv_v": null, "spec": "mtp"})
         );
+    }
+
+    #[test]
+    fn busy_gpu_report_names_the_best_gpu_rows_tiers_and_json() {
+        let mut report = report();
+        let busy = {
+            let mut p = projection();
+            p.free = 2 << 30;
+            p.card_cap = 0;
+            p
+        };
+        let mut roomy = projection();
+        roomy.card_cap = 1_600_000;
+        let mut gpu0 = device();
+        gpu0.free = Some(2 << 30);
+        gpu0.capacity = Some(0);
+        let mut gpu2 = device();
+        gpu2.index = 2;
+        gpu2.capacity = Some(1_600_000);
+        gpu2.env_selector = "2".into();
+        gpu2.config_selector = "GPU-0000000000000002".into();
+        let gpus = vec![
+            GpuCapacity::new(&gpu0, Ok(busy)),
+            GpuCapacity::new(&gpu2, Ok(roomy)),
+        ];
+        report.machine.devices = vec![gpu0, gpu2];
+        let plan = report.plan.as_mut().unwrap();
+        plan.projection = Some(projection_json(busy));
+        plan.best_device = capacity::best_gpu(&gpus).and_then(capacity::best_device);
+        plan.gpus = gpus;
+        report.tiers = vec![TierRow {
+            tag: "example:mq4".into(),
+            size_bytes: Some(20 << 30),
+            verdict: Verdict::Fits,
+            summary: "up to 1600000 tokens on GPU2".into(),
+            best_gpu: Some(2),
+        }];
+        let text = render_text(&report, false);
+        assert!(text.contains(
+            "  GPU0 gfx1201  2.0 GiB free of 32.0 GiB  capacity: weights don't fit  link:"
+        ));
+        assert!(text.contains(
+            "  GPU2 gfx1201  31.0 GiB free of 32.0 GiB  capacity: up to 1600000 tokens  link:"
+        ));
+        assert!(text.contains("  capacity   weights + prefill scratch exceed free memory (2.0 GiB free of 32.0 GiB; 30.0 GiB held by other processes or the desktop)"));
+        assert!(text.contains("  best GPU   GPU2 (32.0 GiB free): up to 1600000 tokens — select it with HIP_VISIBLE_DEVICES=2 (or `hipfire config set hardware.devices GPU-0000000000000002`)"));
+        assert!(text.contains("quant tiers (model fit only, on each tier's best GPU;"));
+        assert!(text.contains("  example:mq4  20.0 GiB  FITS  up to 1600000 tokens on GPU2"));
+        assert!(text.contains("largest tier that fits at 65536 tokens: example:mq4 (on GPU2)"));
+        let value = json_report(&report).unwrap();
+        assert_eq!(value["plan"]["best_device"]["index"], 2);
+        assert_eq!(value["plan"]["best_device"]["capacity"], 1_600_000);
+        assert!(value["plan"]["best_device"]["free_bytes"]
+            .as_u64()
+            .is_some());
+        assert_eq!(value["machine"]["devices"][0]["capacity"], 0);
+        assert_eq!(value["machine"]["devices"][1]["capacity"], 1_600_000);
+        assert_eq!(value["tiers"][0]["best_gpu"], 2);
+        assert!(value["machine"]["devices"][0].get("env_selector").is_none());
     }
 }

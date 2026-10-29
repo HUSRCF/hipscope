@@ -403,6 +403,9 @@ fn fit_device(
         vram_total,
         free,
         link: Some(link),
+        capacity: None,
+        env_selector: gpu.rocr_selector(),
+        config_selector: gpu.uuid().unwrap_or(bdf),
     }
 }
 
