@@ -76,7 +76,7 @@
 //! `--base-<knob>` emitted baselines. The baseline's recorded knobs then name its real schedule. The emitted twin of
 //! that export is `--wait window --fetch pairw --idle skiphi` (code sha equal to the shipped export's).
 //!
-//! # `--flush` (cold timing)
+//! # `--pool` / `--flush-l2` / `--flush` (cold timing)
 //! Cold-cache timing with a rotating weight pool, see the doc comment of `pm_loop.rs`. The pool holds distinct seeded
 //! weight sets (`pool_seed`; gate and up for silu), set 0 being the correctness weights; sparse arms are refused.
 //!
@@ -571,8 +571,8 @@ pub struct Iu4 {
     sparse_seed: u64,
     /// `--rip`: the candidate arm is this source, not `iu4_gemm::emit`.
     rip: Option<RipSource>,
-    /// `--flush`: cold-cache timing with the rotating weight pool (`Workload::set_cold`).
-    cold: bool,
+    /// `--pool` / `--flush-l2` / `--flush`: cold-cache timing with the rotating weight pool (`Workload::set_cold`).
+    cold: crate::cold::ColdMode,
 }
 
 struct RipSource {
@@ -839,7 +839,7 @@ pub fn new_with_rip(
         reference: [OnceCell::new(), OnceCell::new()],
         sparse_seed,
         rip,
-        cold: false,
+        cold: crate::cold::ColdMode::Hot,
     }))
 }
 
@@ -1142,11 +1142,8 @@ impl Workload for Iu4 {
         let mut v = json!({"M": self.m, "N": self.n, "K": self.k,
                "launch_rows": if self.cand.epi.is_silu() { 2 * self.m } else { self.m }});
         // Cold-cache timing is part of the shape (a `pm-census noise` group never matches across
-        // hot and cold); a hot run's shape keeps its bytes.
-        if self.cold {
-            v["flush"] = json!(true);
-            v["timing_pool"] = crate::cold::pool_json(self.pool_sets(), self.set_bytes());
-        }
+        // modes); a hot run's shape keeps its bytes.
+        crate::cold::annotate_shape(&mut v, self.cold, self.pool_sets(), self.set_bytes());
         v
     }
     fn record_extra(&self) -> Vec<(String, Value)> {
@@ -1214,7 +1211,7 @@ impl Workload for Iu4 {
         }
         // `--flush`: the timing pool, sets 1.. (set 0 is the correctness set above).
         let mut pool = Vec::new();
-        if self.cold {
+        if self.cold.pool() {
             for s in 1..self.pool_sets() {
                 let w = up(&synth_weights(self.m, self.k, pool_seed(GATE_SEED, s)))?;
                 let w_up = if silu {
@@ -1249,19 +1246,30 @@ impl Workload for Iu4 {
         self.launch_set(arm, 0)
     }
 
-    fn set_cold(&mut self, cold: bool) -> Result<()> {
-        if cold && self.sparse_active() {
-            return Err(
-                "--flush does not support a 2:4 sparse arm (--mma/--base-mma): the packed image has no weight pool"
-                    .into(),
-            );
+    fn set_cold(&mut self, mode: crate::cold::ColdMode) -> Result<()> {
+        if mode.pool() && self.sparse_active() {
+            return Err(format!(
+                "{} does not support a 2:4 sparse arm (--mma/--base-mma): the packed image has no weight pool",
+                mode.flag()
+            ));
         }
-        self.cold = cold;
+        self.cold = mode;
         Ok(())
     }
 
+    fn null_object(&self) -> Result<Option<Object>> {
+        let e = iu4_gemm::emit(self.base)?;
+        crate::common::null_object(
+            &e.s_text,
+            self.base.arch,
+            &self.base.symbol(),
+            "the baseline spec's emit with the body replaced by s_endpgm (descriptor unchanged)",
+        )
+        .map(Some)
+    }
+
     fn pool_sets(&self) -> usize {
-        if self.cold {
+        if self.cold.pool() {
             crate::cold::pool_sets(self.set_bytes())
         } else {
             1
@@ -2031,7 +2039,7 @@ mod tests {
             )
             .unwrap();
             assert_eq!(w.pool_sets(), 1, "hot: no pool");
-            w.set_cold(true).unwrap();
+            w.set_cold(crate::cold::ColdMode::Flush).unwrap();
             (w.pool_sets(), w.shape_json())
         };
         // down (47.3 MB), gate_up (gate + up = 94.7 MB), out-proj (16.7 MB).
@@ -2062,26 +2070,29 @@ mod tests {
             ["K", "M", "N", "launch_rows"],
             "a pm-census noise group keys on this"
         );
-        w.set_cold(true).unwrap();
+        w.set_cold(crate::cold::ColdMode::Flush).unwrap();
         let cold = w.shape_json();
         for k in ["K", "M", "N", "launch_rows"] {
             assert_eq!(cold[k], hot[k]);
         }
         assert!(cold["flush"] == true && cold["timing_pool"].is_object());
         // Back to hot: the keys go away again.
-        w.set_cold(false).unwrap();
+        w.set_cold(crate::cold::ColdMode::Hot).unwrap();
         assert_eq!(w.shape_json(), hot);
     }
 
     #[test]
     fn flush_refuses_a_sparse_arm() {
         let mut w = new("M=128,N=64,K=256", &mut knobs(&[("mma", "s24x64")])).unwrap();
-        assert!(w.set_cold(true).unwrap_err().contains("2:4 sparse"));
+        assert!(w
+            .set_cold(crate::cold::ColdMode::Flush)
+            .unwrap_err()
+            .contains("2:4 sparse"));
         let mut w = new("M=128,N=64,K=256", &mut knobs(&[("base-mma", "s24x32")])).unwrap();
-        assert!(w.set_cold(true).is_err());
+        assert!(w.set_cold(crate::cold::ColdMode::Flush).is_err());
         assert!(new("M=128,N=64,K=256", &mut knobs(&[]))
             .unwrap()
-            .set_cold(true)
+            .set_cold(crate::cold::ColdMode::Flush)
             .is_ok());
     }
 
@@ -2108,5 +2119,64 @@ mod tests {
         assert_ne!(w(1), w(2));
         // Set 0 of the pool is `Host::synth`'s weights.
         assert_eq!(w(0), Host::synth(4, 1, 256, false).w);
+    }
+
+    #[test]
+    fn pool_only_and_l2_flush_modes_pool_like_flush_but_record_their_own_keys() {
+        use crate::cold::ColdMode::*;
+        let shape = |m| {
+            let mut w = new("M=5120,N=64,K=17408", &mut knobs(&[("epi", "add")])).unwrap();
+            w.set_cold(m).unwrap();
+            (w.pool_sets(), w.shape_json())
+        };
+        let (np, p) = shape(Pool);
+        let (nl, l) = shape(FlushL2);
+        let (nf, f) = shape(Flush);
+        assert_eq!((np, nl, nf), (5, 5, 5));
+        assert_eq!(
+            (p["flush"].clone(), l["flush"].clone(), f["flush"].clone()),
+            (json!(false), json!(false), json!(true))
+        );
+        assert!(
+            p.get("flush_l2").is_none() && l["flush_l2"] == true && f.get("flush_l2").is_none()
+        );
+        assert_eq!(p["timing_pool"], f["timing_pool"]);
+        // Sparse arms have no pool in any mode.
+        for m in [Pool, FlushL2, Flush] {
+            let mut w = new("M=128,N=64,K=256", &mut knobs(&[("mma", "s24x64")])).unwrap();
+            let e = w.set_cold(m).unwrap_err();
+            assert!(e.starts_with(m.flag()) && e.contains("2:4 sparse"), "{e}");
+        }
+    }
+
+    #[test]
+    fn null_object_keeps_the_descriptor_and_drops_the_body() {
+        let code = |o: &Object| {
+            let p = crate::lift(&o.bytes).unwrap();
+            let r = crate::resources(&p, std::slice::from_ref(&o.launch_symbol)).unwrap();
+            (
+                r[0]["code_bytes"].as_u64().unwrap(),
+                r[0]["vgprs"].as_u64().unwrap(),
+                r[0]["sgprs"].as_u64().unwrap(),
+                r[0]["kernarg_bytes"].as_u64().unwrap(),
+                r[0]["max_flat_workgroup_size"].as_u64().unwrap(),
+            )
+        };
+        for (epi, shape) in [
+            ("add", "M=5120,N=64,K=17408"),
+            ("silu", "M=17408,N=64,K=5120"),
+        ] {
+            let mut k = knobs(&[("alayout", "slab"), ("epi", epi), ("base-shipped", "v64")]);
+            let w = new(shape, &mut k).unwrap();
+            let (base, null) = (w.baseline().unwrap(), w.null_object().unwrap().unwrap());
+            assert_eq!(null.launch_symbol, base.launch_symbol);
+            let (b, n) = (code(&base), code(&null));
+            assert!(n.0 <= 8 && b.0 > 1000, "{epi}: code {} -> {}", b.0, n.0);
+            assert_eq!(
+                (n.1, n.2, n.3, n.4),
+                (b.1, b.2, b.3, b.4),
+                "{epi}: VGPRs, SGPRs, kernarg, workgroup size stay"
+            );
+        }
     }
 }

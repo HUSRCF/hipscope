@@ -34,9 +34,10 @@
 //! QKV and Z rows `sample_rows(_, 192)` plus every beta (`6144..6192`) and alpha (`6208..6256`) row
 //! of the fold; every token column. Outputs are compared bit for bit.
 //!
-//! # `--flush`
+//! # `--pool` / `--flush-l2` / `--flush`
 //! Cold-cache timing (`support/cold.rs`): a pool of distinct seeded `(Wqkv, Wz fold)` sets whose
-//! total exceeds 192 MiB and a 2 x 96 MiB device copy after every timed dispatch. Set 0 is the
+//! total exceeds 192 MiB, and optionally a device copy after every timed dispatch (2 x L2 per buffer
+//! for `--flush-l2`, 2 x 96 MiB for `--flush`). Set 0 is the
 //! correctness set the CPU reference reads; the arms are also compared on every other pool member.
 
 use crate::common::{dev_err, put_f32, put_i32, put_ptr, sha256_hex};
@@ -210,7 +211,7 @@ pub struct Qkvzaset {
     dev: Option<Dev>,
     /// CPU reference: `[qkv rows, z-fold rows]` x N, each row-major in the rows' order.
     refs: OnceCell<(Vec<f32>, Vec<f32>)>,
-    cold: bool,
+    cold: crate::cold::ColdMode,
 }
 
 pub fn new(shape: &str, knobs: &mut Knobs) -> Result<Box<dyn Workload>> {
@@ -248,7 +249,7 @@ pub fn new(shape: &str, knobs: &mut Knobs) -> Result<Box<dyn Workload>> {
         hz: None,
         dev: None,
         refs: OnceCell::new(),
-        cold: false,
+        cold: crate::cold::ColdMode::Hot,
     }))
 }
 
@@ -336,10 +337,7 @@ impl Workload for Qkvzaset {
             "kernarg_bytes": KERNARG_BYTES,
         });
         // Cold-cache timing is part of the shape; a hot run's shape keeps no cold keys.
-        if self.cold {
-            v["flush"] = json!(true);
-            v["timing_pool"] = crate::cold::pool_json(self.pool_sets(), self.set_bytes());
-        }
+        crate::cold::annotate_shape(&mut v, self.cold, self.pool_sets(), self.set_bytes());
         v
     }
     fn candidate_knobs(&self) -> Value {
@@ -375,7 +373,7 @@ impl Workload for Qkvzaset {
             Ok(d)
         };
         let mut pool = Vec::new();
-        if self.cold {
+        if self.cold.pool() {
             for s in 1..self.pool_sets() {
                 pool.push((
                     up(&synth_weights(QKV_M, self.k, pool_seed(QKV_SEED, s)))?,
@@ -418,13 +416,24 @@ impl Workload for Qkvzaset {
         self.launch_set(arm, 0)
     }
 
-    fn set_cold(&mut self, cold: bool) -> Result<()> {
-        self.cold = cold;
+    fn set_cold(&mut self, mode: crate::cold::ColdMode) -> Result<()> {
+        self.cold = mode;
         Ok(())
     }
 
+    fn null_object(&self) -> Result<Option<Object>> {
+        let e = iu4_gemm::emit(self.base)?;
+        crate::common::null_object(
+            &e.s_text,
+            self.base.arch,
+            &self.base.symbol(),
+            "the baseline spec's emit with the body replaced by s_endpgm (descriptor unchanged)",
+        )
+        .map(Some)
+    }
+
     fn pool_sets(&self) -> usize {
-        if self.cold {
+        if self.cold.pool() {
             crate::cold::pool_sets(self.set_bytes())
         } else {
             1
@@ -695,7 +704,7 @@ mod tests {
     fn cold_pool_exceeds_the_last_level_cache_and_is_recorded() {
         let mut w = make("N=64", &[]).unwrap();
         assert_eq!(w.pool_sets(), 1);
-        w.set_cold(true).unwrap();
+        w.set_cold(crate::cold::ColdMode::Flush).unwrap();
         let set_bytes = (10240 + 6272) * 20 * 136;
         let sets = w.pool_sets();
         assert_eq!(sets % 2, 1);
@@ -762,5 +771,21 @@ mod tests {
             code(&w.baseline().unwrap()).0,
             code(&w.candidate().unwrap()).0
         );
+    }
+
+    #[test]
+    fn null_object_is_the_shipped_descriptor_with_an_empty_body() {
+        let w = make("N=64", &[]).unwrap();
+        let (base, null) = (w.baseline().unwrap(), w.null_object().unwrap().unwrap());
+        assert_eq!(null.launch_symbol, base.launch_symbol);
+        let res = |o: &Object| {
+            let p = crate::lift(&o.bytes).unwrap();
+            crate::resources(&p, std::slice::from_ref(&o.launch_symbol)).unwrap()[0].clone()
+        };
+        let (b, n) = (res(&base), res(&null));
+        assert!(n["code_bytes"].as_u64().unwrap() <= 8 && b["code_bytes"].as_u64().unwrap() > 9000);
+        for key in ["vgprs", "sgprs", "kernarg_bytes", "max_flat_workgroup_size"] {
+            assert_eq!(n[key], b[key], "{key}");
+        }
     }
 }

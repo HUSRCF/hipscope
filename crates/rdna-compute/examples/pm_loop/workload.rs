@@ -63,7 +63,7 @@ pub struct RefReport {
     pub pass: bool,
 }
 
-/// The `--kernel`s that take `--flush` (cold-cache timing with a rotating weight pool).
+/// The `--kernel`s that take `--pool` / `--flush-l2` / `--flush` (cold timing with a rotating weight pool).
 pub const COLD_KERNELS: [&str; 2] = ["iu4_gemm", "qkvzaset"];
 
 /// Raw `--key value` flags the driver did not consume. A module `take`s the
@@ -168,13 +168,15 @@ pub trait Workload {
         None
     }
 
-    /// `--flush` (cold timing, `support/cold.rs`): called once after construction, before `setup`.
-    /// A workload that supports it allocates a rotating weight pool in `setup` ([`Workload::pool_sets`]
-    /// sets whose total exceeds the last-level cache) and records `flush` / `timing_pool` in its
-    /// `shape_json`; the driver evicts the caches between timed dispatches. The default refuses.
-    fn set_cold(&mut self, _cold: bool) -> Result<()> {
+    /// `--pool` / `--flush-l2` / `--flush` (cold timing, `support/cold.rs`): called once after
+    /// construction, before `setup`, with the mode (never `Hot`). A workload that supports it
+    /// allocates a rotating weight pool in `setup` ([`Workload::pool_sets`] sets whose total exceeds
+    /// the last-level cache) and records the mode with `cold::annotate_shape` in its `shape_json`;
+    /// the driver evicts the caches between timed dispatches. The default refuses.
+    fn set_cold(&mut self, mode: crate::cold::ColdMode) -> Result<()> {
         Err(format!(
-            "--flush is not supported by --kernel {} (cold timing: {})",
+            "{} is not supported by --kernel {} (cold timing: {})",
+            mode.flag(),
             self.kernel(),
             COLD_KERNELS.join(", ")
         ))
@@ -187,6 +189,13 @@ pub trait Workload {
     /// CPU reference reads). The driver issues timed dispatch `i` on set `i % pool_sets()`.
     fn launch_set(&self, arm: Arm, _set: usize) -> Launch {
         self.launch(arm)
+    }
+    /// A NULL kernel with the baseline's resource descriptor (VGPRs, LDS, kernarg size) whose body is
+    /// a single `s_endpgm`, launched with [`Workload::launch_set`]'s grid, block, LDS and kernarg: its
+    /// hipEvent time is the fixed dispatch cost the driver reports as `timing.null_dispatch`.
+    /// `Ok(None)`: this workload has none.
+    fn null_object(&self) -> Result<Option<Object>> {
+        Ok(None)
     }
 }
 
