@@ -603,8 +603,10 @@ mod tests {
         let ops = include_str!("../../src/tensor_ops.rs");
         for needle in [
             "const QSA_ATTENTION_HG4_HEADS: usize = 4;",
-            ".checked_mul(4 * QSA_ATTENTION_HG4_HEADS + 4)?",
-            ".checked_add(4 * (QSA_ATTENTION_HG4_HEADS * 256 + QSA_ATTENTION_HG4_HEADS))?",
+            // The non-lite (shipped-before-batch-2) LDS formula this node reproduces; beta's q8 gfx1100 default
+            // is now the hg4_lite twin (`selected * 16 + 128`), which this node does not model yet.
+            "4 * QSA_ATTENTION_HG4_HEADS + 4,",
+            "4 * (QSA_ATTENTION_HG4_HEADS * 256 + QSA_ATTENTION_HG4_HEADS),",
             "p.n_heads / QSA_ATTENTION_HG4_HEADS,",
             "const QSA_ATTENTION_PARALLEL_THREADS: u32 = 256;",
             "const QSA_ATTENTION_DYNAMIC_LDS_LIMIT_BYTES: usize = 64 * 1024;",
