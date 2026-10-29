@@ -208,12 +208,12 @@ impl GgmlType {
             Self::Q4_1 => 20, // 2 (f16 scale) + 2 (f16 min) + 16
             Self::Q5_0 => 22, // 2 + 4 (high bits) + 16
             Self::Q5_1 => 24,
-            Self::Q8_0 => 34, // 2 (f16 scale) + 32 (32 x 8-bit)
-            Self::Q8_1 => 36, // 2 (f16 d) + 2 (f16 s) + 32 (32 x 8-bit)
-            Self::MXFP4 => 17, // 1 (E8M0 scale) + 16 (32 x 4-bit)
-            Self::Q2K => 2 + 2 + 16 + 64, // 84: d(2) + dmin(2) + scales(16) + qs(64)
-            Self::Q3K => 2 + 32 + 12 + 64, // 110: d(2) + hmask(32) + scales(12) + qs(64)
-            Self::Q4K => 2 + 2 + 12 + 128, // 144: d(2) + dmin(2) + scales(12) + qs(128)
+            Self::Q8_0 => 34,                   // 2 (f16 scale) + 32 (32 x 8-bit)
+            Self::Q8_1 => 36,                   // 2 (f16 d) + 2 (f16 s) + 32 (32 x 8-bit)
+            Self::MXFP4 => 17,                  // 1 (E8M0 scale) + 16 (32 x 4-bit)
+            Self::Q2K => 2 + 2 + 16 + 64,       // 84: d(2) + dmin(2) + scales(16) + qs(64)
+            Self::Q3K => 2 + 32 + 12 + 64,      // 110: d(2) + hmask(32) + scales(12) + qs(64)
+            Self::Q4K => 2 + 2 + 12 + 128,      // 144: d(2) + dmin(2) + scales(12) + qs(128)
             Self::Q5K => 2 + 2 + 12 + 128 + 32, // 176: d(2) + dmin(2) + scales(12) + qs(128) + qh(32)
             Self::Q6K => 128 + 64 + 16 + 2,     // 210: ql(128) + qh(64) + scales(16) + d(2)
             Self::Q8K => 4 + 256 + 32,          // 292: d(f32) + qs(256) + bsums(16 x i16)
@@ -221,11 +221,11 @@ impl GgmlType {
             Self::IQ2XS => 2 + 64 + 8,          // 74: d(2) + qs(32 x u16) + scales(8)
             Self::IQ2S => 2 + 64 + 8 + 8,       // 82: d(2) + qs(64) + qh(8) + scales(8)
             Self::IQ3XXS => 2 + 96,             // 98: d(2) + qs(96)
-            Self::IQ3S => 2 + 64 + 8 + 32 + 4,  // 110: d(2) + qs(64) + qh(8) + signs(32) + scales(4)
-            Self::IQ1S => 2 + 32 + 16,          // 50: d(2) + qs(32) + qh(16 B = 8 x u16)
-            Self::IQ1M => 32 + 16 + 8,          // 56: qs(32) + qh(16) + scales(8); no d field
-            Self::IQ4NL => 2 + 16,              // 18: d(2) + qs(16)
-            Self::IQ4XS => 2 + 2 + 4 + 128,     // 136: d(2) + scales_h(2) + scales_l(4) + qs(128)
+            Self::IQ3S => 2 + 64 + 8 + 32 + 4, // 110: d(2) + qs(64) + qh(8) + signs(32) + scales(4)
+            Self::IQ1S => 2 + 32 + 16,         // 50: d(2) + qs(32) + qh(16 B = 8 x u16)
+            Self::IQ1M => 32 + 16 + 8,         // 56: qs(32) + qh(16) + scales(8); no d field
+            Self::IQ4NL => 2 + 16,             // 18: d(2) + qs(16)
+            Self::IQ4XS => 2 + 2 + 4 + 128,    // 136: d(2) + scales_h(2) + scales_l(4) + qs(128)
         }
     }
 
@@ -621,8 +621,14 @@ mod tests {
     #[test]
     fn unknown_ids_fail_closed() {
         // Removed/legacy ids, TQ/NVFP4/Q1_0/Q2_0, the integer types and a wild id.
-        for id in [4, 5, 24, 25, 26, 27, 28, 31, 32, 33, 34, 35, 36, 37, 38, 40, 41, 42, 43, 255] {
-            assert_eq!(GgmlType::from_u32(id), None, "id {id} must not be recognised");
+        for id in [
+            4, 5, 24, 25, 26, 27, 28, 31, 32, 33, 34, 35, 36, 37, 38, 40, 41, 42, 43, 255,
+        ] {
+            assert_eq!(
+                GgmlType::from_u32(id),
+                None,
+                "id {id} must not be recognised"
+            );
         }
     }
 
@@ -635,7 +641,10 @@ mod tests {
             .filter(|&&(id, ..)| GgmlType::from_u32(id).unwrap().legacy_admitted())
             .map(|&(id, ..)| id)
             .collect();
-        assert_eq!(legacy, vec![0, 1, 2, 3, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 30]);
+        assert_eq!(
+            legacy,
+            vec![0, 1, 2, 3, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 30]
+        );
     }
 
     #[test]
@@ -650,7 +659,12 @@ mod tests {
     }
 
     /// One-tensor GGUF v3 with no metadata: `ne0 x 1` of `ty`.
-    fn one_tensor_file(dir: &std::path::Path, ty: u32, ne0: u64, data: usize) -> std::path::PathBuf {
+    fn one_tensor_file(
+        dir: &std::path::Path,
+        ty: u32,
+        ne0: u64,
+        data: usize,
+    ) -> std::path::PathBuf {
         let mut b = Vec::new();
         b.extend_from_slice(&GGUF_MAGIC.to_le_bytes());
         b.extend_from_slice(&3u32.to_le_bytes());
@@ -674,7 +688,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         // IQ4_XS (23): 1 block of 256 = 136 bytes.
         let p = one_tensor_file(dir.path(), 23, 256, 136);
-        let err = GgufFile::open(&p).err().expect("legacy open fails closed on IQ4_XS");
+        let err = GgufFile::open(&p)
+            .err()
+            .expect("legacy open fails closed on IQ4_XS");
         assert!(err.to_string().contains("unknown GGML type: 23"), "{err}");
         let g = GgufFile::open_native(&p).expect("native open admits IQ4_XS");
         let t = &g.tensors[0];
@@ -703,7 +719,10 @@ mod tests {
         let p = one_tensor_file(dir.path(), 12, 100, 144);
         let g = GgufFile::open_native(&p).unwrap();
         let err = g.tensors[0].extent_bytes().unwrap_err();
-        assert!(err.contains("tensor t") && err.contains("Q4_K") && err.contains("256"), "{err}");
+        assert!(
+            err.contains("tensor t") && err.contains("Q4_K") && err.contains("256"),
+            "{err}"
+        );
         assert!(g.try_tensor_data(&g.tensors[0]).is_none());
     }
 }

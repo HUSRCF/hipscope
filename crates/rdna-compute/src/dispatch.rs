@@ -10544,14 +10544,23 @@ mod tests {
             assert_eq!(dt.ggml_block(), Some((elems, bytes)));
             assert_eq!(dt.row_bytes(elems * 20), Some(20 * bytes), "{name}");
             let refusal = dt.ggml_refusal().expect("refusal text");
-            assert!(refusal.contains(name) && refusal.contains("no ggml kernel"), "{refusal}");
+            assert!(
+                refusal.contains(name) && refusal.contains("no ggml kernel"),
+                "{refusal}"
+            );
             assert_eq!(dt.requires_k_mod_256(), elems == 256, "{name}");
         }
         // never aliases a legacy dtype.
         assert_ne!(DType::GgmlQ4K, DType::Q4K);
         assert_ne!(DType::GgmlQ6K, DType::Q6K);
         assert_ne!(DType::GgmlQ8_0, DType::Q8_0);
-        for legacy in [DType::Q4K, DType::Q6K, DType::Q8_0, DType::MQ4G256V2, DType::F16] {
+        for legacy in [
+            DType::Q4K,
+            DType::Q6K,
+            DType::Q8_0,
+            DType::MQ4G256V2,
+            DType::F16,
+        ] {
             assert!(!legacy.is_ggml());
             assert_eq!(legacy.ggml_refusal(), None);
             assert_eq!(legacy.ggml_block(), None);

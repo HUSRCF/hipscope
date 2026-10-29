@@ -225,9 +225,12 @@ pub fn hparams_from_gguf(
                 .iter()
                 .take(n_layers)
                 .map(|v| {
-                    v.as_bool().or_else(|| v.as_u64().map(|n| n != 0)).ok_or_else(|| {
-                        "GGUF metadata attention.recurrent_layers holds a non-boolean".to_string()
-                    })
+                    v.as_bool()
+                        .or_else(|| v.as_u64().map(|n| n != 0))
+                        .ok_or_else(|| {
+                            "GGUF metadata attention.recurrent_layers holds a non-boolean"
+                                .to_string()
+                        })
                 })
                 .collect::<Result<_, _>>()?
         }
@@ -241,7 +244,13 @@ pub fn hparams_from_gguf(
     };
     let layer_types: Vec<&str> = recurrent
         .iter()
-        .map(|&r| if r { "linear_attention" } else { "full_attention" })
+        .map(|&r| {
+            if r {
+                "linear_attention"
+            } else {
+                "full_attention"
+            }
+        })
         .collect();
 
     let vocab = tensors
@@ -994,7 +1003,11 @@ mod tests {
         g.sort_unstable();
         g.dedup();
         assert_eq!(g.len(), names.len());
-        let mut h: Vec<&str> = map.tensors.iter().map(|t| t.hipfire_name.as_str()).collect();
+        let mut h: Vec<&str> = map
+            .tensors
+            .iter()
+            .map(|t| t.hipfire_name.as_str())
+            .collect();
         h.sort_unstable();
         h.dedup();
         assert_eq!(h.len(), names.len());
@@ -1011,15 +1024,26 @@ mod tests {
             VHeadOrder::TiledQkvValueRows { head_dim: 32 }
         );
         let a = map.lookup("blk.0.ssm_a").unwrap();
-        assert_eq!(a.hipfire_name, "model.language_model.layers.0.linear_attn.A_log");
+        assert_eq!(
+            a.hipfire_name,
+            "model.language_model.layers.0.linear_attn.A_log"
+        );
         assert!(a.transform.a_log_neg_exp);
         let n = map.lookup("blk.0.ssm_norm.weight").unwrap();
         assert!(n.transform.is_as_stored(), "linear_attn.norm is not folded");
-        assert!(map.lookup("blk.0.attn_norm.weight").unwrap().transform.norm_plus_one);
+        assert!(
+            map.lookup("blk.0.attn_norm.weight")
+                .unwrap()
+                .transform
+                .norm_plus_one
+        );
         let m = map.lookup("blk.2.nextn.eh_proj.weight").unwrap();
         assert_eq!((m.hipfire_name.as_str(), m.layer), ("mtp.eh_proj", None));
         assert_eq!(m.ggml_shape, vec![512, 256]);
-        assert_eq!(map.lookup("blk.2.attn_q.weight").unwrap().hipfire_name, "mtp.wq");
+        assert_eq!(
+            map.lookup("blk.2.attn_q.weight").unwrap().hipfire_name,
+            "mtp.wq"
+        );
         assert!(map.lookup("output.weight").unwrap().optional);
         assert_eq!(map.lookup("blk.9.attn_q.weight"), None);
     }
@@ -1031,7 +1055,10 @@ mod tests {
         let hp = hparams_from_gguf(&m, &[embd_info(10)]).unwrap();
         let map = Qwen35GgufMap::new(&hp);
         assert_eq!(
-            map.lookup("blk.0.attn_gate.weight").unwrap().transform.v_order,
+            map.lookup("blk.0.attn_gate.weight")
+                .unwrap()
+                .transform
+                .v_order,
             VHeadOrder::Native
         );
     }

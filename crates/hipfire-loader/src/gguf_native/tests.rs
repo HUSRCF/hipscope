@@ -44,7 +44,10 @@ fn parses_maps_and_builds_the_manifest() {
     let m = open(&tensors, 0).expect("canonical fixture admits");
     assert_eq!(m.arch_id, 5);
     let c = &m.hparams.config;
-    assert_eq!((c.dim, c.n_layers, c.vocab_size, c.hidden_dim), (256, 2, 512, 512));
+    assert_eq!(
+        (c.dim, c.n_layers, c.vocab_size, c.hidden_dim),
+        (256, 2, 512, 512)
+    );
 
     // One manifest entry per file tensor, none tied (output.weight present).
     assert_eq!(m.manifest.entries.len(), tensors.len());
@@ -61,9 +64,18 @@ fn parses_maps_and_builds_the_manifest() {
     // dtype per tensor: distinct Ggml dtypes for quantised types, plain ones for floats.
     assert_eq!(by_gguf("token_embd.weight").weight.dtype, DType::GgmlQ8_0);
     assert_eq!(by_gguf("output.weight").weight.dtype, DType::GgmlQ6K);
-    assert_eq!(by_gguf("blk.0.attn_qkv.weight").weight.dtype, DType::GgmlQ4K);
-    assert_eq!(by_gguf("blk.0.attn_gate.weight").weight.dtype, DType::GgmlIQ4XS);
-    assert_eq!(by_gguf("blk.1.attn_output.weight").weight.dtype, DType::GgmlQ5K);
+    assert_eq!(
+        by_gguf("blk.0.attn_qkv.weight").weight.dtype,
+        DType::GgmlQ4K
+    );
+    assert_eq!(
+        by_gguf("blk.0.attn_gate.weight").weight.dtype,
+        DType::GgmlIQ4XS
+    );
+    assert_eq!(
+        by_gguf("blk.1.attn_output.weight").weight.dtype,
+        DType::GgmlQ5K
+    );
     assert_eq!(by_gguf("blk.0.ssm_a").weight.dtype, DType::F32);
     assert_eq!(by_gguf("blk.0.ssm_beta.weight").weight.dtype, DType::F16);
     // names and layers follow the HFQ convention; logical shape is [rows, cols].
@@ -75,7 +87,10 @@ fn parses_maps_and_builds_the_manifest() {
     assert_eq!(qkv.weight.layer, Some(0));
     assert_eq!(qkv.weight.logical_shape, vec![256, 256]);
     assert_eq!(qkv.weight.policy, ShardPolicy::Replicate);
-    assert_eq!(by_gguf("blk.1.attn_q.weight").weight.logical_shape, vec![512, 256]);
+    assert_eq!(
+        by_gguf("blk.1.attn_q.weight").weight.logical_shape,
+        vec![512, 256]
+    );
     assert_eq!(by_gguf("token_embd.weight").weight.layer, None);
     // exact byte extents.
     for spec in &tensors {
@@ -83,7 +98,10 @@ fn parses_maps_and_builds_the_manifest() {
         assert_eq!(e.byte_extent as usize, spec.bytes(), "{}", spec.name);
         assert_eq!(e.params as usize, spec.params(), "{}", spec.name);
     }
-    assert_eq!(by_gguf("blk.0.attn_qkv.weight").byte_extent, (256 / 256) * 144 * 256);
+    assert_eq!(
+        by_gguf("blk.0.attn_qkv.weight").byte_extent,
+        (256 / 256) * 144 * 256
+    );
     assert_eq!(by_gguf("blk.0.attn_gate.weight").byte_extent, 136 * 128);
     // the tensor bytes are reachable and exactly the extent.
     let bytes = m.tensor_bytes(by_gguf("blk.1.attn_v.weight")).unwrap();
@@ -95,7 +113,11 @@ fn parses_maps_and_builds_the_manifest() {
     assert_eq!(m.manifest.census.total_bytes as usize, bytes);
     assert_eq!(m.manifest.census.total_params as usize, params);
     let want = bytes as f64 * 8.0 / params as f64;
-    assert!((m.manifest.bpw - want).abs() < 1e-12, "{} vs {want}", m.manifest.bpw);
+    assert!(
+        (m.manifest.bpw - want).abs() < 1e-12,
+        "{} vs {want}",
+        m.manifest.bpw
+    );
     assert_eq!(m.manifest.census.by_type["Q4_K"].tensors, 7);
     assert_eq!(m.manifest.census.by_type["F32"].tensors, 11);
     // weights() is the shared declaration list.
@@ -152,9 +174,15 @@ fn the_mtp_block_is_all_or_nothing() {
 
     // half a block: refuses, naming the missing tensor.
     let mut half = base_tensors();
-    half.extend(mtp_tensors().into_iter().filter(|t| t.name != "blk.2.nextn.enorm.weight"));
+    half.extend(
+        mtp_tensors()
+            .into_iter()
+            .filter(|t| t.name != "blk.2.nextn.enorm.weight"),
+    );
     let p = write_fixture(&dir, &base_kvs("qwen35", 1), &half, true);
-    let err = GgufNativeModel::open_gated(&p, true).err().expect("half MTP refuses");
+    let err = GgufNativeModel::open_gated(&p, true)
+        .err()
+        .expect("half MTP refuses");
     assert!(err.contains("blk.2.nextn.enorm.weight"), "{err}");
 }
 
@@ -162,7 +190,9 @@ fn the_mtp_block_is_all_or_nothing() {
 fn env_unset_refuses_with_the_stable_prefix() {
     let dir = tempfile::tempdir().unwrap();
     let p = write_fixture(&dir, &base_kvs("qwen35", 0), &base_tensors(), true);
-    let err = GgufNativeModel::open_gated(&p, false).err().expect("gate refuses");
+    let err = GgufNativeModel::open_gated(&p, false)
+        .err()
+        .expect("gate refuses");
     assert!(err.starts_with("load refused:"), "{err}");
     assert!(err.contains(GGUF_NATIVE_ENV), "{err}");
     assert!(err.contains("fixture-"), "{err}");
@@ -178,7 +208,9 @@ fn unknown_type_id_fails_closed_at_parse() {
     tensors[5].ty = 250;
     let dir = tempfile::tempdir().unwrap();
     let p = write_fixture(&dir, &base_kvs("qwen35", 0), &tensors, true);
-    let err = GgufNativeModel::open_gated(&p, true).err().expect("unknown id refuses");
+    let err = GgufNativeModel::open_gated(&p, true)
+        .err()
+        .expect("unknown id refuses");
     assert!(err.starts_with("load refused:"), "{err}");
     assert!(err.contains("unknown GGML type: 250"), "{err}");
 }
@@ -193,7 +225,12 @@ fn a_known_but_unserved_type_refuses_naming_type_and_tensor() {
     tensors[i] = Spec::new("blk.1.ffn_gate.weight", &[DIM, FF], GgmlType::IQ2XS);
     expect_refusal(
         &tensors,
-        &["blk.1.ffn_gate.weight", "IQ2_XS", "ggml id 17", "Q8_0, IQ4_XS"],
+        &[
+            "blk.1.ffn_gate.weight",
+            "IQ2_XS",
+            "ggml id 17",
+            "Q8_0, IQ4_XS",
+        ],
     );
     // Q4_0 and MXFP4 parse but are not tier 1.
     tensors[i] = Spec::new("blk.1.ffn_gate.weight", &[DIM, FF], GgmlType::Q4_0);
@@ -209,7 +246,10 @@ fn a_missing_tensor_refuses_naming_it() {
         .filter(|t| t.name != "blk.1.attn_k_norm.weight")
         .collect();
     let err = expect_refusal(&tensors, &["missing tensor 'blk.1.attn_k_norm.weight'"]);
-    assert!(err.contains("self_attn.k_norm.weight"), "names the hipfire side too: {err}");
+    assert!(
+        err.contains("self_attn.k_norm.weight"),
+        "names the hipfire side too: {err}"
+    );
     // a required global likewise.
     let tensors: Vec<Spec> = base_tensors()
         .into_iter()
@@ -225,7 +265,11 @@ fn an_extra_tensor_refuses_naming_it() {
     expect_refusal(&tensors, &["rope_freqs.weight", "extra tensor"]);
     // a fused full-attention QKV is not the canonical export either.
     let mut tensors = base_tensors();
-    tensors.push(Spec::new("blk.1.attn_qkv.weight", &[DIM, 768], GgmlType::Q4K));
+    tensors.push(Spec::new(
+        "blk.1.attn_qkv.weight",
+        &[DIM, 768],
+        GgmlType::Q4K,
+    ));
     expect_refusal(&tensors, &["blk.1.attn_qkv.weight", "extra tensor"]);
     // and a layer the config does not have.
     let mut tensors = base_tensors();
@@ -260,7 +304,10 @@ fn a_wrong_shape_refuses_naming_the_tensor() {
         .unwrap();
     // a plain Qwen3 q_proj (no output gate) is half the rows.
     tensors[i] = Spec::new("blk.1.attn_q.weight", &[DIM, 256], GgmlType::Q4K);
-    expect_refusal(&tensors, &["blk.1.attn_q.weight", "[256, 256]", "[256, 512]"]);
+    expect_refusal(
+        &tensors,
+        &["blk.1.attn_q.weight", "[256, 256]", "[256, 512]"],
+    );
 }
 
 #[test]
@@ -272,14 +319,19 @@ fn a_quantised_norm_is_refused() {
         .unwrap();
     // 32 elements of Q8_0 is one valid block, but a norm must stay float.
     tensors[i] = Spec::new("blk.0.ssm_norm.weight", &[32], GgmlType::Q8_0);
-    expect_refusal(&tensors, &["blk.0.ssm_norm.weight", "Q8_0", "F32, F16 or BF16"]);
+    expect_refusal(
+        &tensors,
+        &["blk.0.ssm_norm.weight", "Q8_0", "F32, F16 or BF16"],
+    );
 }
 
 #[test]
 fn a_truncated_file_refuses_but_a_header_fixture_analyses() {
     let dir = tempfile::tempdir().unwrap();
     let p = write_fixture(&dir, &base_kvs("qwen35", 0), &base_tensors(), false);
-    let err = GgufNativeModel::open_gated(&p, true).err().expect("header-only is truncated");
+    let err = GgufNativeModel::open_gated(&p, true)
+        .err()
+        .expect("header-only is truncated");
     assert!(err.contains("re-download"), "{err}");
     let g = hipfire_runtime::gguf::GgufFile::open_native(&p).unwrap();
     let a = analyze(&g, false);
@@ -291,7 +343,9 @@ fn a_truncated_file_refuses_but_a_header_fixture_analyses() {
     assert!(r.contains("ADMITTED"), "{r}");
     assert!(!r.contains("download may be incomplete"), "{r}");
     let full = write_fixture(&dir, &base_kvs("qwen35", 0), &base_tensors(), true);
-    assert!(inspect_report(&full, false).unwrap().contains("data:          complete"));
+    assert!(inspect_report(&full, false)
+        .unwrap()
+        .contains("data:          complete"));
 }
 
 #[test]
@@ -299,14 +353,19 @@ fn architecture_is_resolved_through_the_shared_table() {
     let dir = tempfile::tempdir().unwrap();
     let check = |arch: &str, needles: &[&str]| {
         let p = write_fixture(&dir, &base_kvs(arch, 0), &base_tensors(), true);
-        let err = GgufNativeModel::open_gated(&p, true).err().expect("refuses");
+        let err = GgufNativeModel::open_gated(&p, true)
+            .err()
+            .expect("refuses");
         assert!(err.starts_with("load refused:"), "{err}");
         for n in needles {
             assert!(err.contains(n), "{n:?} in {err}");
         }
     };
     // unknown strings fail closed (MoE export included: not in the table).
-    check("qwen35moe", &["'qwen35moe'", "not a model family hipfire knows"]);
+    check(
+        "qwen35moe",
+        &["'qwen35moe'", "not a model family hipfire knows"],
+    );
     check("mamba", &["'mamba'", "not a model family hipfire knows"]);
     // known, but another family.
     check("llama", &["'llama'", "arch 0", "dense Qwen3.5"]);
@@ -320,8 +379,14 @@ fn inspect_prints_arch_histogram_bpw_and_verdict() {
     let p = write_fixture(&dir, &base_kvs("qwen35", 0), &base_tensors(), true);
     let r = inspect_report(&p, false).unwrap();
     assert!(r.contains("qwen35 (hipfire arch 5)"), "{r}");
-    assert!(r.contains(&format!("tensors:       {}", base_tensors().len())), "{r}");
-    assert!(r.contains("Q4_K") && r.contains("IQ4_XS") && r.contains("F32"), "{r}");
+    assert!(
+        r.contains(&format!("tensors:       {}", base_tensors().len())),
+        "{r}"
+    );
+    assert!(
+        r.contains("Q4_K") && r.contains("IQ4_XS") && r.contains("F32"),
+        "{r}"
+    );
     assert!(r.contains("model bpw:"), "{r}");
     assert!(r.contains("ADMITTED"), "{r}");
     assert!(r.contains("switch OFF"), "{r}");
@@ -333,22 +398,25 @@ fn inspect_prints_arch_histogram_bpw_and_verdict() {
     tensors.push(Spec::new("stray.weight", &[32], GgmlType::F32));
     let p = write_fixture(&dir, &base_kvs("qwen35", 0), &tensors, true);
     let r = inspect_report(&p, true).unwrap();
-    assert!(r.contains("REFUSED (2 problems: Extra=1, Type=1; mapping problems = 1)"), "{r}");
+    assert!(
+        r.contains("REFUSED (2 problems: Extra=1, Type=1; mapping problems = 1)"),
+        "{r}"
+    );
     assert!(r.contains("IQ3_S") && r.contains("NOT admitted"), "{r}");
     assert!(r.contains("stray.weight"), "{r}");
 }
 
 /// Real-header check for the S2 kill criterion: set
-/// `HIPFIRE_GGUF_HEADER=<path to a 27B .gguf or header-only dump>` and run
+/// `GGUF_TEST_HEADER=<path to a 27B .gguf or header-only dump>` and run
 /// with `--ignored --nocapture`. The test fails when any tensor is unmapped
 /// (missing, extra, mis-shaped or duplicated), naming it. Tensors of types
 /// outside the admitted set are *reported* (a quantisation choice, not a
-/// mapping failure); set `HIPFIRE_GGUF_EXPECT_ADMITTED=1` to require none.
+/// mapping failure); set `GGUF_TEST_EXPECT_ADMITTED=1` to require none.
 #[test]
 #[ignore]
 fn real_27b_header_maps_every_tensor() {
-    let path = std::env::var("HIPFIRE_GGUF_HEADER")
-        .expect("set HIPFIRE_GGUF_HEADER to a 27B GGUF (or its header dump)");
+    let path = std::env::var("GGUF_TEST_HEADER")
+        .expect("set GGUF_TEST_HEADER to a 27B GGUF (or its header dump)");
     let g = hipfire_runtime::gguf::GgufFile::open_native(std::path::Path::new(&path))
         .expect("parse real header");
     let a = analyze(&g, false);
@@ -388,7 +456,11 @@ fn real_27b_header_maps_every_tensor() {
         }
     }
     for (ty, names) in &by_type {
-        println!("type refusal {ty}: {} tensors, e.g. {:?}", names.len(), &names[..names.len().min(3)]);
+        println!(
+            "type refusal {ty}: {} tensors, e.g. {:?}",
+            names.len(),
+            &names[..names.len().min(3)]
+        );
     }
     let mapping = a.mapping_refusals();
     assert!(
@@ -398,9 +470,13 @@ fn real_27b_header_maps_every_tensor() {
         mapping.first().map(|r| &r.message)
     );
     println!("every tensor maps ({} file tensors)", a.census.tensor_count);
-    if std::env::var_os("HIPFIRE_GGUF_EXPECT_ADMITTED").is_some() {
+    if std::env::var_os("GGUF_TEST_EXPECT_ADMITTED").is_some() {
         assert!(a.admitted(), "{} refusals", a.refusals.len());
         let m = a.manifest.as_ref().unwrap();
-        println!("manifest entries {} mtp_present {}", m.entries.len(), m.mtp_present);
+        println!(
+            "manifest entries {} mtp_present {}",
+            m.entries.len(),
+            m.mtp_present
+        );
     }
 }

@@ -254,7 +254,10 @@ impl GgufAnalysis {
     /// Refusals that mean the name map does not cover the file (see
     /// [`RefusalKind::is_mapping`]).
     pub fn mapping_refusals(&self) -> Vec<&Refusal> {
-        self.refusals.iter().filter(|r| r.kind.is_mapping()).collect()
+        self.refusals
+            .iter()
+            .filter(|r| r.kind.is_mapping())
+            .collect()
     }
 
     /// Refusal count per kind.
@@ -332,7 +335,10 @@ pub fn analyze(gguf: &GgufFile, check_extents: bool) -> GgufAnalysis {
             a.refuse(
                 RefusalKind::Duplicate,
                 Some(&t.name),
-                format!("load refused: GGUF lists tensor '{}' more than once", t.name),
+                format!(
+                    "load refused: GGUF lists tensor '{}' more than once",
+                    t.name
+                ),
             );
         }
     }
@@ -496,12 +502,15 @@ fn entry_for(
             ),
         )
     })?;
-    let file_offset = gguf.tensor_data_offset.checked_add(info.offset).ok_or_else(|| {
-        refuse(
-            RefusalKind::Extent,
-            format!("load refused: GGUF tensor '{}' offset overflows", info.name),
-        )
-    })?;
+    let file_offset = gguf
+        .tensor_data_offset
+        .checked_add(info.offset)
+        .ok_or_else(|| {
+            refuse(
+                RefusalKind::Extent,
+                format!("load refused: GGUF tensor '{}' offset overflows", info.name),
+            )
+        })?;
     if check_extents {
         let end = file_offset.checked_add(extent);
         if end.map_or(true, |end| end > gguf.file_len()) {
@@ -634,8 +643,7 @@ impl GgufNativeModel {
                         .filter(|t| !t.trim().is_empty())
                         .map(str::to_owned);
                     let from_file = embedded.is_some();
-                    let (t, source) =
-                        crate::qwen35_template_from_embedded(embedded, &model_path);
+                    let (t, source) = crate::qwen35_template_from_embedded(embedded, &model_path);
                     let source = if from_file {
                         "embedded GGUF tokenizer.chat_template".to_string()
                     } else {
@@ -668,8 +676,8 @@ pub struct GgufSourceMeta {
 pub fn inspect_report(path: &Path, native_enabled: bool) -> Result<String, String> {
     use std::fmt::Write as _;
     let shown = path.display();
-    let gguf = GgufFile::open_native(path)
-        .map_err(|e| format!("could not read GGUF {shown}: {e}"))?;
+    let gguf =
+        GgufFile::open_native(path).map_err(|e| format!("could not read GGUF {shown}: {e}"))?;
     // Bytes the tensor table says the file must hold; a header-only dump or a
     // partial download falls short. Extents are then reported once here
     // instead of as one refusal per tensor.
@@ -770,7 +778,8 @@ pub fn inspect_report(path: &Path, native_enabled: bool) -> Result<String, Strin
             let _ = writeln!(out, "  ... and {} more", ordered.len() - 20);
         }
     }
-    let _ = writeln!(
+    let _ =
+        writeln!(
         out,
         "native load:   {} ({GGUF_NATIVE_ENV}=1 {}; no ggml kernel is wired yet, so this build \
          parses and plans but cannot run GGUF weights)",
