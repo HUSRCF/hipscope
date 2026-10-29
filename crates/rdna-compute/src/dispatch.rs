@@ -950,6 +950,21 @@ pub enum DType {
     E8PI4G128R256,
     /// E8P-I4 down (qt=136): E8P codec, R128 FWHT. Planar like qt=135.
     E8PI4G128R128,
+    /// ggml Q4_K (GGUF type 12), served as-is: 144 B per 256 elements, 4.5 bpw.
+    /// Distinct from the legacy llama `Q4K` until that path is cut over to the
+    /// ggml kernels. No kernel consumes it yet: every execution site must refuse
+    /// it by name ([`DType::ggml_name`]), never reinterpret it as another dtype.
+    /// `K % 256 == 0`.
+    GgmlQ4K,
+    /// ggml Q5_K (GGUF type 13): 176 B per 256 elements, 5.5 bpw. `K % 256 == 0`.
+    GgmlQ5K,
+    /// ggml Q6_K (GGUF type 14): 210 B per 256 elements, 6.5625 bpw. `K % 256 == 0`.
+    GgmlQ6K,
+    /// ggml Q8_0 (GGUF type 8): 34 B per 32 elements, 8.5 bpw. `K % 32 == 0`.
+    GgmlQ8_0,
+    /// ggml IQ4_XS (GGUF type 23): 136 B per 256 elements, 4.25 bpw (non-linear
+    /// 16-level codebook + 6-bit sub-scales). `K % 256 == 0`.
+    GgmlIQ4XS,
 }
 
 impl DType {
@@ -1012,7 +1027,12 @@ impl DType {
             | DType::MQ2I4G128R256
             | DType::MQ2I4G128R128
             | DType::E8PI4G128R256
-            | DType::E8PI4G128R128 => 1, // byte-level
+            | DType::E8PI4G128R128
+            | DType::GgmlQ4K
+            | DType::GgmlQ5K
+            | DType::GgmlQ6K
+            | DType::GgmlQ8_0
+            | DType::GgmlIQ4XS => 1, // byte-level
         }
     }
 
@@ -1056,6 +1076,12 @@ impl DType {
                 .map(|scales| scales & !15)?
                 .checked_add(blocks.checked_mul(16)?)?
                 .checked_add(16),
+            // ggml block formats: whole blocks per row.
+            DType::GgmlQ4K => grouped(256, 144),
+            DType::GgmlQ5K => grouped(256, 176),
+            DType::GgmlQ6K => grouped(256, 210),
+            DType::GgmlQ8_0 => grouped(32, 34),
+            DType::GgmlIQ4XS => grouped(256, 136),
             // MQ-I4 is planar (codes plane, then scale plane): no per-row
             // stride exists, and the size needs M as well as K.
             DType::MQ3I4G128R256
@@ -1217,7 +1243,54 @@ impl DType {
                 | DType::MQ5G256V2
                 | DType::MQ3G256V2
                 | DType::MQ2G256V2
+                | DType::GgmlQ4K
+                | DType::GgmlQ5K
+                | DType::GgmlQ6K
+                | DType::GgmlIQ4XS
         )
+    }
+
+    /// Whether this is one of the ggml-format dtypes that carry GGUF block
+    /// bytes as-is (`Ggml*`). Distinct from the legacy llama `Q4K`/`Q6K`/`Q8_0`.
+    /// No kernel consumes them yet, so execution sites refuse them with
+    /// [`DType::ggml_refusal`] instead of falling through to another dtype.
+    pub fn is_ggml(self) -> bool {
+        self.ggml_name().is_some()
+    }
+
+    /// Canonical ggml type name of a `Ggml*` dtype; `None` for every other dtype.
+    pub fn ggml_name(self) -> Option<&'static str> {
+        match self {
+            DType::GgmlQ4K => Some("Q4_K"),
+            DType::GgmlQ5K => Some("Q5_K"),
+            DType::GgmlQ6K => Some("Q6_K"),
+            DType::GgmlQ8_0 => Some("Q8_0"),
+            DType::GgmlIQ4XS => Some("IQ4_XS"),
+            _ => None,
+        }
+    }
+
+    /// `(elements per block, bytes per block)` of a `Ggml*` dtype.
+    pub fn ggml_block(self) -> Option<(usize, usize)> {
+        match self {
+            DType::GgmlQ4K => Some((256, 144)),
+            DType::GgmlQ5K => Some((256, 176)),
+            DType::GgmlQ6K => Some((256, 210)),
+            DType::GgmlQ8_0 => Some((32, 34)),
+            DType::GgmlIQ4XS => Some((256, 136)),
+            _ => None,
+        }
+    }
+
+    /// Refusal text for an execution site handed a `Ggml*` dtype (no ggml
+    /// kernel is wired yet); `None` for every other dtype.
+    pub fn ggml_refusal(self) -> Option<String> {
+        self.ggml_name().map(|name| {
+            format!(
+                "this build cannot run GGUF {name} weights yet: the ggml block format is only \
+                 parsed and inspected, and no ggml kernel is wired; use an MQ or HFQ model"
+            )
+        })
     }
 }
 
@@ -10451,6 +10524,38 @@ mod tests {
         }
         assert!(!DType::MQ4G128V2.is_mq_i4());
         assert_eq!(DType::MQ4G128V2.mq_i4_name(), None);
+    }
+
+    /// The ggml dtypes carry GGUF block bytes as-is: distinct from the legacy
+    /// llama `Q4K`/`Q6K`/`Q8_0`, exact per-row bytes, and a named refusal for
+    /// every execution site (no ggml kernel exists yet).
+    #[test]
+    fn ggml_dtypes_are_distinct_byte_level_and_refused_by_name() {
+        for (dt, name, elems, bytes) in [
+            (DType::GgmlQ4K, "Q4_K", 256, 144),
+            (DType::GgmlQ5K, "Q5_K", 256, 176),
+            (DType::GgmlQ6K, "Q6_K", 256, 210),
+            (DType::GgmlQ8_0, "Q8_0", 32, 34),
+            (DType::GgmlIQ4XS, "IQ4_XS", 256, 136),
+        ] {
+            assert_eq!(dt.size(), 1, "{name}");
+            assert!(dt.is_ggml());
+            assert_eq!(dt.ggml_name(), Some(name));
+            assert_eq!(dt.ggml_block(), Some((elems, bytes)));
+            assert_eq!(dt.row_bytes(elems * 20), Some(20 * bytes), "{name}");
+            let refusal = dt.ggml_refusal().expect("refusal text");
+            assert!(refusal.contains(name) && refusal.contains("no ggml kernel"), "{refusal}");
+            assert_eq!(dt.requires_k_mod_256(), elems == 256, "{name}");
+        }
+        // never aliases a legacy dtype.
+        assert_ne!(DType::GgmlQ4K, DType::Q4K);
+        assert_ne!(DType::GgmlQ6K, DType::Q6K);
+        assert_ne!(DType::GgmlQ8_0, DType::Q8_0);
+        for legacy in [DType::Q4K, DType::Q6K, DType::Q8_0, DType::MQ4G256V2, DType::F16] {
+            assert!(!legacy.is_ggml());
+            assert_eq!(legacy.ggml_refusal(), None);
+            assert_eq!(legacy.ggml_block(), None);
+        }
     }
 
     #[test]

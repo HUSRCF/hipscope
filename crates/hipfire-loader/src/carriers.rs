@@ -50,6 +50,25 @@ struct SourceMeta {
     arch_id: u32,
 }
 
+// The GGUF arm of this seam. `ModelSource` (hipfire-runtime) is matched
+// exhaustively by dozens of arch carriers, and no carrier can run GGUF weights
+// yet (no ggml kernel is wired), so GGUF is not a `ModelSource` variant:
+// `crate::gguf_native::GgufNativeModel::source_meta` (gated by
+// `HIPFIRE_GGUF_NATIVE=1`, refusing `load refused:` otherwise) produces the
+// same three facts this struct carries. `arch_id` is in the HFQ header
+// namespace (`hipfire_runtime::arch_mapping`, from `general.architecture`),
+// not the `derive_arch_id` directory namespace.
+impl From<crate::gguf_native::GgufSourceMeta> for SourceMeta {
+    fn from(m: crate::gguf_native::GgufSourceMeta) -> Self {
+        SourceMeta {
+            tokenizer: m.tokenizer,
+            chat_template: m.chat_template,
+            chat_template_source: m.chat_template_source,
+            arch_id: m.arch_id,
+        }
+    }
+}
+
 /// Discover a `.vl` sidecar file for the given trunk model path.
 ///
 /// Same resolution the daemon uses (they are one implementation now, in

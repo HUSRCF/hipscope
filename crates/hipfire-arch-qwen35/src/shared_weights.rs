@@ -189,6 +189,8 @@ dtype_table! {
     FP8E4M3PT = 52,
     MQ3I4G128R256 = 53, MQ3I4G128R128 = 54, MQ2I4G128R256 = 55, MQ2I4G128R128 = 56,
     E8PI4G128R256 = 57, E8PI4G128R128 = 58, ParoQ4G64 = 59,
+    // GGUF block formats (additive tags; no export route produces them yet).
+    GgmlQ4K = 60, GgmlQ5K = 61, GgmlQ6K = 62, GgmlQ8_0 = 63, GgmlIQ4XS = 64,
 }
 
 fn embd_tag(f: EmbeddingFormat) -> u8 {

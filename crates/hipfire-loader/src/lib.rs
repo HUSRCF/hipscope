@@ -10,6 +10,9 @@ pub mod bench_topology;
 mod carriers;
 pub use carriers::*;
 pub mod decide;
+/// GGUF as a native model source (CPU side): parse, name map, per-tensor
+/// admission, byte extents, bpw census. Default-off (`HIPFIRE_GGUF_NATIVE=1`).
+pub mod gguf_native;
 mod qwen4_slab;
 
 /// Speculative-decode build/glue (RAII slot guard now; `DflashSpeculator` +

@@ -58,6 +58,7 @@ mod config_view;
 mod doctor;
 mod emu;
 mod fit;
+mod inspect;
 mod kernel_pack;
 mod npu_trunk;
 mod ple;
@@ -157,6 +158,8 @@ pub(crate) enum Commands {
     Doctor(doctor::DoctorArgs),
     /// What fits on this machine: context, placement, route and expected speed for a model.
     Fit(fit::FitArgs),
+    /// Read a GGUF header: architecture, tensor types, bits per weight and whether hipfire can serve it.
+    Inspect(inspect::InspectArgs),
 }
 
 #[derive(Args, Debug)]
@@ -1094,6 +1097,7 @@ fn run() -> Result<()> {
                 | Commands::Ps(_)
                 | Commands::Version(_)
                 | Commands::Rm(_)
+                | Commands::Inspect(_)
         )
     ) {
         // SAFETY: restores the default disposition before any thread starts.
@@ -1103,6 +1107,7 @@ fn run() -> Result<()> {
     match cli.command {
         None => launch_tui(&paths, &[]),
         Some(Commands::Tui(args)) => launch_tui(&paths, &args.arguments),
+        Some(Commands::Inspect(args)) => inspect::inspect_command(args),
         Some(Commands::Config(args)) => config_command(&paths, args),
         Some(Commands::Registry(args)) => registry_command(&paths, args),
         Some(Commands::List(args)) => list_command(&paths, args),

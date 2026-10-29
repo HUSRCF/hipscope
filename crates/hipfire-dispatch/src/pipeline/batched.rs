@@ -183,7 +183,8 @@ pub(crate) struct FfnLayerView<'a> {
     pub kind: &'static str,
 }
 
-/// Refuse the typed-only weight formats every generic batched route rejects.
+/// Refuse the typed-only weight formats (and the not-yet-runnable ggml block
+/// formats) every generic batched route rejects.
 pub fn reject_typed_only_format(dtype: DType) -> HipResult<()> {
     if dtype == DType::MQ4G128V2 {
         Err(HipError::new(
@@ -197,6 +198,10 @@ pub fn reject_typed_only_format(dtype: DType) -> HipResult<()> {
                 "this model uses the {name} weight format (MQ-I4 / E8P-I4, qt=131..=136), an expert-slab format only Qwen4 (Flash-Next) models can run, and it has no generic GPU kernel; re-quantize it to a different format"
             ),
         ))
+    } else if let Some(refusal) = dtype.ggml_refusal() {
+        // GGUF block formats (`DType::Ggml*`): parsed and planned, but no ggml
+        // kernel is wired, so no route may run or reinterpret them.
+        Err(HipError::new(0, &refusal))
     } else {
         Ok(())
     }
