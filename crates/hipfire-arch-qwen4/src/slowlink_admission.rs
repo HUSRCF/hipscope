@@ -356,6 +356,15 @@ pub enum SlowlinkDecline {
     ShortContext {
         max_seq: usize,
     },
+    /// The window (`min(S1_WINDOW_ROWS, max_seq)` rows) is smaller than the route's worst-case
+    /// cohort bound: the dispatch layout needs `k1_rows + tail_rows <= rows`
+    /// ([`check_window_cohort`]). An incumbent decline, never a capacity refusal: the bound is
+    /// the route's own constants, so no free memory makes the window legal.
+    WindowTooSmall {
+        rows: usize,
+        k1_rows: usize,
+        tail_rows: usize,
+    },
     /// Measured discrete link at or above 16 GB/s.
     FastLink {
         gbps: f64,
@@ -399,6 +408,14 @@ impl fmt::Display for SlowlinkDecline {
             Self::ShortContext { max_seq } => write!(
                 f,
                 "context {max_seq} is shorter than the {S1_MIN_FORCED_REQUEST_ROWS}-row minimum multi-chunk window"
+            ),
+            Self::WindowTooSmall {
+                rows,
+                k1_rows,
+                tail_rows,
+            } => write!(
+                f,
+                "window too small for its cohort rows: rows {rows} < k1 {k1_rows} + tail {tail_rows}"
             ),
             Self::FastLink { gbps } => write!(
                 f,
@@ -1042,6 +1059,27 @@ pub fn route_dims(
         },
         route: geometry.route,
     }
+}
+
+/// Whether a window of `rows` rows can hold the cohort capacities [`route_dims`] charges
+/// (`k1_rows + tail_rows <= rows`, the same bound `PromptRouteLayout::new` enforces), so a window
+/// too small for them is a named incumbent decline before the census instead of a layout error
+/// at load. Only the aggregate routes charge tail rows: the slab route's 48 K1 rows always fit a
+/// window of at least [`S1_MIN_FORCED_REQUEST_ROWS`] rows.
+pub fn check_window_cohort(geometry: &ModelGeometry, rows: usize) -> Result<(), SlowlinkDecline> {
+    let dims = route_dims(geometry, rows);
+    if dims
+        .k1_rows
+        .checked_add(dims.tail_rows)
+        .is_none_or(|cohort| cohort > rows)
+    {
+        return Err(SlowlinkDecline::WindowTooSmall {
+            rows,
+            k1_rows: dims.k1_rows,
+            tail_rows: dims.tail_rows,
+        });
+    }
+    Ok(())
 }
 
 /// Device bytes of the dispatch crate's `PromptRouteStorage` for a window of
@@ -1869,6 +1907,7 @@ pub fn project_at_tile(
             "slow-link prefill tile {tile_rows} is not a legal rung"
         )));
     }
+    check_window_cohort(&inputs.geometry, inputs.window_rows)?;
     let (pages, arena, census) =
         census_at_tile(inputs, tile_rows).map_err(SlowlinkDecline::Geometry)?;
     let granule =
@@ -7953,6 +7992,84 @@ mod tests {
                 matches!(admit(&miss), Err(SlowlinkDecline::Deficit(_))),
                 "{label}"
             );
+        }
+    }
+
+    /// A window smaller than the aggregate routes' worst-case cohort bound
+    /// (`k1 48 + tail 3066 = 3114` rows) is a named incumbent decline before the census, not a
+    /// layout error at load; every size that admits is untouched and builds a valid layout.
+    #[test]
+    fn slowlink_admission_window_smaller_than_its_cohort_rows_declines_by_name() {
+        use hipfire_dispatch::pipeline::slowlink_prefill::PromptRouteLayout;
+        let cohort = S1_K1_TAIL_ROWS + S1_AGGREGATE_TAIL_ROWS;
+        assert_eq!(cohort, 3114);
+        for route in [WindowRoute::Aggregate, WindowRoute::AggregateSymIu4] {
+            for max_seq in [1536, 1537, 3113, 3114, S1_WINDOW_ROWS] {
+                let load = LoadShape { max_seq, ..shape() };
+                let pre = preflight(SlowlinkMode::Force, &load);
+                if max_seq < S1_MIN_FORCED_REQUEST_ROWS {
+                    assert_eq!(pre, Err(SlowlinkDecline::ShortContext { max_seq }));
+                    continue;
+                }
+                assert_eq!(pre, Ok(()), "{route:?} {max_seq}");
+                let inputs = AdmissionInputs {
+                    window_rows: S1_WINDOW_ROWS.min(max_seq),
+                    ..j1778_inputs(route, AdmissionPurpose::Product, J1778_PRELOAD_FREE)
+                };
+                let admitted = admit_grown(&inputs, max_seq);
+                if max_seq < cohort {
+                    let decline = SlowlinkDecline::WindowTooSmall {
+                        rows: max_seq,
+                        k1_rows: S1_K1_TAIL_ROWS,
+                        tail_rows: S1_AGGREGATE_TAIL_ROWS,
+                    };
+                    assert_eq!(
+                        admitted.map(|_| ()),
+                        Err(decline.clone()),
+                        "{route:?} {max_seq}"
+                    );
+                    assert!(!decline.is_capacity());
+                    assert_eq!(
+                        decline.to_string(),
+                        format!(
+                            "window too small for its cohort rows: rows {max_seq} < k1 48 + tail 3066"
+                        )
+                    );
+                    // The forced selector keeps the incumbent instead of failing the load.
+                    let selected = select_profile(
+                        SlowlinkMode::Force,
+                        &load,
+                        || HostLink::Discrete { gbps: 7.09 },
+                        |_| Ok(inputs.clone()),
+                    );
+                    assert_eq!(
+                        selected.map(|p| p.is_some()),
+                        Ok(false),
+                        "{route:?} {max_seq}"
+                    );
+                } else {
+                    let profile = admitted.unwrap_or_else(|d| panic!("{route:?} {max_seq}: {d}"));
+                    assert_eq!(profile.window_rows, S1_WINDOW_ROWS.min(max_seq));
+                    let layout = PromptRouteLayout::new(&profile.route_dims()).unwrap();
+                    assert_eq!(layout.total_bytes() as u64, profile.census.route_storage);
+                    assert_eq!(layout.dims().k1_rows, S1_K1_TAIL_ROWS);
+                    assert_eq!(layout.dims().tail_rows, S1_AGGREGATE_TAIL_ROWS);
+                }
+            }
+        }
+        // The slab route charges no tail rows: every legal context admits.
+        for max_seq in [1537, 3113, 3114, S1_WINDOW_ROWS] {
+            let inputs = AdmissionInputs {
+                window_rows: S1_WINDOW_ROWS.min(max_seq),
+                ..j1778_inputs(
+                    WindowRoute::SlabIu4,
+                    AdmissionPurpose::Product,
+                    J1778_PRELOAD_FREE,
+                )
+            };
+            let profile = admit_grown(&inputs, max_seq).unwrap();
+            let layout = PromptRouteLayout::new(&profile.route_dims()).unwrap();
+            assert_eq!((layout.dims().k1_rows, layout.dims().tail_rows), (48, 0));
         }
     }
 
