@@ -7152,13 +7152,14 @@ mod tests {
     }
 
     #[test]
-    fn qwen4_sp_touched_is_a_typed_bool_developer_key_default_off() {
+    fn qwen4_sp_touched_is_a_typed_bool_developer_key_unset_follows_the_arch_default() {
         const KEY: &str = "developer.qwen4_sp_touched";
         const ENV: &str = "HIPFIRE_QWEN4_SP_TOUCHED";
         assert!(is_developer_key(KEY));
         assert!(is_typed_bool_developer_key(KEY));
         assert_eq!(developer_key_for_env(ENV).as_deref(), Some(KEY));
         assert_ne!(KEY, "developer.qwen4_sp");
+        // Unset is None: the consumer applies the gfx1100 default (not a config-level on/off).
         assert_eq!(typed_developer_bool_value(ENV, None), None);
         for (raw, want) in [("1", true), ("true", true), ("0", false), ("false", false)] {
             assert_eq!(
@@ -10557,13 +10558,14 @@ pub mod memory {
     /// boolean read once per Qwen4 load by the S1 short-prompt prefill hook's
     /// touched-only mode (SP `TouchedOnly`: stream exactly the experts a layer
     /// routes to, run S1's own per-panel pipeline over them, no CPU expert, byte-identical
-    /// to the stream-all sweep). Default **off** until its card gates close (it is
-    /// intended to become the gfx1100 default): only an explicit `true`/`1` arms
-    /// it. It needs an admitted S1 profile, gfx1100 and the `Aggregate` window
-    /// route; a failed rule declines it by name. With `developer.qwen4_sp` also
-    /// on, the hybrid SP mode wins.
-    pub fn qwen4_sp_touched() -> bool {
-        super::developer_typed_bool("HIPFIRE_QWEN4_SP_TOUCHED").unwrap_or(false)
+    /// to the stream-all sweep). `None` (unset) follows the arch default, which the
+    /// consumer resolves (`slowlink_sp::touched_knob_for`): **on for exact gfx1100**, off
+    /// elsewhere. An explicit `false`/`0` is the kill switch; an explicit `true`/`1` asks for it on
+    /// any arch (every arch but gfx1100 declines it by name: only gfx1100 is calibrated). It needs
+    /// an admitted S1 profile, gfx1100 and an aggregate window route; a failed rule declines it
+    /// by name. With `developer.qwen4_sp` also on, the hybrid SP mode wins.
+    pub fn qwen4_sp_touched() -> Option<bool> {
+        super::developer_typed_bool("HIPFIRE_QWEN4_SP_TOUCHED")
     }
 
     /// Developer kill switch `HIPFIRE_QWEN4_DIRECT_LOAD` for the discrete-GPU

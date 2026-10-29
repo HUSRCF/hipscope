@@ -1954,7 +1954,7 @@ pub(crate) fn bind_at_load(
     bundle: &mut Qwen4Bundle,
     gpu: &mut Gpu,
 ) -> Result<(), String> {
-    let sp_knob = hipfire_config::memory::qwen4_sp() || hipfire_config::memory::qwen4_sp_touched();
+    let sp_knob = hipfire_config::memory::qwen4_sp() || crate::slowlink_sp::touched_knob(&gpu.arch);
     let Some(profile) = forward.slowlink_profile().copied() else {
         if sp_knob {
             sp_log_decision(Err(&SpDecline::NoS1Profile));

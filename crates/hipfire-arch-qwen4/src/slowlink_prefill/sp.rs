@@ -288,7 +288,7 @@ pub(crate) fn sp_load_decision(
 ) -> Result<SpOutcome, String> {
     let placement = lab_placement()?;
     let hybrid_knob = hipfire_config::memory::qwen4_sp();
-    let touched_knob = hipfire_config::memory::qwen4_sp_touched();
+    let touched_knob = crate::slowlink_sp::touched_knob(&gpu.arch);
     let force_all = placement == SpPlacement::All;
     let mode = sp_mode_for(hybrid_knob, touched_knob, force_all);
     let route = profile.geometry.route;

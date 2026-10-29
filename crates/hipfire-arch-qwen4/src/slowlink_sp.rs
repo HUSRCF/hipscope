@@ -158,6 +158,19 @@ impl SpMode {
     }
 }
 
+/// The touched-only knob of a load on `arch`: an explicit `developer.qwen4_sp_touched`
+/// (`HIPFIRE_QWEN4_SP_TOUCHED`, `0` is the kill switch) wins, unset is **on for exact
+/// gfx1100** (the only calibrated arch; byte-identical to stream-all S1) and off elsewhere.
+/// Pure; [`touched_knob`] reads the process value.
+pub fn touched_knob_for(explicit: Option<bool>, arch: &str) -> bool {
+    explicit.unwrap_or(arch == SP_ARCH)
+}
+
+/// [`touched_knob_for`] with the process's `developer.qwen4_sp_touched`.
+pub fn touched_knob(arch: &str) -> bool {
+    touched_knob_for(hipfire_config::memory::qwen4_sp_touched(), arch)
+}
+
 /// The window route one window runs: the armed hybrid SP's route
 /// ([`SpProfile::window_route`]) when SP runs the window (`sp_ok`: its pre-mutation
 /// verdict qualified it), else the S1 profile's own `base` route. Touched-only never changes a
@@ -1082,6 +1095,66 @@ mod tests {
         assert_eq!(
             hipfire_config::developer_key_for_env(SP_TOUCHED_ENV).as_deref(),
             Some("developer.qwen4_sp_touched")
+        );
+    }
+
+    /// Touched-only is the gfx1100 default: unset is on there and off on every other arch, an
+    /// explicit value wins on every arch, and the arch gate of admission still declines an
+    /// explicit `1` elsewhere by name. The hybrid knob stays default off.
+    #[test]
+    fn touched_only_defaults_on_for_gfx1100_only() {
+        for (explicit, arch, want) in [
+            (None, "gfx1100", true),
+            (Some(true), "gfx1100", true),
+            (Some(false), "gfx1100", false),
+            (None, "gfx1151", false),
+            (None, "gfx1201", false),
+            (None, "gfx1030", false),
+            (Some(true), "gfx1201", true),
+            (Some(false), "gfx1201", false),
+        ] {
+            assert_eq!(
+                touched_knob_for(explicit, arch),
+                want,
+                "{explicit:?} {arch}"
+            );
+        }
+        // The resolved knob feeds admission: unset on gfx1100 arms touched-only with the hybrid
+        // knob off; the kill switch and other arches are the named decline / knob off.
+        let on = |explicit, arch: &'static str| SpLoadFacts {
+            knob: false,
+            touched_knob: touched_knob_for(explicit, arch),
+            arch,
+            ..facts()
+        };
+        assert_eq!(
+            admit_sp(&on(None, "gfx1100")).unwrap().mode,
+            SpMode::TouchedOnly
+        );
+        assert_eq!(
+            admit_sp(&on(Some(false), "gfx1100")).unwrap_err(),
+            SpDecline::KnobOff
+        );
+        assert_eq!(
+            admit_sp(&on(None, "gfx1201")).unwrap_err(),
+            SpDecline::KnobOff
+        );
+        assert_eq!(
+            admit_sp(&on(Some(true), "gfx1201")).unwrap_err(),
+            SpDecline::ArchNotCalibrated {
+                arch: "gfx1201".into()
+            }
+        );
+        // Hybrid is never defaulted: with its own knob off and touched-only killed nothing arms,
+        // and with its own knob on it still wins over the default-on touched-only.
+        assert_eq!(
+            admit_sp(&SpLoadFacts {
+                knob: true,
+                ..on(None, "gfx1100")
+            })
+            .unwrap()
+            .mode,
+            SpMode::Hybrid
         );
     }
 
