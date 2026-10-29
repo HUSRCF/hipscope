@@ -5,6 +5,9 @@ use rdna_compute::railgun_check::CheckMode;
 pub const EXPERT_CACHE_ENV: &str = "HIPFIRE_QWEN4_EXPERT_CACHE";
 pub const EXPERT_CACHE_TAIL_PERCENT_ENV: &str = "HIPFIRE_QWEN4_EXPERT_CACHE_TAIL_PERCENT";
 pub const EXPERT_CACHE_INFLIGHT_ENV: &str = "HIPFIRE_QWEN4_EXPERT_CACHE_INFLIGHT";
+/// The cache's allocation and typed mutable-read capability share one row bound.
+pub const EXPERT_CACHE_MAX_VERIFY_ROWS: usize =
+    hipfire_dispatch::families::moe::MutableExpertResidency::MAX_VERIFY_ROWS;
 
 const IMMUTABLE_WEIGHTS_CHECK_REASON: &str =
     "is incompatible with HIPFIRE_RAILGUN_CHECK=always: physical donor-slot payloads are mutable, but the check compares a fixed Weights digest baseline";
@@ -36,6 +39,12 @@ fn admit_railgun_check(cache_enabled: bool, always: bool) -> Result<(), String> 
 pub struct ExpertCacheConfig {
     pub tail_percent: u32,
     pub max_inflight: usize,
+    /// Resolved per-load window capacity, including the native MTP seed row.
+    /// This is not an environment override: the loader derives it from the same
+    /// proposal bound as the GDN row ring before placement or materialization.
+    /// A later auto-only decline keeps this conservative admitted allocation;
+    /// it does not re-plan expert placement or resize runtime route storage.
+    pub verify_rows: usize,
 }
 
 /// The immutable ranked load decision, used only to seed cache recency.
@@ -92,7 +101,19 @@ impl ExpertCacheConfig {
         Ok(enabled.then_some(Self {
             tail_percent,
             max_inflight,
+            verify_rows: 1,
         }))
+    }
+
+    pub fn with_verify_rows(mut self, rows: usize) -> Result<Self, String> {
+        if !(1..=EXPERT_CACHE_MAX_VERIFY_ROWS).contains(&rows) {
+            return Err(format!(
+                "exact expert cache native MTP window requires {rows} rows; supported capacity is \
+                 1..={EXPERT_CACHE_MAX_VERIFY_ROWS}; reduce the native MTP proposal bound"
+            ));
+        }
+        self.verify_rows = rows;
+        Ok(self)
     }
 
     pub fn tail_bytes(self, resident_owner_bytes: u64) -> Result<u64, String> {
@@ -114,12 +135,14 @@ impl ExpertCacheConfig {
         experts: usize,
         topk: usize,
     ) -> Result<u64, String> {
+        self.with_verify_rows(self.verify_rows)?;
         let tables = layers
             .checked_mul(experts)
             .and_then(|x| x.checked_mul(16))
             .ok_or("expert-cache table budget overflows")?;
         let routes = layers
             .checked_mul(topk)
+            .and_then(|x| x.checked_mul(self.verify_rows))
             .and_then(|x| x.checked_mul(4))
             .ok_or("expert-cache route budget overflows")?;
         u64::try_from(tables)
@@ -145,7 +168,9 @@ pub struct ExpertCacheAdmission<'a> {
     pub single_device: bool,
     pub ranked_hotset: bool,
     pub uniform_mq4: bool,
-    pub speculation: bool,
+    /// DFlash, DSpark and the independent n-gram drafter remain unsupported.
+    /// Native MTP instead has a bounded, loader-resolved verify_rows capacity.
+    pub unsupported_speculation: bool,
     pub continuous_batch: bool,
     pub cpu_experts: bool,
     pub decode_share: bool,
@@ -166,8 +191,8 @@ pub fn admit(facts: &ExpertCacheAdmission<'_>) -> Result<(), String> {
         Some("requires an applied ranked expert hotset")
     } else if !facts.uniform_mq4 {
         Some("requires uniform QT44/QT53 experts")
-    } else if facts.speculation {
-        Some("requires speculation off")
+    } else if facts.unsupported_speculation {
+        Some("does not support DFlash, DSpark or the independent n-gram drafter")
     } else if facts.continuous_batch {
         Some("does not support continuous batching/lanes")
     } else if facts.cpu_experts {
@@ -198,7 +223,7 @@ mod tests {
         let c = ExpertCacheConfig::parse(Some("true"), None, None)
             .unwrap()
             .unwrap();
-        assert_eq!((c.tail_percent, c.max_inflight), (50, 64));
+        assert_eq!((c.tail_percent, c.max_inflight, c.verify_rows), (50, 64, 1));
         for raw in ["", "yes", "2"] {
             assert!(ExpertCacheConfig::parse(Some(raw), None, None).is_err());
         }
@@ -220,7 +245,7 @@ mod tests {
             single_device: true,
             ranked_hotset: true,
             uniform_mq4: true,
-            speculation: false,
+            unsupported_speculation: false,
             continuous_batch: false,
             cpu_experts: false,
             decode_share: false,
@@ -250,7 +275,7 @@ mod tests {
         f.uniform_mq4 = false;
         assert!(admit(&f).is_err());
         let mut f = facts();
-        f.speculation = true;
+        f.unsupported_speculation = true;
         assert!(admit(&f).is_err());
         let mut f = facts();
         f.continuous_batch = true;
@@ -298,5 +323,37 @@ mod tests {
                 "cache={cache_enabled} check={setting:?}",
             );
         }
+    }
+
+    #[test]
+    fn expert_cache_verify_window_reserve_matches_the_exact_route_extent() {
+        let single = ExpertCacheConfig::parse(Some("1"), None, None)
+            .unwrap()
+            .unwrap();
+        let tables = 48 * 512 * 16;
+        let ids_per_row = 48 * 10 * std::mem::size_of::<u32>();
+        for rows in [1, 2, 4, EXPERT_CACHE_MAX_VERIFY_ROWS] {
+            let config = single.with_verify_rows(rows).unwrap();
+            assert_eq!(
+                config.device_reserve_bytes(48, 512, 10).unwrap(),
+                (tables + ids_per_row * rows + (32 << 20)) as u64,
+            );
+        }
+        for rows in [0, EXPERT_CACHE_MAX_VERIFY_ROWS + 1, usize::MAX] {
+            let error = single.with_verify_rows(rows).unwrap_err();
+            assert!(error.contains(&format!("{rows} rows")));
+            assert!(error.contains("supported capacity"));
+            // Public policy fields cannot bypass validation at byte admission.
+            let invalid = ExpertCacheConfig {
+                verify_rows: rows,
+                ..single
+            };
+            assert!(invalid.device_reserve_bytes(48, 512, 10).is_err());
+        }
+        let batch = single
+            .with_verify_rows(EXPERT_CACHE_MAX_VERIFY_ROWS)
+            .unwrap();
+        assert!(batch.device_reserve_bytes(1, usize::MAX, 10).is_err());
+        assert!(batch.device_reserve_bytes(48, 512, usize::MAX).is_err());
     }
 }

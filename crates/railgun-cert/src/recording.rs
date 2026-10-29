@@ -1596,7 +1596,7 @@ pub const DECISIONS: &[Decision] = &[
         predicates: &[CaptureMode],
         condition: "Qwen4GpuForward::forward_chunk_inner refuses HIP graph capture before acquiring an exact expert-cache reader or launching the token; prompt entries use their separate canonical prefill scope",
         effect: Refusal,
-        switches: "error before launch: mutable table publication and route readback require an explicit retired reader, so the singleton exact-cache call cannot be nested inside HIP graph capture",
+        switches: "error before launch: mutable table publication and route readback require an explicit retired reader, so the singleton AR or bounded native-MTP exact-cache call cannot be nested inside HIP graph capture",
         kernels: &[],
         verdict: Invariant,
         evidence: "the capture branch returns before begin_token, table refresh, route reset or forward_chunk_tile; it records no alternative body. Ordinary eager and checked retained AR keep their existing lifetime proof",

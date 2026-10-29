@@ -2978,6 +2978,112 @@ fn qwen4_ep_lane_request(
     })
 }
 
+/// Only the native MTP driver has the cache's bounded mutable-window contract.
+/// Its internal n-gram takeover is already included in proposal_drafts; the
+/// independent drafter remains a different, unsupported producer.
+fn qwen4_expert_cache_unsupported_speculation(spec: SpecLoadCfg) -> bool {
+    spec.dflash == Some(true) || spec.dspark == Some(true) || spec.ngram_draft == Some(true)
+}
+
+fn qwen4_expert_cache_for_native_mtp(
+    cache: Option<hipfire_arch_qwen4::expert_cache_config::ExpertCacheConfig>,
+    spec: SpecLoadCfg,
+    native_mtp: bool,
+    proposal_drafts: usize,
+) -> Result<Option<hipfire_arch_qwen4::expert_cache_config::ExpertCacheConfig>, String> {
+    let Some(cache) = cache else {
+        return Ok(None);
+    };
+    if qwen4_expert_cache_unsupported_speculation(spec) {
+        return Err(
+            "exact expert cache does not support DFlash, DSpark or the independent n-gram drafter"
+                .into(),
+        );
+    }
+    if spec.mtp == Some(false) && native_mtp {
+        return Err(
+            "exact expert cache received native MTP on despite explicit speculation.mtp off".into(),
+        );
+    }
+    qwen4_refuse_explicit_mtp_decline(
+        true,
+        spec,
+        !native_mtp,
+        "no admitted native MTP head/route",
+    )?;
+    let rows = if native_mtp {
+        hipfire_arch_qwen4::mtp_spec::native_mtp_window_rows(proposal_drafts)
+    } else {
+        1
+    };
+    cache.with_verify_rows(rows).map(Some)
+}
+
+/// An opted-in cache's explicit native request must attach or return a named
+/// error. Cache-off loads retain their existing policy and diagnostics; auto
+/// still follows the original head and host-spill policy.
+fn qwen4_refuse_explicit_mtp_decline(
+    cache_enabled: bool,
+    spec: SpecLoadCfg,
+    declined: bool,
+    reason: &str,
+) -> Result<(), String> {
+    if cache_enabled && declined && spec.mtp == Some(true) {
+        return Err(format!(
+            "qwen4: explicit native MTP was requested but cannot be kept: {reason}"
+        ));
+    }
+    Ok(())
+}
+
+/// Reuse the existing routed-expert census's canonical key/policy predicate.
+/// Unit payloads classify keys only; physical sizes come from owning handles.
+/// The public census also excludes tied aliases and external source records.
+fn qwen4_host_expert_summary_keys(
+    weights: &[hipfire_runtime::weight_manifest::WeightEntry],
+) -> std::collections::BTreeSet<(&str, Option<usize>)> {
+    use hipfire_arch_qwen4::expert_residency::routed_expert_bytes;
+    use hipfire_runtime::weight_manifest::WeightResidency;
+    let mut keys = std::collections::BTreeSet::new();
+    for entry in weights {
+        if entry.residency == WeightResidency::HostMapped
+            && matches!(
+                routed_expert_bytes(std::slice::from_ref(entry), |_| Some(1)),
+                Ok(1)
+            )
+        {
+            keys.insert((entry.name.as_str(), entry.layer));
+        }
+    }
+    keys
+}
+
+/// Describe settled physical expert owners, not a requested placement policy.
+/// A materialized cache donor tail is not proof that any decode used the LRU.
+fn qwen4_expert_placement_summary(
+    routed_experts: bool,
+    tier: Option<(u64, u64, bool)>,
+    host_tensors: usize,
+    host_bytes: u64,
+) -> Option<String> {
+    if !routed_experts {
+        return None;
+    }
+    let gib = |bytes: u64| bytes as f64 / (1u64 << 30) as f64;
+    Some(match tier {
+        Some((device, host, cache_tail)) => format!(
+            "experts: ranked tier{} ({:.1} GiB VRAM, {:.1} GiB host-mapped); {host_tensors} other expert tensors ({:.1} GiB) host-mapped",
+            if cache_tail { " with cache donor tail" } else { "" },
+            gib(device), gib(host), gib(host_bytes),
+        ),
+        None if host_tensors > 0 => format!(
+            "experts: {host_tensors} tensors ({:.1} GiB) host-mapped",
+            gib(host_bytes),
+        ),
+        None => "experts: fully resident".into(),
+    })
+}
+
 /// Metadata-only preload resource plan for one Qwen4 rank (`Unit B`).
 ///
 /// Source-planned, unmeasured, non-qualifying: admits the HFQ artifact and
@@ -3095,6 +3201,16 @@ pub fn qwen4_preload_resource_plan(
                 )
             })
             .map_err(|error| format!("qwen4 preload plan: native MTP: {error}"))?;
+    let effective_max_k = qwen4_native_mtp_k(shared.spec, &gpu.arch);
+    let capture_reserve_drafts =
+        hipfire_arch_qwen4::mtp_spec::native_mtp_proposal_drafts(effective_max_k, &gpu.arch);
+    let expert_cache = qwen4_expert_cache_for_native_mtp(
+        expert_cache,
+        shared.spec,
+        effective_native_mtp,
+        capture_reserve_drafts,
+    )
+    .map_err(|error| format!("qwen4 preload plan: {error}"))?;
     if expert_cache.is_some() {
         use hipfire_arch_qwen4::expert_cache_config::{
             admit, railgun_check_always, ExpertCacheAdmission,
@@ -3105,11 +3221,7 @@ pub fn qwen4_preload_resource_plan(
             single_device: !use_ranges,
             ranked_hotset: true,
             uniform_mq4: true,
-            speculation: effective_native_mtp
-                || shared.spec.mtp == Some(true)
-                || shared.spec.dflash == Some(true)
-                || shared.spec.ngram_draft == Some(true)
-                || shared.spec.dspark == Some(true),
+            unsupported_speculation: qwen4_expert_cache_unsupported_speculation(shared.spec),
             continuous_batch: shared.continuous_batch,
             cpu_experts: hipfire_config::memory::offload_exec()
                 != hipfire_config::memory::OffloadExec::Pcie
@@ -3126,7 +3238,6 @@ pub fn qwen4_preload_resource_plan(
         })
         .map_err(|error| format!("qwen4 preload plan: {error}"))?;
     }
-    let effective_max_k = qwen4_native_mtp_k(shared.spec, &gpu.arch);
     // Placement census at the requested chunk (same convention as the load).
     let mtp_kept = effective_native_mtp
         && crate::admission::qwen4_mtp_with_host_mapped_experts(
@@ -3134,6 +3245,12 @@ pub fn qwen4_preload_resource_plan(
             &gpu.arch,
             usize::from(routed_experts),
         );
+    qwen4_refuse_explicit_mtp_decline(
+        expert_cache.is_some(),
+        shared.spec,
+        effective_native_mtp && !mtp_kept,
+        "host-mapped expert policy refused the native MTP head",
+    )?;
     let inputs = residency::placement_inputs(&residency::PlacementInputsArgs {
         gpu,
         config: &config,
@@ -3849,7 +3966,8 @@ pub fn qwen4_preload_resource_plan(
     if let Some(cache) = expert_cache {
         plan["expert_cache"] = serde_json::json!({
             "requested": true, "tail_percent": cache.tail_percent,
-            "max_inflight": cache.max_inflight,
+            "max_inflight": cache.max_inflight, "verify_rows": cache.verify_rows,
+            "verify_rows_basis": "pre-placement admitted capacity; retained if auto MTP later declines to AR",
             "device_tables_routes_queue_reserve_bytes": cache.device_reserve_bytes(
                 config.num_hidden_layers, config.num_experts, config.num_experts_per_tok,
             )?,
@@ -4613,6 +4731,14 @@ fn load_qwen4_rank_scoped(
     // A dense FFN has no routed experts: its gate/up/down are ordinary
     // resident weights and the host-expert placement does not apply.
     let routed_experts = !config.ffn.is_dense();
+    let capture_reserve_drafts =
+        hipfire_arch_qwen4::mtp_spec::native_mtp_proposal_drafts(max_k, &ctx.gpu.arch);
+    let expert_cache = qwen4_expert_cache_for_native_mtp(
+        expert_cache,
+        ctx.spec,
+        native_mtp,
+        capture_reserve_drafts,
+    )?;
     if expert_cache.is_some() {
         use hipfire_arch_qwen4::expert_cache_config::{
             admit, railgun_check_always, ExpertCacheAdmission,
@@ -4628,11 +4754,7 @@ fn load_qwen4_rank_scoped(
             // any expert materialization or full model fulfillment.
             ranked_hotset: true,
             uniform_mq4: true,
-            speculation: native_mtp
-                || ctx.spec.mtp == Some(true)
-                || ctx.spec.dflash == Some(true)
-                || ctx.spec.ngram_draft == Some(true)
-                || ctx.spec.dspark == Some(true),
+            unsupported_speculation: qwen4_expert_cache_unsupported_speculation(ctx.spec),
             continuous_batch: shared.continuous_batch,
             cpu_experts: hipfire_config::memory::offload_exec()
                 != hipfire_config::memory::OffloadExec::Pcie
@@ -4648,7 +4770,7 @@ fn load_qwen4_rank_scoped(
             railgun_check_always: railgun_check_always()?,
         })
         .map_err(|reason| {
-            format!("qwen4: {reason}; use --spec off, decode-share off and PCIe expert execution")
+            format!("qwen4: {reason}; use native MTP or --spec off, decode-share off and PCIe expert execution")
         })?;
     }
 
@@ -4956,8 +5078,6 @@ fn load_qwen4_rank_scoped(
     } else {
         None
     };
-    let capture_reserve_drafts =
-        hipfire_arch_qwen4::mtp_spec::native_mtp_proposal_drafts(max_k, &ctx.gpu.arch);
     let planned_capture = placement_native_mtp
         .then(|| {
             hipfire_arch_qwen4::mtp_spec::native_mtp_capture(
@@ -5933,6 +6053,12 @@ fn load_qwen4_rank_scoped(
         if native_mtp
             && !crate::admission::qwen4_mtp_with_host_mapped_experts(ctx.spec, &ctx.gpu.arch, moved)
         {
+            qwen4_refuse_explicit_mtp_decline(
+                expert_cache.is_some(),
+                ctx.spec,
+                true,
+                "host-mapped expert policy refused the native MTP head",
+            )?;
             native_mtp = false;
             eprintln!(
                 "{}",
@@ -5952,12 +6078,6 @@ fn load_qwen4_rank_scoped(
                 ),
             );
         }
-    }
-    if placement.is_none() && moe_layers > 0 {
-        hipfire_config::load_summary::note(
-            hipfire_config::load_summary::Facet::Placement,
-            "experts: fully resident",
-        );
     }
     if whole_first == hotsets::WholeFirstDecision::Active && placement.is_none() {
         if let Some(inputs) = &measured {
@@ -5990,6 +6110,12 @@ fn load_qwen4_rank_scoped(
                 host_projections,
             )
         {
+            qwen4_refuse_explicit_mtp_decline(
+                expert_cache.is_some(),
+                ctx.spec,
+                true,
+                "host-mapped expert policy refused the native MTP head",
+            )?;
             native_mtp = false;
             eprintln!(
                 "{}",
@@ -7590,6 +7716,46 @@ fn load_qwen4_rank_scoped(
         eprintln!("  qwen4 measured resources: unavailable (single-rank settled identity or placement evidence unavailable)");
         None
     };
+    if placement.is_none() {
+        // Whole-layer splits already emitted their detailed placement note above.
+        // For the other routes, successful materialized owners determine this receipt.
+        // The legacy whole-layer `placement` is None on ranked tiers too, so it
+        // cannot distinguish a fully resident model from host-backed tier/cache
+        // experts. Include the independent MTP host projections as well.
+        let host_expert_keys = qwen4_host_expert_summary_keys(&bundle.weights.manifest.weights);
+        let mut host_tensors = 0usize;
+        let mut host_bytes = 0u64;
+        for taken in &bundle.weights.taken {
+            if !host_expert_keys.contains(&(taken.key.name.as_str(), taken.key.layer)) {
+                continue;
+            }
+            let hipfire_runtime::weight_store::WeightHandle::Resident(tensor) = &taken.handle
+            else {
+                continue;
+            };
+            if tensor.buf.is_host_mapped() && !tensor.buf.is_borrowed() {
+                host_tensors += 1;
+                host_bytes += tensor.buf.size() as u64;
+            }
+        }
+        drop(host_expert_keys);
+        let tier = bundle.weights.expert_tiers().map(|lease| {
+            use hipfire_arch_qwen4::expert_tier_plan::Placement;
+            (
+                lease.owner_bytes(Placement::Device),
+                lease.owner_bytes(Placement::HostMapped),
+                lease.expert_cache_ranges().is_some(),
+            )
+        });
+        if let Some(summary) =
+            qwen4_expert_placement_summary(routed_experts, tier, host_tensors, host_bytes)
+        {
+            hipfire_config::load_summary::note(
+                hipfire_config::load_summary::Facet::Placement,
+                summary,
+            );
+        }
+    }
     let card_cap = ctx.sequence.map(|sequence| sequence.card_cap);
     Ok(Qwen4RankLoad {
         bundle,
@@ -11556,6 +11722,7 @@ mod qwen4_admission_tests {
         let cache = ExpertCacheConfig {
             tail_percent: 50,
             max_inflight: 64,
+            verify_rows: 1,
         };
         let run = |total, cache, share| {
             super::qwen4_plan_hotset_placement_with_cache(
@@ -11586,6 +11753,22 @@ mod qwen4_admission_tests {
         // The frozen resident prefill uses the same original donor experts.
         assert_eq!(cache_stage, plain_stage);
         assert!(cache.device_reserve_bytes(48, 512, 10).unwrap() > 32 << 20);
+        let batch_config = cache.with_verify_rows(8).unwrap();
+        let (batch, batch_pin, batch_stage) = run(128 << 20, Some(batch_config), None).unwrap();
+        assert_eq!(batch_pin, cache_pin);
+        assert_eq!(batch_stage, cache_stage);
+        assert_eq!(batch.logical_digest(), cached.logical_digest());
+        let tight_single_total = cache_pin
+            + cache_stage
+            + super::qwen4_expert_table_bytes(true, (48, 512, false)).unwrap()
+            - hipfire_arch_qwen4::expert_residency::EXPERT_TIER_TABLE_BYTES
+            + cache.device_reserve_bytes(48, 512, 10).unwrap()
+            + cached.owner_bytes(Placement::Device)
+            - plain.owner_bytes(Placement::Device);
+        assert!(run(tight_single_total, Some(cache), None).is_ok());
+        // The same pinned expert set is no permission to omit the wider route
+        // landing extent: a budget that fits singleton must refuse this batch.
+        assert!(run(tight_single_total, Some(batch_config), None).is_err());
         assert!(run(32 << 20, Some(cache), None).is_err());
         assert!(run(128 << 20, Some(cache), Some(1024)).is_err());
         let (off, _, _) = super::qwen4_plan_hotset_placement(
@@ -11600,6 +11783,210 @@ mod qwen4_admission_tests {
         )
         .unwrap();
         assert_eq!(plain.logical_digest(), off.logical_digest());
+    }
+
+    #[test]
+    fn expert_placement_summary_selects_only_canonical_host_routed_keys() {
+        use hipfire_runtime::weight_manifest::{ShardPolicy, WeightEntry, WeightResidency};
+        let host = |name: &str, layer: Option<usize>| {
+            let mut entry = WeightEntry::model(
+                name,
+                vec![1],
+                rdna_compute::DType::BF16,
+                ShardPolicy::Replicate,
+            );
+            entry.layer = layer;
+            entry.residency = WeightResidency::HostMapped;
+            entry
+        };
+        let arena = format!(
+            "model.language_model.layers.2{}",
+            hipfire_arch_qwen4::expert_arena::ARENA_SUFFIX
+        );
+        let mut weights = vec![
+            host(
+                "model.language_model.layers.1.mlp.experts.gate_up_proj",
+                Some(1),
+            ),
+            host(
+                "model.language_model.layers.1.mlp.experts.down_proj",
+                Some(1),
+            ),
+            host("mtp.layers.0.mlp.experts.gate_up_proj", None),
+            host("mtp.layers.0.mlp.experts.down_proj", None),
+            host(&arena, Some(2)),
+            // Marking unrelated payloads HostMapped cannot make them experts.
+            host("model.language_model.embed_tokens.weight", None),
+            host("model.language_model.ple.embedding_shards.0.weight", None),
+            host(
+                "model.language_model.layers.1.self_attn.q_proj.weight",
+                Some(1),
+            ),
+            host("mtp.fc_embedding.weight", None),
+            host("mtp.fc_hidden.weight", None),
+            host("mtp.layers.0.mlp.shared_expert.down_proj.weight", None),
+            host("mtp.layers.0.mlp.gate.weight", None),
+        ];
+        let mut resident = host(
+            "model.language_model.layers.3.mlp.experts.gate_up_proj",
+            Some(3),
+        );
+        resident.residency = WeightResidency::Resident;
+        weights.push(resident);
+        let actual = super::qwen4_host_expert_summary_keys(&weights);
+        let expected: std::collections::BTreeSet<_> = weights[..5]
+            .iter()
+            .map(|entry| (entry.name.as_str(), entry.layer))
+            .collect();
+        assert_eq!(actual, expected);
+        let non_experts_only = super::qwen4_host_expert_summary_keys(&weights[5..]);
+        assert!(non_experts_only.is_empty());
+    }
+
+    #[test]
+    fn expert_placement_summary_uses_settled_tier_and_host_owners() {
+        let gib = 1u64 << 30;
+        for (tier, host_tensors, host_bytes, expected, fully_resident) in [
+            (None, 0, 0, "fully resident", true),
+            (None, 2, gib, "2 tensors", false),
+            (Some((8 * gib, 12 * gib, false)), 0, 0, "ranked tier", false),
+            (
+                Some((8 * gib, 12 * gib, true)),
+                2,
+                gib,
+                "cache donor tail",
+                false,
+            ),
+            (
+                Some((8 * gib, 0, false)),
+                2,
+                gib,
+                "2 other expert tensors",
+                false,
+            ),
+        ] {
+            let actual =
+                super::qwen4_expert_placement_summary(true, tier, host_tensors, host_bytes)
+                    .unwrap();
+            assert!(actual.contains(expected), "{actual}");
+            assert_eq!(
+                actual.contains("fully resident"),
+                fully_resident,
+                "{actual}"
+            );
+        }
+        assert!(super::qwen4_expert_placement_summary(false, None, 0, 0).is_none());
+    }
+
+    #[test]
+    fn expert_cache_native_mtp_capacity_follows_the_resolved_mode_and_proposal_bound() {
+        use hipfire_arch_qwen4::expert_cache_config::ExpertCacheConfig;
+        let cache = ExpertCacheConfig::parse(Some("1"), None, None)
+            .unwrap()
+            .unwrap();
+        for mtp in [None, Some(false)] {
+            let spec = SpecLoadCfg {
+                mtp,
+                ..SpecLoadCfg::default()
+            };
+            // Auto may legitimately resolve off. The cache does not arm MTP,
+            // and an unused proposal bound must not widen an AR allocation.
+            let actual = super::qwen4_expert_cache_for_native_mtp(Some(cache), spec, false, 63)
+                .unwrap()
+                .unwrap();
+            assert_eq!(actual.verify_rows, 1);
+        }
+        for mtp in [None, Some(true)] {
+            let spec = SpecLoadCfg {
+                mtp,
+                ..SpecLoadCfg::default()
+            };
+            for (drafts, rows) in [(1, 2), (3, 4), (7, 8)] {
+                let actual =
+                    super::qwen4_expert_cache_for_native_mtp(Some(cache), spec, true, drafts)
+                        .unwrap()
+                        .unwrap();
+                assert_eq!(actual.verify_rows, rows);
+            }
+            // The native copy lane's proposal authority may be wider than K.
+            // Never clamp its 9/64-row requests down to a cache-supported 8.
+            for drafts in [8, 63] {
+                let error =
+                    super::qwen4_expert_cache_for_native_mtp(Some(cache), spec, true, drafts)
+                        .unwrap_err();
+                assert!(error.contains("supported capacity"));
+            }
+        }
+        let explicit = SpecLoadCfg {
+            mtp: Some(true),
+            ..SpecLoadCfg::default()
+        };
+        assert!(
+            super::qwen4_expert_cache_for_native_mtp(Some(cache), explicit, false, 3)
+                .unwrap_err()
+                .contains("explicit native MTP")
+        );
+        let off = SpecLoadCfg {
+            mtp: Some(false),
+            ..SpecLoadCfg::default()
+        };
+        assert!(super::qwen4_expert_cache_for_native_mtp(Some(cache), off, true, 3).is_err());
+        // Cache-off retains the ordinary loader's decisions and capacities.
+        assert!(
+            super::qwen4_expert_cache_for_native_mtp(None, explicit, true, 63)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn expert_cache_native_mtp_does_not_admit_independent_drafters() {
+        use hipfire_arch_qwen4::expert_cache_config::ExpertCacheConfig;
+        let cache = ExpertCacheConfig::parse(Some("1"), None, None)
+            .unwrap()
+            .unwrap();
+        for spec in [
+            SpecLoadCfg {
+                dflash: Some(true),
+                ..SpecLoadCfg::default()
+            },
+            SpecLoadCfg {
+                dspark: Some(true),
+                ..SpecLoadCfg::default()
+            },
+            SpecLoadCfg {
+                ngram_draft: Some(true),
+                ..SpecLoadCfg::default()
+            },
+        ] {
+            let error =
+                super::qwen4_expert_cache_for_native_mtp(Some(cache), spec, true, 7).unwrap_err();
+            assert!(
+                error.contains("does not support DFlash, DSpark or the independent n-gram drafter")
+            );
+        }
+        for mtp in [None, Some(false), Some(true)] {
+            let spec = SpecLoadCfg {
+                mtp,
+                ..SpecLoadCfg::default()
+            };
+            for cache_enabled in [false, true] {
+                assert!(super::qwen4_refuse_explicit_mtp_decline(
+                    cache_enabled,
+                    spec,
+                    false,
+                    "test route"
+                )
+                .is_ok());
+                let declined = super::qwen4_refuse_explicit_mtp_decline(
+                    cache_enabled,
+                    spec,
+                    true,
+                    "host spill test",
+                );
+                assert_eq!(declined.is_err(), cache_enabled && mtp == Some(true));
+            }
+        }
     }
 
     /// Uniform metadata slabs (padded payload 1,536 B per expert) and the id
