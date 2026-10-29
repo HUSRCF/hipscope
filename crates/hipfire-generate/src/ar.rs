@@ -6210,6 +6210,7 @@ pub fn generate(
         let mut stream_bytes: Vec<u8> = Vec::new();
         let mut filter = EosFilter::new(EosFilterConfig::default());
 
+        let mut hit_stop = false;
         for _ in 0..max_tokens {
             // Decode-side abort check (mirrors the Qwen AR loop): a client
             // cancel bails at the next iteration with an attested
@@ -6230,10 +6231,20 @@ pub fn generate(
                 streamed_tokens.len() - 1,
                 t0.elapsed().as_millis() as u64,
             );
+            // The terminator is committed (KV + conversation) but never streamed
+            // as text, matching the DFlash/DSpark routes.
+            let is_stop = next_token == config.eos_token
+                || im_end_token == Some(next_token)
+                || tokenizer.is_terminator(next_token);
             let fed = stream_bytes.len();
             tokenizer.decode_token_bytes_into(next_token, &mut stream_bytes);
             let new_bytes = &stream_bytes[fed..];
-            if let FilterAction::Emit(text_bytes) = filter.observe(new_bytes) {
+            let action = if is_stop {
+                FilterAction::Hold
+            } else {
+                filter.observe(new_bytes)
+            };
+            if let FilterAction::Emit(text_bytes) = action {
                 let text = std::str::from_utf8(&text_bytes).unwrap();
                 let _ = writeln!(
                     stdout,
@@ -6297,13 +6308,8 @@ pub fn generate(
                 }
             };
 
-            if next_token == config.eos_token {
-                break;
-            }
-            if im_end_token == Some(next_token) {
-                break;
-            }
-            if tokenizer.is_terminator(next_token) {
+            if is_stop {
+                hit_stop = true;
                 break;
             }
 
@@ -6382,6 +6388,7 @@ pub fn generate(
             "prefill_tok_s": (prefill_tok_s * 10.0).round() / 10.0,
             "decode_tok_s": (decode_tok_s * 10.0).round() / 10.0,
             "ttft_ms": ((prefill_s * 1000.0) * 10.0).round() / 10.0,
+            "finish_reason": if hit_stop { "stop" } else { "length" },
             "attempt_id": active_attempt_id(),
         });
         if !pflash_frag.is_empty() {
