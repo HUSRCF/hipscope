@@ -351,7 +351,14 @@ fn lift_kernel(
             format!("symbol size {} is not a dword multiple", image.code.len()),
         ));
     }
-    let body = decode_body(&image.name, &image.code, image.entry_va, arch, object_sha, frontend)?;
+    let body = decode_body(
+        &image.name,
+        &image.code,
+        image.entry_va,
+        arch,
+        object_sha,
+        frontend,
+    )?;
     kd::validate(&image.descriptor, arch)
         .map_err(|e| kernel_error(image, slot.kd_va, Rule::Descriptor, e))?;
     metadata::check(&image.metadata.parsed, &image.name, &image.descriptor)

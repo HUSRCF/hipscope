@@ -78,12 +78,7 @@ fn tree32(a: &mut [f32; 32]) -> f32 {
 /// `rows[s]`, K = 2048 = 8 groups) against `lanes` activation columns
 /// `x[b*2048 ..]`. Returns per segment `[lanes][rows_s]` f32 bit patterns
 /// (`out[s][b * rows_s + row]`).
-pub fn lane_proj_ref(
-    weights: &[&[u8]],
-    rows: &[usize],
-    x: &[f32],
-    lanes: usize,
-) -> Vec<Vec<u32>> {
+pub fn lane_proj_ref(weights: &[&[u8]], rows: &[usize], x: &[f32], lanes: usize) -> Vec<Vec<u32>> {
     const K: usize = 2048;
     const GROUPS: usize = 8;
     assert_eq!(weights.len(), rows.len());
@@ -91,7 +86,10 @@ pub fn lane_proj_ref(
     let row_bytes = GROUPS * GROUP_BYTES;
     let mut out = Vec::with_capacity(weights.len());
     for (w, &m) in weights.iter().zip(rows) {
-        assert!(w.len() >= m * row_bytes, "weights shorter than rows * 1088 B");
+        assert!(
+            w.len() >= m * row_bytes,
+            "weights shorter than rows * 1088 B"
+        );
         let mut seg = vec![0u32; lanes * m];
         for row in 0..m {
             let rbase = row * row_bytes;
@@ -192,7 +190,10 @@ impl WordCmp {
 
 pub fn compare_words(got: &[u32], want: &[u32]) -> WordCmp {
     assert_eq!(got.len(), want.len());
-    let mut c = WordCmp { words: got.len(), ..Default::default() };
+    let mut c = WordCmp {
+        words: got.len(),
+        ..Default::default()
+    };
     for (&g, &w) in got.iter().zip(want) {
         let (gn, wn) = (f32::from_bits(g).is_nan(), f32::from_bits(w).is_nan());
         if gn && wn {
@@ -227,11 +228,20 @@ mod tests {
         let sign = ((b >> 16) & 0x8000) as u16;
         let e = ((b >> 23) & 0xFF) as i32 - 127 + 15;
         let m = ((b >> 13) & 0x3FF) as u16;
-        assert!((1..31).contains(&e) && (b & 0x1FFF) == 0, "not exactly representable");
+        assert!(
+            (1..31).contains(&e) && (b & 0x1FFF) == 0,
+            "not exactly representable"
+        );
         sign | ((e as u16) << 10) | m
     }
 
-    fn put_group(buf: &mut [u8], gb: usize, sc: [u16; 2], zp: [u16; 2], nibbles: impl Fn(usize, usize) -> u32) {
+    fn put_group(
+        buf: &mut [u8],
+        gb: usize,
+        sc: [u16; 2],
+        zp: [u16; 2],
+        nibbles: impl Fn(usize, usize) -> u32,
+    ) {
         buf[gb..gb + 2].copy_from_slice(&sc[0].to_le_bytes());
         buf[gb + 2..gb + 4].copy_from_slice(&zp[0].to_le_bytes());
         buf[gb + 4..gb + 6].copy_from_slice(&sc[1].to_le_bytes());
@@ -284,7 +294,13 @@ mod tests {
         // sc=0.5, zp=-1.0 (header half 0); nibbles of lane 0, group g: k -> k
         let mut w = vec![0u8; 8 * GROUP_BYTES];
         for g in 0..8 {
-            put_group(&mut w, g * GROUP_BYTES, [h(0.5), h(0.0)], [h(-1.0), h(0.0)], |l, k| if l == 0 { k as u32 } else { 0 });
+            put_group(
+                &mut w,
+                g * GROUP_BYTES,
+                [h(0.5), h(0.0)],
+                [h(-1.0), h(0.0)],
+                |l, k| if l == 0 { k as u32 } else { 0 },
+            );
         }
         // u_k = 0.5*k - 1 = [-1,-0.5,0,0.5,1,1.5,2,2.5]
         let mut x = vec![0f32; 2048];
@@ -336,11 +352,23 @@ mod tests {
         let mut w1 = vec![0u8; 8 * GROUP_BYTES];
         for r in 0..2 {
             for g in 0..8 {
-                put_group(&mut w0, (r * 8 + g) * GROUP_BYTES, [h(1.0), h(1.0)], [h(0.0), h(0.0)], |_, _| 1);
+                put_group(
+                    &mut w0,
+                    (r * 8 + g) * GROUP_BYTES,
+                    [h(1.0), h(1.0)],
+                    [h(0.0), h(0.0)],
+                    |_, _| 1,
+                );
             }
         }
         for g in 0..8 {
-            put_group(&mut w1, g * GROUP_BYTES, [h(2.0), h(2.0)], [h(0.0), h(0.0)], |_, _| 1);
+            put_group(
+                &mut w1,
+                g * GROUP_BYTES,
+                [h(2.0), h(2.0)],
+                [h(0.0), h(0.0)],
+                |_, _| 1,
+            );
         }
         // u = 1 (seg0) / 2 (seg1) everywhere; x[b] = b+1 everywhere -> dot = 2048*(b+1)*u
         let mut x = vec![0f32; 3 * 2048];
@@ -363,14 +391,20 @@ mod tests {
         // acc[0] = 0 + g0, += g4 ; acc[1] = g1 ; result (acc0+acc1)+(acc2+acc3).
         let mut w = vec![0u8; 8 * GROUP_BYTES];
         for g in 0..8 {
-            put_group(&mut w, g * GROUP_BYTES, [h(1.0), h(1.0)], [h(0.0), h(0.0)], |l, k| if l == 0 && k == 0 { 1 } else { 0 });
+            put_group(
+                &mut w,
+                g * GROUP_BYTES,
+                [h(1.0), h(1.0)],
+                [h(0.0), h(0.0)],
+                |l, k| if l == 0 && k == 0 { 1 } else { 0 },
+            );
         }
         // lane 0, k=0 -> u0 = 1; all other u = 0 (nibble 0: fma(1,0,0)=0).
         let mut x = vec![0f32; 2048];
         x[0] = 16777216.0; // group 0
         x[256] = 1.0; // group 1
         x[4 * 256] = 1.0; // group 4
-        // acc0 = (0 + 2^24) + 1 = 2^24 (tie rounds to even); acc1 = 1 ; (acc0+acc1) = 2^24 + 1 -> 2^24
+                          // acc0 = (0 + 2^24) + 1 = 2^24 (tie rounds to even); acc1 = 1 ; (acc0+acc1) = 2^24 + 1 -> 2^24
         let got = f32::from_bits(lane_proj_ref(&[&w], &[1], &x, 1)[0][0]);
         assert_eq!(got, 16777216.0);
         // had it been acc0 = 2^24 + 1 + 1 summed as (1+1) first we would have 2^24+2
@@ -383,7 +417,13 @@ mod tests {
         let mut w = vec![0u8; m * 16 * GROUP_BYTES];
         for r in 0..m {
             for g in 0..16 {
-                put_group(&mut w, (r * 16 + g) * GROUP_BYTES, [h(1.0), h(1.0)], [h(0.0), h(0.0)], |_, _| 3);
+                put_group(
+                    &mut w,
+                    (r * 16 + g) * GROUP_BYTES,
+                    [h(1.0), h(1.0)],
+                    [h(0.0), h(0.0)],
+                    |_, _| 3,
+                );
             }
         }
         // u = 3 everywhere; x[b] = 0.5*(b+1); dot = 4096*3*0.5*(b+1)
@@ -409,9 +449,19 @@ mod tests {
         let mut w = vec![0u8; 2 * 16 * GROUP_BYTES];
         for r in 0..2 {
             for g in 0..16 {
-                put_group(&mut w, (r * 16 + g) * GROUP_BYTES, [h(1.0), h(1.0)], [h(0.0), h(0.0)], |l, k| {
-                    if l == 0 && g == 0 && k < 2 { 1 } else { 0 }
-                });
+                put_group(
+                    &mut w,
+                    (r * 16 + g) * GROUP_BYTES,
+                    [h(1.0), h(1.0)],
+                    [h(0.0), h(0.0)],
+                    |l, k| {
+                        if l == 0 && g == 0 && k < 2 {
+                            1
+                        } else {
+                            0
+                        }
+                    },
+                );
             }
         }
         // w0 = w1 = 1 -> w0*x0 exact; need rounding: use header scale 1+2^-10 so w = 1.0009765625
@@ -450,7 +500,13 @@ mod tests {
         let mut xn = vec![0f32; 4096];
         xn[15 * 256 + 5] = f32::INFINITY;
         let mut wn = vec![0u8; 16 * GROUP_BYTES];
-        put_group(&mut wn, 15 * GROUP_BYTES, [h(0.0), h(0.0)], [h(0.0), h(0.0)], |_, _| 0);
+        put_group(
+            &mut wn,
+            15 * GROUP_BYTES,
+            [h(0.0), h(0.0)],
+            [h(0.0), h(0.0)],
+            |_, _| 0,
+        );
         let mut y2 = vec![1.0f32];
         residual_lanes_ref(&wn, &xn, &mut y2, 1, 1);
         assert!(y2[0].is_nan(), "0 * inf = NaN must reach y");
@@ -464,6 +520,9 @@ mod tests {
         assert_eq!(c.mismatches, 1);
         assert_eq!(c.nan_payload_diffs, 1);
         assert!(!c.ok());
-        assert_eq!(first_mismatch(&[1, nan_a, 5, nan_a], &[1, nan_b, 5, 7]), Some(3));
+        assert_eq!(
+            first_mismatch(&[1, nan_a, 5, nan_a], &[1, nan_b, 5, 7]),
+            Some(3)
+        );
     }
 }

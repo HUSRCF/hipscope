@@ -1393,7 +1393,11 @@ mod tests {
         assert_eq!(only.candidates[0], only.incumbent);
         assert!(only.candidates[1].knobs.contains_key("rip"));
         assert_ne!(only.domain_hash, full.domain_hash);
-        assert!(only.derivation.last().unwrap().contains("dropped 2 knob points"));
+        assert!(only
+            .derivation
+            .last()
+            .unwrap()
+            .contains("dropped 2 knob points"));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

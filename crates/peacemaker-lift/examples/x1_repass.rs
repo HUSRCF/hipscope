@@ -28,15 +28,17 @@ use peacemaker_ir::inst::{Abi, Arch, Form, Frontend, Kernel, KernelOrigin, Progr
 use peacemaker_ir::passes::windows::check_windows;
 use peacemaker_ir::reg::{Kind, RegRef};
 use peacemaker_ir::state::Analyzed;
-use peacemaker_lift::text::parse_line;
 use peacemaker_lift::rewrite::{apply, EquivalenceKind, Rewrite};
+use peacemaker_lift::text::parse_line;
 use peacemaker_lift::{emit, lift_object, Options};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 
 type R<T> = Result<T, Box<dyn std::error::Error>>;
-const OPTS: Options = Options { frontend: Frontend::Hipcc };
+const OPTS: Options = Options {
+    frontend: Frontend::Hipcc,
+};
 
 fn hex(b: &[u8]) -> String {
     format!("{:x}", Sha256::digest(b))
@@ -53,7 +55,13 @@ fn kernel<'a>(p: &'a Program, s: &SymbolId) -> &'a Kernel {
 fn is_valu(form: Form) -> bool {
     matches!(
         form,
-        Form::Vop1 | Form::Vop2 | Form::Vop3 | Form::Vop3p | Form::Vopd | Form::Vopc | Form::Vinterp
+        Form::Vop1
+            | Form::Vop2
+            | Form::Vop3
+            | Form::Vop3p
+            | Form::Vopd
+            | Form::Vopc
+            | Form::Vinterp
     )
 }
 
@@ -62,7 +70,12 @@ fn delay_ids(k: &Kernel) -> Vec<InstId> {
         .layout
         .iter()
         .copied()
-        .filter(|id| k.body.insts.get(*id).is_some_and(|i| i.effects.control == Control::Delay))
+        .filter(|id| {
+            k.body
+                .insts
+                .get(*id)
+                .is_some_and(|i| i.effects.control == Control::Delay)
+        })
         .collect()
 }
 
@@ -92,14 +105,25 @@ struct BuilderDelay {
     recent: Vec<(Vec<RegRef>, bool)>,
 }
 impl BuilderDelay {
-    const TRANS: [&'static str; 7] = ["v_rcp_", "v_sqrt_", "v_rsq_", "v_sin_", "v_cos_", "v_exp_", "v_log_"];
+    const TRANS: [&'static str; 7] = [
+        "v_rcp_", "v_sqrt_", "v_rsq_", "v_sin_", "v_cos_", "v_exp_", "v_log_",
+    ];
     fn step(&mut self, mnemonic: &str, uses: &[RegRef], defs: &[RegRef]) -> Option<String> {
         let (mut valu, mut trans, mut trans_seen) = (None, None, 0usize);
-        for (distance, (written, is_trans)) in self.recent.iter().rev().enumerate().map(|(i, r)| (i + 1, r)) {
+        for (distance, (written, is_trans)) in self
+            .recent
+            .iter()
+            .rev()
+            .enumerate()
+            .map(|(i, r)| (i + 1, r))
+        {
             if *is_trans {
                 trans_seen += 1
             }
-            if !written.iter().any(|w| uses.iter().any(|u| u.kind == Kind::V && w.overlaps(*u))) {
+            if !written
+                .iter()
+                .any(|w| uses.iter().any(|u| u.kind == Kind::V && w.overlaps(*u)))
+            {
                 continue;
             }
             if *is_trans && trans_seen <= 3 {
@@ -109,7 +133,10 @@ impl BuilderDelay {
             }
         }
         let trans_insn = Self::TRANS.iter().any(|p| mnemonic.starts_with(p));
-        self.recent.push((defs.iter().copied().filter(|r| r.kind == Kind::V).collect(), trans_insn));
+        self.recent.push((
+            defs.iter().copied().filter(|r| r.kind == Kind::V).collect(),
+            trans_insn,
+        ));
         if self.recent.len() > self.window {
             self.recent.remove(0);
         }
@@ -117,7 +144,9 @@ impl BuilderDelay {
             (None, None) => None,
             (Some(v), None) => Some(format!("s_delay_alu instid0(VALU_DEP_{v})")),
             (None, Some(t)) => Some(format!("s_delay_alu instid0(TRANS32_DEP_{t})")),
-            (Some(v), Some(t)) => Some(format!("s_delay_alu instid0(VALU_DEP_{v}) | instid1(TRANS32_DEP_{t})")),
+            (Some(v), Some(t)) => Some(format!(
+                "s_delay_alu instid0(VALU_DEP_{v}) | instid1(TRANS32_DEP_{t})"
+            )),
         }
     }
 }
@@ -125,8 +154,15 @@ impl BuilderDelay {
 /// One batch removing every `s_delay_alu` of the kernel (`None` when it has none).
 fn strip_edit(k: &Kernel) -> Option<Edit> {
     let ids = delay_ids(k);
-    (!ids.is_empty())
-        .then(|| Edit::Batch(ids.iter().map(|id| Edit::Remove { range: InstRange::single(*id) }).collect()))
+    (!ids.is_empty()).then(|| {
+        Edit::Batch(
+            ids.iter()
+                .map(|id| Edit::Remove {
+                    range: InstRange::single(*id),
+                })
+                .collect(),
+        )
+    })
 }
 
 fn builder_delay(a: &Analyzed<Program>, sym: &SymbolId, window: usize) -> R<(Edit, usize, usize)> {
@@ -134,7 +170,10 @@ fn builder_delay(a: &Analyzed<Program>, sym: &SymbolId, window: usize) -> R<(Edi
     let k = kernel(&a.program, sym);
     let mut inserts: Vec<(InstId, String)> = Vec::new();
     for block in &k.body.blocks {
-        let mut policy = BuilderDelay { window, recent: Vec::new() };
+        let mut policy = BuilderDelay {
+            window,
+            recent: Vec::new(),
+        };
         for pos in block.range.0..block.range.1 {
             let id = k.body.layout[pos];
             let inst = k.body.insts.get(id).unwrap();
@@ -161,7 +200,11 @@ fn builder_delay(a: &Analyzed<Program>, sym: &SymbolId, window: usize) -> R<(Edi
         .collect();
     // Check 11 treats a re-inserted consumer as new code: it may not read anything the
     // base already reads undefined (e.g. the preserved half of a true16 destination).
-    flagged.extend(peacemaker_lift::rewrite::definedness::undefined_reads(k).iter().map(|u| u.inst));
+    flagged.extend(
+        peacemaker_lift::rewrite::definedness::undefined_reads(k)
+            .iter()
+            .map(|u| u.inst),
+    );
     let mut edits = Vec::new();
     let mut skipped = 0usize;
     for (consumer, text) in &inserts {
@@ -191,16 +234,21 @@ fn wait_probe(a: &Analyzed<Program>, sym: &SymbolId) -> R<Value> {
         if inst.effects.control != Control::Wait {
             continue;
         }
-        let Some(old) = inst.mods.wait.clone() else { continue };
+        let Some(old) = inst.mods.wait.clone() else {
+            continue;
+        };
         for c in 0..old.per_counter.len() {
-            let Some(n) = old.per_counter[c] else { continue };
+            let Some(n) = old.per_counter[c] else {
+                continue;
+            };
             let mut imm: WaitImm = old.clone();
             imm.per_counter[c] = Some(n + 1);
             tried += 1;
             match a.edit(sym, Edit::SetWait { inst: *id, imm }) {
                 Ok(_) => {
                     ok += 1;
-                    accepted.push(json!({"pc": inst.prov.pc, "counter": c, "from": n, "to": n + 1}));
+                    accepted
+                        .push(json!({"pc": inst.prov.pc, "counter": c, "from": n, "to": n + 1}));
                 }
                 Err(e) => {
                     let e = e.to_string();
@@ -227,15 +275,34 @@ fn main() -> R<()> {
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
-            "--kernel" => { sym = Some(args[i + 1].clone()); i += 2 }
-            "--transform" => { tf = Some(args[i + 1].clone()); i += 2 }
-            "--out" => { out = Some(args[i + 1].clone()); i += 2 }
-            "--report" => { report = Some(args[i + 1].clone()); i += 2 }
-            _ => { input = Some(args[i].clone()); i += 1 }
+            "--kernel" => {
+                sym = Some(args[i + 1].clone());
+                i += 2
+            }
+            "--transform" => {
+                tf = Some(args[i + 1].clone());
+                i += 2
+            }
+            "--out" => {
+                out = Some(args[i + 1].clone());
+                i += 2
+            }
+            "--report" => {
+                report = Some(args[i + 1].clone());
+                i += 2
+            }
+            _ => {
+                input = Some(args[i].clone());
+                i += 1
+            }
         }
     }
     let usage = "usage: x1_repass IN.hsaco --kernel SYMBOL --transform identity|strip-delay|builder-delay[:W]|wait-probe [--out OUT.co] [--report R.json]";
-    let (input, sym, tf) = (input.ok_or(usage)?, SymbolId(sym.ok_or(usage)?), tf.ok_or(usage)?);
+    let (input, sym, tf) = (
+        input.ok_or(usage)?,
+        SymbolId(sym.ok_or(usage)?),
+        tf.ok_or(usage)?,
+    );
     let bytes = std::fs::read(&input)?;
     let lifted = lift_object(&bytes, OPTS)?;
     let arch = lifted.program.target.arch;
@@ -258,7 +325,11 @@ fn main() -> R<()> {
     // The script (core edits on this kernel) and the claim it makes.
     let (script, claim, note): (Vec<Edit>, EquivalenceKind, Value) = match tf.as_str() {
         "identity" => (Vec::new(), EquivalenceKind::ByteIdentical, json!({})),
-        "strip-delay" => (strip_edit(k0).into_iter().collect(), EquivalenceKind::Unproved, json!({})),
+        "strip-delay" => (
+            strip_edit(k0).into_iter().collect(),
+            EquivalenceKind::Unproved,
+            json!({}),
+        ),
         t if t == "builder-delay" || t.starts_with("builder-delay:") => {
             let w: usize = t.split_once(':').map_or(Ok(4), |(_, w)| w.parse())?;
             let mut script: Vec<Edit> = strip_edit(k0).into_iter().collect();
@@ -268,12 +339,24 @@ fn main() -> R<()> {
             }
             let (e, n, skipped) = builder_delay(&stripped, &sym, w)?;
             script.push(e);
-            (script, EquivalenceKind::Unproved, json!({"window": w, "hints_inserted": n, "consumers_skipped_definedness": skipped}))
+            (
+                script,
+                EquivalenceKind::Unproved,
+                json!({"window": w, "hints_inserted": n, "consumers_skipped_definedness": skipped}),
+            )
         }
         other => return Err(format!("unknown transform {other}\n{usage}").into()),
     };
     // `rewrite::apply`: every step a checked transaction, re-layout, `emit::checked`, check 11.
-    let cert = apply(&bytes, OPTS, Rewrite { kernel: sym.clone(), script, claim })?;
+    let cert = apply(
+        &bytes,
+        OPTS,
+        Rewrite {
+            kernel: sym.clone(),
+            script,
+            claim,
+        },
+    )?;
     let (after, emitted) = (cert.program.clone(), cert.bytes.clone());
     let back = lift_object(&emitted, OPTS)?;
     let k1 = kernel(&after.program, &sym);
@@ -294,18 +377,49 @@ fn main() -> R<()> {
         }
     }
     // Descriptor/metadata: all fields but the layout-derived entry offset / INST_PREF_SIZE.
-    let (d0, m0) = match &k0.abi { Abi::Hsa { descriptor, metadata } => (descriptor, metadata), _ => return Err("raw ABI".into()) };
+    let (d0, m0) = match &k0.abi {
+        Abi::Hsa {
+            descriptor,
+            metadata,
+        } => (descriptor, metadata),
+        _ => return Err("raw ABI".into()),
+    };
     let kb = kernel(&back.program, &sym);
-    let (d1, m1) = match &kb.abi { Abi::Hsa { descriptor, metadata } => (descriptor, metadata), _ => return Err("raw ABI".into()) };
+    let (d1, m1) = match &kb.abi {
+        Abi::Hsa {
+            descriptor,
+            metadata,
+        } => (descriptor, metadata),
+        _ => return Err("raw ABI".into()),
+    };
     let mut diffs = Vec::new();
-    macro_rules! cmp { ($f:ident) => { if d0.$f != d1.$f { diffs.push(stringify!($f)) } }; }
-    cmp!(group_segment_fixed_size); cmp!(private_segment_fixed_size); cmp!(kernarg_size);
-    cmp!(compute_pgm_rsrc1); cmp!(compute_pgm_rsrc2); cmp!(kernel_code_properties); cmp!(kernarg_preload);
-    if d0.compute_pgm_rsrc3 != d1.compute_pgm_rsrc3 { diffs.push("compute_pgm_rsrc3(INST_PREF_SIZE tracks code size)") }
+    macro_rules! cmp {
+        ($f:ident) => {
+            if d0.$f != d1.$f {
+                diffs.push(stringify!($f))
+            }
+        };
+    }
+    cmp!(group_segment_fixed_size);
+    cmp!(private_segment_fixed_size);
+    cmp!(kernarg_size);
+    cmp!(compute_pgm_rsrc1);
+    cmp!(compute_pgm_rsrc2);
+    cmp!(kernel_code_properties);
+    cmp!(kernarg_preload);
+    if d0.compute_pgm_rsrc3 != d1.compute_pgm_rsrc3 {
+        diffs.push("compute_pgm_rsrc3(INST_PREF_SIZE tracks code size)")
+    }
     let meta_same = m0.parsed == m1.parsed;
-    let entry = |p: &Program, s: &SymbolId| match kernel(p, s).origin { KernelOrigin::Frontend { entry_va, size, .. } => (entry_va, size), _ => (0, 0) };
+    let entry = |p: &Program, s: &SymbolId| match kernel(p, s).origin {
+        KernelOrigin::Frontend { entry_va, size, .. } => (entry_va, size),
+        _ => (0, 0),
+    };
     let after_obl = obligations(&after);
-    let worse: Vec<_> = after_obl.iter().filter(|(k, v)| **v > before_obl_get(&before, k)).collect();
+    let worse: Vec<_> = after_obl
+        .iter()
+        .filter(|(k, v)| **v > before_obl_get(&before, k))
+        .collect();
     rep["after"] = json!({
         "text_sha256": hex(&text1), "text_bytes": text1.len(), "census": census(k1, arch),
         "obligations": after_obl, "ambiguous_delays": ambiguous,
@@ -332,14 +446,30 @@ fn main() -> R<()> {
         "obligations_worse": worse.iter().map(|(k, v)| format!("{k}: {v}")).collect::<Vec<_>>(),
     });
     let mut failures = Vec::new();
-    if tf == "identity" && emitted != bytes { failures.push("identity transform changed the bytes".to_owned()) }
-    if !other_changed.is_empty() { failures.push(format!("other kernels changed: {other_changed:?}")) }
-    if !meta_same { failures.push("metadata changed".into()) }
-    if let Err(e) = &r.definedness { failures.push(format!("check 11: {e}")) }
-    if diffs.iter().any(|d| !d.starts_with("compute_pgm_rsrc3")) { failures.push(format!("descriptor fields changed: {diffs:?}")) }
-    if !worse.is_empty() { failures.push("analysis obligations got worse".into()) }
+    if tf == "identity" && emitted != bytes {
+        failures.push("identity transform changed the bytes".to_owned())
+    }
+    if !other_changed.is_empty() {
+        failures.push(format!("other kernels changed: {other_changed:?}"))
+    }
+    if !meta_same {
+        failures.push("metadata changed".into())
+    }
+    if let Err(e) = &r.definedness {
+        failures.push(format!("check 11: {e}"))
+    }
+    if diffs.iter().any(|d| !d.starts_with("compute_pgm_rsrc3")) {
+        failures.push(format!("descriptor fields changed: {diffs:?}"))
+    }
+    if !worse.is_empty() {
+        failures.push("analysis obligations got worse".into())
+    }
     let ambiguous_before = win0.delays.iter().filter(|d| d.is_ambiguous()).count();
-    if ambiguous > ambiguous_before { failures.push(format!("{ambiguous} ambiguous delay hints (input had {ambiguous_before})")) }
+    if ambiguous > ambiguous_before {
+        failures.push(format!(
+            "{ambiguous} ambiguous delay hints (input had {ambiguous_before})"
+        ))
+    }
     rep["failures"] = json!(failures);
     if let Some(p) = out {
         std::fs::write(&p, &emitted)?;
@@ -350,7 +480,11 @@ fn main() -> R<()> {
         std::fs::write(p, &text)?;
     }
     println!("{text}");
-    if failures.is_empty() { Ok(()) } else { Err("validation failed".into()) }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err("validation failed".into())
+    }
 }
 
 fn before_obl_get(a: &Analyzed<Program>, key: &str) -> usize {

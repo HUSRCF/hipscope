@@ -1155,8 +1155,14 @@ mod c5_tests {
                 .collect::<Vec<_>>()
             };
             let reads_ds_a = rules(&[0x0628_2b02]); // v_add_f32_e32 v20, v2, v21
-            assert!(reads_ds_a.is_empty(), "{arch:?}: ds_load A retired in order behind the flat load: {reads_ds_a:?}");
-            assert!(!rules(&[0x0628_2b01]).is_empty(), "{arch:?}: the flat load's data still waits on vmcnt");
+            assert!(
+                reads_ds_a.is_empty(),
+                "{arch:?}: ds_load A retired in order behind the flat load: {reads_ds_a:?}"
+            );
+            assert!(
+                !rules(&[0x0628_2b01]).is_empty(),
+                "{arch:?}: the flat load's data still waits on vmcnt"
+            );
         }
     }
 
@@ -1188,9 +1194,18 @@ mod c5_tests {
             let (vm1_lgkm0, lgkm0) = (0xbf89_0407, 0xbf89_fc07); // s_waitcnt vmcnt(1) lgkmcnt(0); s_waitcnt lgkmcnt(0)
             let (reads_flat, reads_global) = (0x0628_2b01, 0x0628_2b02); // v_add_f32 v20, v1|v2, v21
             let ok = rules(vm1_lgkm0, reads_flat);
-            assert!(ok.is_empty(), "{arch:?}: the older flat load retired behind vmcnt(1): {ok:?}");
-            assert!(!rules(vm1_lgkm0, reads_global).is_empty(), "{arch:?}: the younger global load is outstanding");
-            assert!(!rules(lgkm0, reads_flat).is_empty(), "{arch:?}: lgkmcnt alone does not retire a flat load's vm side");
+            assert!(
+                ok.is_empty(),
+                "{arch:?}: the older flat load retired behind vmcnt(1): {ok:?}"
+            );
+            assert!(
+                !rules(vm1_lgkm0, reads_global).is_empty(),
+                "{arch:?}: the younger global load is outstanding"
+            );
+            assert!(
+                !rules(lgkm0, reads_flat).is_empty(),
+                "{arch:?}: lgkmcnt alone does not retire a flat load's vm side"
+            );
         }
     }
     /// gfx11 GLOBAL atomics: the returning (GLC) form's destination is

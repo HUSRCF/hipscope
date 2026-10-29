@@ -62,7 +62,10 @@ fn saveexec_family_operates_on_all_64_bits_and_scc_follows_the_64_bit_result() {
     st.vcc = 0x0f0f_0000_0000_0001 | 1 << 40;
     run(&[0xBE80_216A], &mut st).unwrap();
     assert_eq!((st.s[0], st.s[1]), (0xffff_0001, 0xf0f0_0000));
-    assert_eq!(st.exec, 0x0000_0000_0000_0001, "hi words of EXEC and VCC are disjoint, lane 0 survives");
+    assert_eq!(
+        st.exec, 0x0000_0000_0000_0001,
+        "hi words of EXEC and VCC are disjoint, lane 0 survives"
+    );
     assert!(st.scc);
     // A high-only intersection is non-empty (a 32-bit model would see EXEC == 0 and SCC == 0).
     let mut st = state64();
@@ -89,7 +92,10 @@ fn saveexec_family_operates_on_all_64_bits_and_scc_follows_the_64_bit_result() {
     st.exec = 0xdead_0000_0000_beef;
     (st.s[2], st.s[3]) = (0xffff_0000, 0x0000_ffff);
     run(&[0x91FE_027E], &mut st).unwrap();
-    assert_eq!(st.exec, 0xdead_0000_0000_0000 & !0x0000_ffff_0000_0000 | 0xbeef);
+    assert_eq!(
+        st.exec,
+        0xdead_0000_0000_0000 & !0x0000_ffff_0000_0000 | 0xbeef
+    );
     assert!(st.scc);
     // s_and_not1_saveexec_b64 s[0:1], s[24:25] (BE803118): s[0:1] = EXEC; EXEC = S & ~EXEC.
     let mut st = state64();
@@ -113,7 +119,11 @@ fn wave32_masks_keep_a_zero_upper_half() {
     st.exec = 0xffff_ffff;
     st.vcc = 0x8000_0000;
     run(&[0xBE80_216A], &mut st).unwrap(); // s_and_saveexec_b64 s[0:1], vcc
-    assert_eq!((st.exec, st.s[1]), (0x8000_0000, 0), "no upper half in wave32");
+    assert_eq!(
+        (st.exec, st.s[1]),
+        (0x8000_0000, 0),
+        "no upper half in wave32"
+    );
 }
 
 #[test]
@@ -133,7 +143,11 @@ fn compare_writes_a_pair_and_cndmask_reads_it() {
     st.vcc = 0x8000_0000_0000_0001;
     run(&[0xD501_0000, 0x01A9_1080], &mut st).unwrap();
     for l in 0..64 {
-        assert_eq!(st.v[0][l], if l == 0 || l == 63 { 8 } else { 0 }, "lane {l}");
+        assert_eq!(
+            st.v[0][l],
+            if l == 0 || l == 63 { 8 } else { 0 },
+            "lane {l}"
+        );
     }
     // v_cmpx_lt_i32_e32 v24, v25 (7D823318) writes EXEC (64 bits).
     let mut st = state64();
@@ -188,7 +202,11 @@ fn carry_chain_uses_the_pair_and_mad_co_i64_i32_widens_signed() {
     run(&[0xD6FF_7C12, 0x0432_00FF, 0x0000_0440], &mut st).unwrap();
     for l in 0..64 {
         let want = (0x440i64 * (l as i64 - 32)).wrapping_add(0x1_1000_0000) as u64;
-        assert_eq!(((st.v[19][l] as u64) << 32) | st.v[18][l] as u64, want, "lane {l}");
+        assert_eq!(
+            ((st.v[19][l] as u64) << 32) | st.v[18][l] as u64,
+            want,
+            "lane {l}"
+        );
     }
 }
 
@@ -232,7 +250,11 @@ fn dpp_row_shl_runs_per_16_lane_row_in_all_four_rows_and_zeroes_with_bound_ctrl(
     run(&[0x0606_06FA, 0xFF09_0803], &mut st).unwrap();
     for l in 0..64 {
         let col = l % 16;
-        let want = if col + 8 < 16 { (l + (l + 8)) as f32 } else { l as f32 }; // out of row: reads 0 (bound_ctrl)
+        let want = if col + 8 < 16 {
+            (l + (l + 8)) as f32
+        } else {
+            l as f32
+        }; // out of row: reads 0 (bound_ctrl)
         assert_eq!(f32::from_bits(st.v[3][l]), want, "lane {l}");
     }
     // v_mov_b32_dpp v56, v3 row_shl:1 (7E7002FA FF010103), no bound_ctrl: the last lane of each row keeps v56.
@@ -243,7 +265,11 @@ fn dpp_row_shl_runs_per_16_lane_row_in_all_four_rows_and_zeroes_with_bound_ctrl(
     }
     run(&[0x7E70_02FA, 0xFF01_0103], &mut st).unwrap();
     for l in 0..64 {
-        assert_eq!(st.v[56][l], if l % 16 == 15 { 9 } else { 501 + l as u32 }, "lane {l}");
+        assert_eq!(
+            st.v[56][l],
+            if l % 16 == 15 { 9 } else { 501 + l as u32 },
+            "lane {l}"
+        );
     }
 }
 
@@ -270,9 +296,20 @@ fn swizzle_swap16_stays_inside_each_32_lane_half() {
             *n = 0x7C1F;
         }
     }
-    memory::execute("ds_swizzle_b32", &inst, &mut st, &mut Memory::default(), &mut []).unwrap();
+    memory::execute(
+        "ds_swizzle_b32",
+        &inst,
+        &mut st,
+        &mut Memory::default(),
+        &mut [],
+    )
+    .unwrap();
     for l in 0..64 {
-        assert_eq!(st.v[56][l], 2000 + ((l & 32) | ((l & 31) ^ 31)) as u32, "lane {l}");
+        assert_eq!(
+            st.v[56][l],
+            2000 + ((l & 32) | ((l & 31) ^ 31)) as u32,
+            "lane {l}"
+        );
     }
     // Inactive source lanes read 0 (lane 56 disabled; lane 40 would read it).
     let mut st = state64();

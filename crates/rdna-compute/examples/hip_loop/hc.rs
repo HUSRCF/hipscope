@@ -70,7 +70,9 @@ impl HcMix {
             Some((n, m, k)) => ((*n).to_owned(), Some(*m), Some(*k)),
             None if emu => ("emu".to_owned(), Some(EMU.0), Some(EMU.1)),
             None => {
-                return Err(format!("hc_mix: unknown shape preset `{preset}` (have mix, sel, emu)"));
+                return Err(format!(
+                    "hc_mix: unknown shape preset `{preset}` (have mix, sel, emu)"
+                ));
             }
         };
         let m = s.take_usize("M", pm)?;
@@ -78,13 +80,23 @@ impl HcMix {
         let n = s.take_usize("N", Some(if emu { EMU.2 } else { DEFAULT_N }))?;
         s.no_leftover()?;
         if m == 0 || n == 0 || k == 0 || k % 64 != 0 {
-            return Err(format!("hc_mix: M={m} N={n} K={k}: need positive dims and K % 64 == 0"));
+            return Err(format!(
+                "hc_mix: M={m} N={n} K={k}: need positive dims and K % 64 == 0"
+            ));
         }
-        Ok(Self { label, m, k, n, st: None })
+        Ok(Self {
+            label,
+            m,
+            k,
+            n,
+            st: None,
+        })
     }
 
     fn st(&self) -> Result<&State> {
-        self.st.as_ref().ok_or_else(|| "hc_mix: setup has not run".to_owned())
+        self.st
+            .as_ref()
+            .ok_or_else(|| "hc_mix: setup has not run".to_owned())
     }
 
     /// Seeded host buffers `(A, X, Y0)` the GPU `setup` uploads and the emulator gate maps.
@@ -146,15 +158,26 @@ impl Node for HcMix {
         // Y is f32 [N][M]; the workgroup is (row tile, token tile).
         let (tm, tn) = header_tiles(hdr, TILE, TILE)?;
         let m = self.m;
-        Ok(Box::new(move |e| [(e % m / tm) as u32, (e / m / tn) as u32, 0]))
+        Ok(Box::new(move |e| {
+            [(e % m / tm) as u32, (e / m / tn) as u32, 0]
+        }))
     }
     fn emu_case(&self, seed: u64) -> Result<EmuCase> {
         let (a, x, y) = self.host_inputs(seed);
         Ok(EmuCase {
             bufs: vec![
-                EmuBuf { name: "a", bytes: a },
-                EmuBuf { name: "x", bytes: x },
-                EmuBuf { name: "y", bytes: y },
+                EmuBuf {
+                    name: "a",
+                    bytes: a,
+                },
+                EmuBuf {
+                    name: "x",
+                    bytes: x,
+                },
+                EmuBuf {
+                    name: "y",
+                    bytes: y,
+                },
             ],
             args: vec![
                 EmuArg::Buf(0),
@@ -232,7 +255,10 @@ mod tests {
         assert_eq!(g.lds, 0);
         assert_eq!(g.threads(), [320, 12, 1]);
         assert_eq!(node("sel").geometry().threads(), [64, 12, 1]);
-        assert_eq!(HcMix::new(&ShapeSpec::parse(None).unwrap()).unwrap().label, "mix");
+        assert_eq!(
+            HcMix::new(&ShapeSpec::parse(None).unwrap()).unwrap().label,
+            "mix"
+        );
     }
 
     #[test]
@@ -259,7 +285,10 @@ mod tests {
     #[test]
     fn rejects_bad_shapes() {
         for s in ["mix,K=100", "nope", "mix,Q=3"] {
-            assert!(HcMix::new(&ShapeSpec::parse(Some(s)).unwrap()).is_err(), "{s}");
+            assert!(
+                HcMix::new(&ShapeSpec::parse(Some(s)).unwrap()).is_err(),
+                "{s}"
+            );
         }
     }
 }

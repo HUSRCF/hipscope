@@ -26,7 +26,10 @@ use std::path::PathBuf;
 
 fn main() {
     let mut args = std::env::args().skip(1);
-    let out = PathBuf::from(args.next().expect("usage: decode_audit_compile OUT_DIR PLAN_TSV [MODULE...]"));
+    let out = PathBuf::from(
+        args.next()
+            .expect("usage: decode_audit_compile OUT_DIR PLAN_TSV [MODULE...]"),
+    );
     let plan = args.next().expect("PLAN_TSV");
     let wanted: Vec<String> = args.collect();
     let objs = out.join("objs");
@@ -43,11 +46,25 @@ fn main() {
         }
         let f: Vec<&str> = line.split('\t').collect();
         if f.len() == 5 && f[0] == "ar" && f[1] == "hip" {
-            rows.insert(f[2].to_owned(), (f[3].split(',').map(str::to_owned).collect(), f[4].to_owned()));
+            rows.insert(
+                f[2].to_owned(),
+                (
+                    f[3].split(',').map(str::to_owned).collect(),
+                    f[4].to_owned(),
+                ),
+            );
         }
     }
-    let modules: Vec<String> = if wanted.is_empty() { rows.keys().cloned().collect() } else { wanted };
-    let mut log = std::fs::OpenOptions::new().create(true).append(true).open(out.join("compile.jsonl")).unwrap();
+    let modules: Vec<String> = if wanted.is_empty() {
+        rows.keys().cloned().collect()
+    } else {
+        wanted
+    };
+    let mut log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(out.join("compile.jsonl"))
+        .unwrap();
     for module in modules {
         let rec = one(&module, &rows, &objs);
         let line = rec.to_string();
@@ -60,7 +77,9 @@ fn one(module: &str, rows: &BTreeMap<String, (Vec<String>, String)>, objs: &Path
     let (plan_symbols, plan_sha) = rows.get(module).cloned().unwrap_or_default();
     let entry = match kernel_registry::lookup("gfx1100", module, "") {
         Ok(e) => e,
-        Err(e) => return json!({"module": module, "error": format!("registry: {e:?}"), "plan_symbols": plan_symbols}),
+        Err(e) => {
+            return json!({"module": module, "error": format!("registry: {e:?}"), "plan_symbols": plan_symbols})
+        }
     };
     let source = entry.source().to_owned();
     let source_sha = format!("{:x}", Sha256::digest(source.as_bytes()));
@@ -87,7 +106,12 @@ fn one(module: &str, rows: &BTreeMap<String, (Vec<String>, String)>, objs: &Path
         "object_sha256": format!("{:x}", Sha256::digest(&bytes)),
         "argv": argv,
     });
-    match peacemaker_lift::lift_object(&bytes, peacemaker_lift::Options { frontend: Frontend::Hipcc }) {
+    match peacemaker_lift::lift_object(
+        &bytes,
+        peacemaker_lift::Options {
+            frontend: Frontend::Hipcc,
+        },
+    ) {
         Err(e) => {
             rec["lift_ok"] = json!(false);
             rec["lift_error"] = json!(format!("{e}"));

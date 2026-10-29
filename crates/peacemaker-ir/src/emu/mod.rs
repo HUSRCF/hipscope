@@ -33,9 +33,9 @@ pub mod mma;
 #[cfg(test)]
 mod swmmac_fixtures;
 pub mod trans;
-mod wide;
 #[cfg(test)]
 mod wave64_tests;
+mod wide;
 mod wmma;
 use crate::{
     inst::{Abi, Wave},
@@ -168,7 +168,13 @@ impl Memory {
         if let Some(j) = self.journal.as_mut() {
             for (c, chunk) in bytes.chunks(16).enumerate() {
                 let off = o + c * 16;
-                let mut e = JournalEntry { region: i, off, len: chunk.len(), old: [0; 16], was_written: 0 };
+                let mut e = JournalEntry {
+                    region: i,
+                    off,
+                    len: chunk.len(),
+                    old: [0; 16],
+                    was_written: 0,
+                };
                 e.old[..chunk.len()].copy_from_slice(&r.bytes[off..off + chunk.len()]);
                 for k in 0..chunk.len() {
                     e.was_written |= u16::from(r.written.contains(off + k)) << k;
@@ -215,7 +221,9 @@ impl Memory {
     }
     /// Restores the bytes and written-bits every journaled store replaced (newest first) and clears the journal.
     fn journal_undo(&mut self) {
-        let Some(j) = self.journal.as_mut() else { return };
+        let Some(j) = self.journal.as_mut() else {
+            return;
+        };
         let entries = std::mem::take(j);
         for e in entries.iter().rev() {
             let r = &mut self.regions[e.region];
@@ -301,12 +309,18 @@ impl State {
             Wave::Wave32 => 32usize,
             Wave::Wave64 => 64usize,
         };
-        let Abi::Hsa { descriptor: d, metadata } = &kernel.abi else {
+        let Abi::Hsa {
+            descriptor: d,
+            metadata,
+        } = &kernel.abi
+        else {
             return Err("descriptor-driven HSA ABI required".into());
         };
         // The lifter derives `kernel.wave` from KERNEL_CODE_PROPERTIES.ENABLE_WAVEFRONT_SIZE32; refuse a disagreement.
         if d.kernel_code_properties.wave32() != (lanes == 32) {
-            return Err("kernel wave disagrees with the descriptor ENABLE_WAVEFRONT_SIZE32 bit".into());
+            return Err(
+                "kernel wave disagrees with the descriptor ENABLE_WAVEFRONT_SIZE32 bit".into(),
+            );
         }
         if metadata.parsed.uses_dynamic_stack {
             return Err("dynamic stack (private segment beyond the fixed size) unsupported".into());
@@ -517,8 +531,12 @@ impl State {
     fn read_mask(&self, op: &Operand) -> Result<u64> {
         let wide = self.lanes == 64;
         Ok(match op {
-            Operand::Special(Special::Vcc | Special::VccLo | Special::VccHi) => self.vcc & self.lane_mask(),
-            Operand::Special(Special::Exec | Special::ExecLo | Special::ExecHi) => self.exec & self.lane_mask(),
+            Operand::Special(Special::Vcc | Special::VccLo | Special::VccHi) => {
+                self.vcc & self.lane_mask()
+            }
+            Operand::Special(Special::Exec | Special::ExecLo | Special::ExecHi) => {
+                self.exec & self.lane_mask()
+            }
             Operand::Special(Special::Null) => 0,
             Operand::Reg(r) if r.kind != Kind::V => {
                 if wide && r.len < 2 {
@@ -583,10 +601,18 @@ impl State {
                 )?;
             }
             Operand::Special(s) => match s {
-                Special::Exec | Special::ExecLo => self.exec = (self.exec & !0xffff_ffff) | u64::from(value),
-                Special::Vcc | Special::VccLo => self.vcc = (self.vcc & !0xffff_ffff) | u64::from(value),
-                Special::ExecHi if self.lanes == 64 => self.exec = (self.exec & 0xffff_ffff) | u64::from(value) << 32,
-                Special::VccHi if self.lanes == 64 => self.vcc = (self.vcc & 0xffff_ffff) | u64::from(value) << 32,
+                Special::Exec | Special::ExecLo => {
+                    self.exec = (self.exec & !0xffff_ffff) | u64::from(value)
+                }
+                Special::Vcc | Special::VccLo => {
+                    self.vcc = (self.vcc & !0xffff_ffff) | u64::from(value)
+                }
+                Special::ExecHi if self.lanes == 64 => {
+                    self.exec = (self.exec & 0xffff_ffff) | u64::from(value) << 32
+                }
+                Special::VccHi if self.lanes == 64 => {
+                    self.vcc = (self.vcc & 0xffff_ffff) | u64::from(value) << 32
+                }
                 Special::ExecHi | Special::VccHi => (),
                 Special::Scc => self.scc = value != 0,
                 Special::M0 => self.m0 = value,
@@ -731,7 +757,12 @@ impl<'a> Emulator<'a> {
             return Err("workgroup must contain 1..1024 threads".into());
         }
         let mut states = (0..n.div_ceil(kernel.wave.lanes()))
-            .map(|w| State::new(self.arch, kernel, launch, w).map(|mut s| { s.nan_loose = self.nan_loose; s }))
+            .map(|w| {
+                State::new(self.arch, kernel, launch, w).map(|mut s| {
+                    s.nan_loose = self.nan_loose;
+                    s
+                })
+            })
             .collect::<Result<Vec<_>>>()?;
         let mut lds = vec![
             0u8;
@@ -759,9 +790,15 @@ impl<'a> Emulator<'a> {
                 let result = match step.class {
                     Class::Wait => Ok(()),
                     Class::Control => control(name, inst, st, kernel),
-                    Class::Memory => {
-                        memory::execute_tracked(name, inst, st, mem, &mut lds, defined.as_mut(), None)
-                    }
+                    Class::Memory => memory::execute_tracked(
+                        name,
+                        inst,
+                        st,
+                        mem,
+                        &mut lds,
+                        defined.as_mut(),
+                        None,
+                    ),
                     Class::Alu => alu::execute(self.arch, name, inst, st),
                 };
                 result.map_err(|e| {
@@ -1492,7 +1529,8 @@ mod tests {
     }
     fn run_gate(p: &Program, block: u32, hw: bool) -> (Result<RunReport>, Memory) {
         let mut mem = Memory::default();
-        mem.map("buf".into(), 0x10000, (0..=255u8).collect()).unwrap();
+        mem.map("buf".into(), 0x10000, (0..=255u8).collect())
+            .unwrap();
         let emu = Emulator::new(p, "exchange").unwrap();
         let emu = if hw { emu.hw_model() } else { emu };
         let r = emu.run_workgroup_report(
@@ -1513,9 +1551,15 @@ mod tests {
         body.push(buf_op("buffer_load_b32", 3, 1));
         body.push(insn("v_add_f32_e32", vec![v(4), v(3), v(3)]));
         let p = prog(body.clone());
-        assert!(run_gate(&p, 32, false).0.is_ok(), "the legacy model retires loads at issue");
+        assert!(
+            run_gate(&p, 32, false).0.is_ok(),
+            "the legacy model retires loads at issue"
+        );
         let e = run_gate(&p, 32, true).0.unwrap_err();
-        assert!(e.contains("[in-flight]") && e.contains("reads v3") && e.contains("buffer_load_b32"), "{e}");
+        assert!(
+            e.contains("[in-flight]") && e.contains("reads v3") && e.contains("buffer_load_b32"),
+            "{e}"
+        );
         // wait first: fine
         let mut ok = srd_prologue();
         ok.push(buf_op("buffer_load_b32", 3, 1));
@@ -1541,7 +1585,10 @@ mod tests {
         assert!(e.contains("reads v5") && e.contains("loadcnt"), "{e}");
         // writing the in-flight destination (WAW against an ALU write) is an error too
         let waw = mk(vec![insn("v_mov_b32_e32", vec![v(5), v(0)])]);
-        assert!(run_gate(&waw, 32, true).0.unwrap_err().contains("writes v5"));
+        assert!(run_gate(&waw, 32, true)
+            .0
+            .unwrap_err()
+            .contains("writes v5"));
     }
     #[test]
     fn gfx12_store_data_is_locked_until_dscnt_retires() {
@@ -1555,9 +1602,15 @@ mod tests {
             b.push(insn("v_mov_b32_e32", vec![v(0), v(1)]));
             prog(b)
         };
-        assert!(run_gate(&ds(false), 32, false).0.is_ok(), "the legacy model never overwrites late");
+        assert!(
+            run_gate(&ds(false), 32, false).0.is_ok(),
+            "the legacy model never overwrites late"
+        );
         let e = run_gate(&ds(false), 32, true).0.unwrap_err();
-        assert!(e.contains("[in-flight]") && e.contains("store source") && e.contains("ds_store_b32"), "{e}");
+        assert!(
+            e.contains("[in-flight]") && e.contains("store source") && e.contains("ds_store_b32"),
+            "{e}"
+        );
         assert!(run_gate(&ds(true), 32, true).0.is_ok());
     }
     /// Same pattern as `gfx12_store_data_is_locked_until_dscnt_retires`, but the object comes from stock hipcc: LLVM
@@ -1586,17 +1639,38 @@ mod tests {
         };
         let run = |p: &Program, strict: bool| {
             let mut mem = Memory::default();
-            mem.map("buf".into(), 0x10000, (0..=255u8).collect()).unwrap();
+            mem.map("buf".into(), 0x10000, (0..=255u8).collect())
+                .unwrap();
             let emu = Emulator::new(p, "exchange").unwrap();
-            let emu = if strict { emu.hw_model_strict_store_sources() } else { emu.hw_model() };
+            let emu = if strict {
+                emu.hw_model_strict_store_sources()
+            } else {
+                emu.hw_model()
+            };
             emu.run_workgroup_report(
-                &Launch { kernarg_ptr: 0, workgroup: [0, 0, 0], block: [32, 1, 1], dynamic_lds: 0 },
+                &Launch {
+                    kernarg_ptr: 0,
+                    workgroup: [0, 0, 0],
+                    block: [32, 1, 1],
+                    dynamic_lds: 0,
+                },
                 &mut mem,
             )
         };
-        assert!(run(&hipcc(ds(false)), false).is_ok(), "hipcc: no store-source lock");
-        assert!(run(&ds(false), false).unwrap_err().contains("store source"), "builder object keeps it");
-        assert!(run(&hipcc(ds(false)), true).unwrap_err().contains("store source"), "strict variant keeps it");
+        assert!(
+            run(&hipcc(ds(false)), false).is_ok(),
+            "hipcc: no store-source lock"
+        );
+        assert!(
+            run(&ds(false), false).unwrap_err().contains("store source"),
+            "builder object keeps it"
+        );
+        assert!(
+            run(&hipcc(ds(false)), true)
+                .unwrap_err()
+                .contains("store source"),
+            "strict variant keeps it"
+        );
         assert!(run(&hipcc(ds(true)), true).is_ok());
     }
     /// gfx12 combined waits (`s_wait_storecnt_dscnt`, `s_wait_loadcnt_dscnt`; simm16 = {cnt[13:8], dscnt[5:0]}) retire
@@ -1605,7 +1679,11 @@ mod tests {
     fn combined_storecnt_dscnt_wait_retires_ds_and_stores() {
         use crate::wait::Counter;
         for name in ["s_wait_storecnt_dscnt", "s_wait_loadcnt_dscnt"] {
-            let counter = if name.contains("store") { Counter::Store } else { Counter::Load };
+            let counter = if name.contains("store") {
+                Counter::Store
+            } else {
+                Counter::Load
+            };
             let mk = |wait: bool| {
                 let mut b = srd_prologue();
                 b.push(insn("ds_store_b32", vec![v(1), v(1)]));
@@ -1617,7 +1695,10 @@ mod tests {
                 prog(b)
             };
             let e = run_gate(&mk(false), 32, true).0.unwrap_err();
-            assert!(e.contains("[in-flight]") && e.contains("reads v3"), "{name}: {e}");
+            assert!(
+                e.contains("[in-flight]") && e.contains("reads v3"),
+                "{name}: {e}"
+            );
             assert!(run_gate(&mk(true), 32, true).0.is_ok(), "{name}");
         }
     }
@@ -1630,8 +1711,14 @@ mod tests {
             b.push(winsn("s_wait_dscnt", &[(Counter::Ds, 0)]));
         }
         if barrier {
-            b.push(insn("s_barrier_signal", vec![Operand::Imm(ImmField::Sopp(-1))]));
-            b.push(insn("s_barrier_wait", vec![Operand::Imm(ImmField::Sopp(-1))]));
+            b.push(insn(
+                "s_barrier_signal",
+                vec![Operand::Imm(ImmField::Sopp(-1))],
+            ));
+            b.push(insn(
+                "s_barrier_wait",
+                vec![Operand::Imm(ImmField::Sopp(-1))],
+            ));
         }
         b.push(insn(
             "v_xor_b32_e32",
@@ -1645,9 +1732,17 @@ mod tests {
     #[test]
     fn lds_exchange_needs_a_waited_barrier() {
         let racy = exchange(true, false);
-        assert!(run_gate(&racy, 64, false).0.is_ok(), "the legacy model cannot see the race");
+        assert!(
+            run_gate(&racy, 64, false).0.is_ok(),
+            "the legacy model cannot see the race"
+        );
         let e = run_gate(&racy, 64, true).0.unwrap_err();
-        assert!(e.contains("[race]") && e.contains("read-after-write") && e.contains("same barrier epoch"), "{e}");
+        assert!(
+            e.contains("[race]")
+                && e.contains("read-after-write")
+                && e.contains("same barrier epoch"),
+            "{e}"
+        );
         // barrier without waiting for the store: the store is still in flight at the barrier
         let e = run_gate(&exchange(false, true), 64, true).0.unwrap_err();
         assert!(e.contains("[race]") && e.contains("still in flight"), "{e}");
@@ -1664,12 +1759,18 @@ mod tests {
     fn schedules_must_agree_on_global_stores() {
         // Both waves store their lane 31 value at byte 0: the last writer decides, which a different schedule flips.
         let mut b = srd_prologue();
-        b.push(insn("v_mov_b32_e32", vec![v(5), Operand::Inline(InlineConst::Integer(0))]));
+        b.push(insn(
+            "v_mov_b32_e32",
+            vec![v(5), Operand::Inline(InlineConst::Integer(0))],
+        ));
         b.push(buf_op("buffer_store_b32", 0, 5));
         let p = prog(b);
         assert!(run_gate(&p, 64, false).0.is_ok());
         let e = run_gate(&p, 64, true).0.unwrap_err();
-        assert!(e.contains("[schedule]") && e.contains("stores differ"), "{e}");
+        assert!(
+            e.contains("[schedule]") && e.contains("stores differ"),
+            "{e}"
+        );
         // one wave has one schedule and passes
         assert_eq!(run_gate(&p, 32, true).0.unwrap().schedules, ["round-robin"]);
     }

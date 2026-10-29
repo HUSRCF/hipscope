@@ -87,7 +87,13 @@ impl LaneWo {
         if m == 0 || m > (i32::MAX as usize) / 64 {
             return Err(format!("lane_wo: m={m} out of range"));
         }
-        Ok(Self { lanes, m, flush, emu, st: None })
+        Ok(Self {
+            lanes,
+            m,
+            flush,
+            emu,
+            st: None,
+        })
     }
 
     fn at(&self, lanes: usize, m: usize) -> Self {
@@ -99,7 +105,9 @@ impl LaneWo {
     }
 
     fn st(&self) -> Result<&State> {
-        self.st.as_ref().ok_or_else(|| "lane_wo: setup has not run".to_owned())
+        self.st
+            .as_ref()
+            .ok_or_else(|| "lane_wo: setup has not run".to_owned())
     }
 
     /// Seeded host buffers: weights (Normal), activations `[lanes][4096]`, residual `[lanes][m]`.
@@ -125,8 +133,16 @@ impl LaneWo {
         let n = m.div_ceil(CHUNK);
         let parts = par_map(n, |c| {
             let (r0, nr) = (c * CHUNK, CHUNK.min(m - c * CHUNK));
-            let mut y: Vec<f32> = (0..lanes).flat_map(|b| y0[b * m + r0..b * m + r0 + nr].iter().copied()).collect();
-            lane_ref::residual_lanes_ref(&w[r0 * ROW_BYTES..(r0 + nr) * ROW_BYTES], x, &mut y, nr, lanes);
+            let mut y: Vec<f32> = (0..lanes)
+                .flat_map(|b| y0[b * m + r0..b * m + r0 + nr].iter().copied())
+                .collect();
+            lane_ref::residual_lanes_ref(
+                &w[r0 * ROW_BYTES..(r0 + nr) * ROW_BYTES],
+                x,
+                &mut y,
+                nr,
+                lanes,
+            );
             y
         });
         let mut out = vec![0u32; lanes * m];
@@ -188,7 +204,11 @@ fn make_x(kind: Xk, r: &mut Xs64, lanes: usize) -> Vec<f32> {
                 Xk::Overflow => r.unit() * 3.0e38,
                 Xk::Denormal => {
                     let v = f32::from_bits((r.next_u64() >> 32) as u32 & 0x007F_FFFF);
-                    if r.next_u64() >> 40 & 1 == 1 { -v } else { v }
+                    if r.next_u64() >> 40 & 1 == 1 {
+                        -v
+                    } else {
+                        v
+                    }
                 }
                 Xk::Ones => 1.0,
                 Xk::Alternating => {
@@ -244,7 +264,12 @@ impl Node for LaneWo {
         GFX1201
     }
     fn shape_label(&self) -> String {
-        format!("{}n{}-m{}", if self.emu { "emu-" } else { "" }, self.lanes, self.m)
+        format!(
+            "{}n{}-m{}",
+            if self.emu { "emu-" } else { "" },
+            self.lanes,
+            self.m
+        )
     }
     fn shape_json(&self) -> Value {
         let sets = pool_sets(self.set_bytes());
@@ -275,20 +300,32 @@ impl Node for LaneWo {
         let lds = hdr.take_usize("lds_dynamic", 0)?;
         hdr.no_leftover()?;
         if block == 0 || block % 32 != 0 || block > 1024 {
-            return Err(format!("hip_loop header: block={block} must be a multiple of 32 in 32..=1024"));
+            return Err(format!(
+                "hip_loop header: block={block} must be a multiple of 32 in 32..=1024"
+            ));
         }
         if rows_per_wg == 0 {
             return Err("hip_loop header: rows_per_wg must be positive".into());
         }
         if lds > 64 * 1024 {
-            return Err(format!("hip_loop header: lds_dynamic={lds} exceeds the 64 KiB workgroup LDS"));
+            return Err(format!(
+                "hip_loop header: lds_dynamic={lds} exceeds the 64 KiB workgroup LDS"
+            ));
         }
-        let grid = u32::try_from(self.m.div_ceil(rows_per_wg)).map_err(|_| "grid exceeds u32".to_owned())?;
-        Ok(Geometry { grid: [grid, 1, 1], block: [block as u32, 1, 1], lds: lds as u32 })
+        let grid = u32::try_from(self.m.div_ceil(rows_per_wg))
+            .map_err(|_| "grid exceeds u32".to_owned())?;
+        Ok(Geometry {
+            grid: [grid, 1, 1],
+            block: [block as u32, 1, 1],
+            lds: lds as u32,
+        })
     }
     fn work(&self) -> Work {
         let (m, l) = (self.m as f64, self.lanes as f64);
-        Work { flops: 2.0 * m * K as f64 * l, bytes: m * ROW_BYTES as f64 + l * K as f64 * 4.0 + l * m * 8.0 }
+        Work {
+            flops: 2.0 * m * K as f64 * l,
+            bytes: m * ROW_BYTES as f64 + l * K as f64 * 4.0 + l * m * 8.0,
+        }
     }
     fn record_extra(&self) -> Value {
         json!({"lanes": self.lanes, "m": self.m, "flush": self.flush})
@@ -303,12 +340,16 @@ impl Node for LaneWo {
         true
     }
     fn extent_shapes(&self) -> Vec<String> {
-        [1, 5, 8].iter().map(|n| format!("lanes={n},m={PRODUCTION_M}")).collect()
+        [1, 5, 8]
+            .iter()
+            .map(|n| format!("lanes={n},m={PRODUCTION_M}"))
+            .collect()
     }
     fn out_owner<'a>(&'a self, hdr: &Header) -> Result<Box<dyn Fn(usize) -> [u32; 3] + 'a>> {
         // y is f32 [lanes][m]: row `e % m` belongs to workgroup `row / rows_per_wg`.
         let rows_per_wg = hdr.kv.get("rows_per_wg").map_or(Ok(ROWS_PER_WG), |v| {
-            v.parse::<usize>().map_err(|e| format!("hip_loop header rows_per_wg={v}: {e}"))
+            v.parse::<usize>()
+                .map_err(|e| format!("hip_loop header rows_per_wg={v}: {e}"))
         })?;
         if rows_per_wg == 0 {
             return Err("hip_loop header: rows_per_wg must be positive".into());
@@ -320,9 +361,18 @@ impl Node for LaneWo {
         let (w, x, y) = self.host_inputs(seed);
         Ok(EmuCase {
             bufs: vec![
-                EmuBuf { name: "w", bytes: w },
-                EmuBuf { name: "x", bytes: f32_bytes(&x) },
-                EmuBuf { name: "y", bytes: f32_bytes(&y) },
+                EmuBuf {
+                    name: "w",
+                    bytes: w,
+                },
+                EmuBuf {
+                    name: "x",
+                    bytes: f32_bytes(&x),
+                },
+                EmuBuf {
+                    name: "y",
+                    bytes: f32_bytes(&y),
+                },
             ],
             args: vec![
                 EmuArg::Buf(0),
@@ -339,12 +389,25 @@ impl Node for LaneWo {
         let n_sets = pool_sets(self.set_bytes());
         let mut sets = Vec::with_capacity(n_sets);
         for s in 0..n_sets {
-            let w = synth_weights(self.m, K / 256, seed ^ 0xA3B0 ^ ((s as u64) << 8), WKind::Normal);
+            let w = synth_weights(
+                self.m,
+                K / 256,
+                seed ^ 0xA3B0 ^ ((s as u64) << 8),
+                WKind::Normal,
+            );
             sets.push(Buf::from_bytes(gpu, &w)?);
         }
         let x = Buf::from_bytes(gpu, &f32_bytes(&self.host_x(seed)))?;
-        let mut y0 = word_bytes(&self.host_y(seed).iter().map(|v| v.to_bits()).collect::<Vec<_>>());
-        y0.extend_from_slice(&word_bytes(&poison_words((MAX_LANES + 1) * self.m - self.lanes * self.m)));
+        let mut y0 = word_bytes(
+            &self
+                .host_y(seed)
+                .iter()
+                .map(|v| v.to_bits())
+                .collect::<Vec<_>>(),
+        );
+        y0.extend_from_slice(&word_bytes(&poison_words(
+            (MAX_LANES + 1) * self.m - self.lanes * self.m,
+        )));
         let y = Buf::from_bytes(gpu, &y0)?;
         let y0 = Buf::from_bytes(gpu, &y0)?;
         self.st = Some(State { sets, x, y, y0 });
@@ -357,7 +420,11 @@ impl Node for LaneWo {
     fn kernarg(&self) -> Result<Vec<u8>> {
         let s = self.st()?;
         let mut a = Args::new();
-        a.ptr(&s.sets[0]).ptr(&s.x).ptr(&s.y).i32(self.m as i32).i32(self.lanes as i32);
+        a.ptr(&s.sets[0])
+            .ptr(&s.x)
+            .ptr(&s.y)
+            .i32(self.m as i32)
+            .i32(self.lanes as i32);
         let k = a.finish();
         debug_assert_eq!(k.len(), ARGS_BYTES);
         Ok(k)
@@ -382,30 +449,59 @@ impl Node for LaneWo {
         }
     }
 
-    fn adversarial(&mut self, gpu: &Gpu, base: &ArmImage, cand: &ArmImage, seed: u64) -> Result<Option<Value>> {
-        let arms = [LoadedArm::load(gpu, base.image)?, LoadedArm::load(gpu, cand.image)?];
-        let funcs = [arms[0].function(gpu, SYMBOL)?, arms[1].function(gpu, SYMBOL)?];
+    fn adversarial(
+        &mut self,
+        gpu: &Gpu,
+        base: &ArmImage,
+        cand: &ArmImage,
+        seed: u64,
+    ) -> Result<Option<Value>> {
+        let arms = [
+            LoadedArm::load(gpu, base.image)?,
+            LoadedArm::load(gpu, cand.image)?,
+        ];
+        let funcs = [
+            arms[0].function(gpu, SYMBOL)?,
+            arms[1].function(gpu, SYMBOL)?,
+        ];
         let lanes_all: Vec<usize> = (1..=MAX_LANES).collect();
-        let mut mx = Matrix { lanes: lanes_all.clone(), ..Default::default() };
+        let mut mx = Matrix {
+            lanes: lanes_all.clone(),
+            ..Default::default()
+        };
         let mut ms = vec![self.m];
         for m in [37usize, 1, 2050, 333, 96] {
             if !ms.contains(&m) {
                 ms.push(m);
             }
         }
-        let wkinds = [WKind::Normal, WKind::Wide, WKind::AllZero, WKind::AllFifteen, WKind::Wild];
+        let wkinds = [
+            WKind::Normal,
+            WKind::Wide,
+            WKind::AllZero,
+            WKind::AllFifteen,
+            WKind::Wild,
+        ];
         let max_m = *ms.iter().max().unwrap();
         let xbuf = Buf::alloc(gpu, MAX_LANES * K * 4)?;
         let ybuf = Buf::alloc(gpu, (MAX_LANES + 1) * max_m * 4)?;
         let result = (|| -> Result<()> {
             for (si, &m) in ms.iter().enumerate() {
                 let g_dims = self.at(self.lanes, m);
-                let geo = [g_dims.geometry(), g_dims.geometry_with(&mut cand.header.clone())?];
+                let geo = [
+                    g_dims.geometry(),
+                    g_dims.geometry_with(&mut cand.header.clone())?,
+                ];
                 for (wi, wk) in wkinds.into_iter().enumerate() {
                     if si == 0 {
                         mx.wkinds.push(wk.name());
                     }
-                    let w = synth_weights(m, K / 256, seed ^ 0xA3B0 ^ (((si * 8 + wi) as u64) << 16), wk);
+                    let w = synth_weights(
+                        m,
+                        K / 256,
+                        seed ^ 0xA3B0 ^ (((si * 8 + wi) as u64) << 16),
+                        wk,
+                    );
                     let wbuf = Buf::from_bytes(gpu, &w)?;
                     for (xi, &xk) in XKINDS.iter().enumerate() {
                         for (yi, &yk) in YKINDS.iter().enumerate() {
@@ -417,8 +513,12 @@ impl Node for LaneWo {
                                     continue;
                                 }
                                 let mut r = Xs64::new(
-                                    seed ^ 0x1234_5678 ^ ((si as u64) << 40) ^ ((wi as u64) << 32) ^ ((xi as u64) << 24)
-                                        ^ ((yi as u64) << 16) ^ lanes as u64,
+                                    seed ^ 0x1234_5678
+                                        ^ ((si as u64) << 40)
+                                        ^ ((wi as u64) << 32)
+                                        ^ ((xi as u64) << 24)
+                                        ^ ((yi as u64) << 16)
+                                        ^ lanes as u64,
                                 );
                                 let x = make_x(xk, &mut r, lanes);
                                 let y0 = make_y(yk, &mut r, lanes * m);
@@ -431,11 +531,20 @@ impl Node for LaneWo {
                                 for arm in 0..2 {
                                     ybuf.upload(gpu, &word_bytes(&y_init))?;
                                     let mut a = Args::new();
-                                    a.ptr(&wbuf).ptr(&xbuf).ptr(&ybuf).i32(m as i32).i32(lanes as i32);
+                                    a.ptr(&wbuf)
+                                        .ptr(&xbuf)
+                                        .ptr(&ybuf)
+                                        .i32(m as i32)
+                                        .i32(lanes as i32);
                                     let mut karg = a.finish();
-                                    launch_sync(gpu, &funcs[arm], &geo[arm], &mut karg).map_err(|e| {
-                                        format!("{} arm, {tag}: {e}", ["baseline", "candidate"][arm])
-                                    })?;
+                                    launch_sync(gpu, &funcs[arm], &geo[arm], &mut karg).map_err(
+                                        |e| {
+                                            format!(
+                                                "{} arm, {tag}: {e}",
+                                                ["baseline", "candidate"][arm]
+                                            )
+                                        },
+                                    )?;
                                     let mut all = words(&ybuf.download(gpu)?);
                                     all.truncate((MAX_LANES + 1) * m);
                                     outs.push(all);
@@ -445,7 +554,10 @@ impl Node for LaneWo {
                                 for arm in 0..2 {
                                     if outs[arm][written..].iter().any(|&v| v != POISON) {
                                         mx.guard_violations[arm] += 1;
-                                        mx.fail(format!("[{tag}] {} wrote past lane {lanes} (guard words)", ["baseline", "candidate"][arm]));
+                                        mx.fail(format!(
+                                            "[{tag}] {} wrote past lane {lanes} (guard words)",
+                                            ["baseline", "candidate"][arm]
+                                        ));
                                     }
                                 }
                                 let (b, c) = (&outs[0][..written], &outs[1][..written]);
@@ -528,10 +640,17 @@ mod tests {
     #[test]
     fn header_geometry() {
         let n = node("lanes=3,m=2048");
-        let mut h = Header::parse("// hip_loop: block=256 rows_per_wg=16 lds_dynamic=1024").unwrap();
+        let mut h =
+            Header::parse("// hip_loop: block=256 rows_per_wg=16 lds_dynamic=1024").unwrap();
         let g = n.geometry_with(&mut h).unwrap();
         assert_eq!((g.grid, g.block, g.lds), ([128, 1, 1], [256, 1, 1], 1024));
-        for bad in ["block=48", "block=2048", "rows_per_wg=0", "lds_dynamic=70000", "tile_m=8"] {
+        for bad in [
+            "block=48",
+            "block=2048",
+            "rows_per_wg=0",
+            "lds_dynamic=70000",
+            "tile_m=8",
+        ] {
             let mut h = Header::parse(&format!("// hip_loop: {bad}")).unwrap();
             assert!(n.geometry_with(&mut h).is_err(), "{bad}");
         }
@@ -540,7 +659,10 @@ mod tests {
     #[test]
     fn shapes_parse_and_refuse() {
         for s in ["lanes=0", "lanes=9", "m=0", "q=1", "nope"] {
-            assert!(LaneWo::new(&ShapeSpec::parse(Some(s)).unwrap()).is_err(), "{s}");
+            assert!(
+                LaneWo::new(&ShapeSpec::parse(Some(s)).unwrap()).is_err(),
+                "{s}"
+            );
         }
         let n = node("emu");
         assert_eq!((n.lanes, n.m), (5, EMU_M));
@@ -572,7 +694,11 @@ mod tests {
             let mut y = y0.clone();
             lane_ref::residual_lanes_ref(&w, &x, &mut y, m, lanes);
             let want: Vec<u32> = y.iter().map(|v| v.to_bits()).collect();
-            assert_eq!(LaneWo::cpu_reference(&w, &x, &y0, m, lanes), want, "m{m} n{lanes}");
+            assert_eq!(
+                LaneWo::cpu_reference(&w, &x, &y0, m, lanes),
+                want,
+                "m{m} n{lanes}"
+            );
         }
     }
 
@@ -584,7 +710,11 @@ mod tests {
         let (w, x, y0) = n.host_inputs(5);
         let t = std::time::Instant::now();
         let r = LaneWo::cpu_reference(&w, &x, &y0, 2048, 8);
-        eprintln!("lane_wo cpu reference m2048 n8: {:?} ({} words)", t.elapsed(), r.len());
+        eprintln!(
+            "lane_wo cpu reference m2048 n8: {:?} ({} words)",
+            t.elapsed(),
+            r.len()
+        );
     }
 
     #[test]

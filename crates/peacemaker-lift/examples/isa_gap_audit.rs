@@ -16,7 +16,12 @@ fn main() {
     for path in std::env::args().skip(1) {
         let name = path.rsplit('/').next().unwrap_or(&path).to_owned();
         let bytes = std::fs::read(&path).unwrap();
-        let program = match lift_object(&bytes, Options { frontend: Frontend::Hipcc }) {
+        let program = match lift_object(
+            &bytes,
+            Options {
+                frontend: Frontend::Hipcc,
+            },
+        ) {
             Ok(l) => l.program,
             Err(e) => {
                 println!("{name}: LIFT FAIL: {e}");
@@ -25,7 +30,12 @@ fn main() {
             }
         };
         let arch = program.target.arch;
-        let identical = match emit::checked(&program, Options { frontend: Frontend::Hipcc }) {
+        let identical = match emit::checked(
+            &program,
+            Options {
+                frontend: Frontend::Hipcc,
+            },
+        ) {
             Ok((out, _)) => {
                 if out == bytes {
                     None
@@ -43,7 +53,11 @@ fn main() {
                 let i = k.body.insts.get(*id).unwrap();
                 let n = i.op.name(arch).unwrap_or("?");
                 if peacemaker_ir::emu::semantic_class(n).is_none() {
-                    *missing.entry(k.symbol.0.clone()).or_default().entry(n.to_owned()).or_default() += 1;
+                    *missing
+                        .entry(k.symbol.0.clone())
+                        .or_default()
+                        .entry(n.to_owned())
+                        .or_default() += 1;
                 }
             }
         }

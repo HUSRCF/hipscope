@@ -146,7 +146,8 @@ pub fn apply(base: &[u8], options: Options, rewrite: Rewrite) -> Result<Certifie
     let (bytes, relifted) = emit::checked(&current.program, options)?;
     let edited = kernel(&current.program, &symbol);
     let emitted = kernel(&relifted.program, &symbol);
-    let definedness = definedness::check(current.program.target.arch, &base_kernel, edited, emitted);
+    let definedness =
+        definedness::check(current.program.target.arch, &base_kernel, edited, emitted);
     let new_obligations: Vec<Obligation> = current
         .obligations
         .iter()

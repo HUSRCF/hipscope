@@ -417,7 +417,9 @@ fn parse_args(mut a: impl Iterator<Item = String>) -> Result<Opts> {
             ));
         }
         if o.rip.is_some() {
-            return Err("--cand-object cannot be combined with --rip (two candidate sources)".into());
+            return Err(
+                "--cand-object cannot be combined with --rip (two candidate sources)".into(),
+            );
         }
         if o.null_control {
             return Err(
@@ -1677,8 +1679,14 @@ mod tests {
     fn cand_object_is_gfx1100_qwen4_moe_sym_only() {
         let ok = "--kernel qwen4_moe_sym --arch gfx1100 --offline --cand-object /tmp/c.co";
         let o = parse_args(args(ok)).unwrap();
-        assert_eq!(o.cand_object.as_deref(), Some(std::path::Path::new("/tmp/c.co")));
-        assert!(parse_args(args("--kernel qwen4_moe_sym")).unwrap().cand_object.is_none());
+        assert_eq!(
+            o.cand_object.as_deref(),
+            Some(std::path::Path::new("/tmp/c.co"))
+        );
+        assert!(parse_args(args("--kernel qwen4_moe_sym"))
+            .unwrap()
+            .cand_object
+            .is_none());
         for bad in [
             "--kernel qwen4_moe_sym --arch gfx1151 --cand-object /tmp/c.co",
             "--kernel qwen4_moe_sym --cand-object /tmp/c.co",

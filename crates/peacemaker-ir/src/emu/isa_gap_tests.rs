@@ -34,7 +34,8 @@ fn state() -> State {
 
 /// The instruction and its table name, decoded from machine words.
 fn dec(words: &[u32]) -> (Inst, &'static str) {
-    let (inst, n) = gfx11::decode(Arch::Gfx1100, words).unwrap_or_else(|e| panic!("decode {words:08x?}: {e}"));
+    let (inst, n) =
+        gfx11::decode(Arch::Gfx1100, words).unwrap_or_else(|e| panic!("decode {words:08x?}: {e}"));
     assert_eq!(n, words.len(), "{words:08x?} decoded to {n} words");
     let name = crate::isa::lookup(Arch::Gfx1100, inst.op, inst.form)
         .unwrap_or_else(|| panic!("{words:08x?} has no gfx1100 row"))
@@ -235,7 +236,7 @@ fn s_lshr_b64_shifts_the_whole_pair_logically() {
     st.s[36] = 0x9abc_def0;
     st.s[37] = 0x1234_5678;
     run(S_LSHR_B64, &mut st).unwrap(); // >> 21
-    // 0x123456789abcdef0 >> 21 = 0x91a2b3c4d5
+                                       // 0x123456789abcdef0 >> 21 = 0x91a2b3c4d5
     assert_eq!((st.s[4], st.s[5], st.scc), (0xa2b3_c4d5, 0x91, true));
     // The high word's top bit is a logical, not arithmetic, shift: 0x8000000000000000 >> 21 = 2^42.
     st.s[36] = 0;
@@ -258,7 +259,11 @@ fn s_xor_b64_xors_both_words_and_sets_scc() {
     st.s[6] = 1;
     st.s[7] = 1;
     run(S_XOR_B64, &mut st).unwrap();
-    assert_eq!((st.s[8], st.s[9], st.scc), (0, 0xffff_fffe, true), "the high word differs only");
+    assert_eq!(
+        (st.s[8], st.s[9], st.scc),
+        (0, 0xffff_fffe, true),
+        "the high word differs only"
+    );
     st.s[6] = 0;
     st.s[7] = 0xffff_fffe; // s[8:9] is now {0, 0xfffffffe}
     run(S_XOR_B64, &mut st).unwrap();
@@ -275,10 +280,15 @@ fn v_alignbyte_b32_funnels_by_bytes() {
     setv(&mut st, 2, &[0x1122_3344, 0xaabb_ccdd]);
     setv(&mut st, 3, &[0x5566_7788, 0x0102_0304]);
     run(V_ALIGNBYTE_IMM, &mut st).unwrap(); // S2 = 2: >> 16
-    // 0x1122334455667788 >> 16 -> 0x33445566; 0xaabbccdd01020304 >> 16 -> 0xccdd0102
+                                            // 0x1122334455667788 >> 16 -> 0x33445566; 0xaabbccdd01020304 >> 16 -> 0xccdd0102
     assert_eq!(getv(&st, 1, 2), vec![0x3344_5566, 0xccdd_0102]);
     // S2 comes from an SGPR and only bits [1:0] count: 5 -> byte 1, 4 -> byte 0, 7 -> byte 3.
-    for (s4, want0) in [(5u32, 0x4455_6677u32), (4, 0x5566_7788), (7, 0x2233_4455), (0xffff_fffc, 0x5566_7788)] {
+    for (s4, want0) in [
+        (5u32, 0x4455_6677u32),
+        (4, 0x5566_7788),
+        (7, 0x2233_4455),
+        (0xffff_fffc, 0x5566_7788),
+    ] {
         st.s[4] = s4;
         run(V_ALIGNBYTE_SGPR, &mut st).unwrap();
         assert_eq!(st.v[1][0], want0, "S2 = {s4:#x}");
@@ -375,7 +385,14 @@ fn v_med3_i32_is_the_signed_median() {
     let mut st = state();
     st.exec = 1;
     // median(S0, 1, 0x100)
-    for (s9, want) in [(5i32, 5i32), (-16, 1), (1000, 0x100), (1, 1), (0x100, 0x100), (i32::MIN, 1)] {
+    for (s9, want) in [
+        (5i32, 5i32),
+        (-16, 1),
+        (1000, 0x100),
+        (1, 1),
+        (0x100, 0x100),
+        (i32::MIN, 1),
+    ] {
         st.s[9] = s9 as u32;
         run(V_MED3_I32, &mut st).unwrap();
         assert_eq!(st.v[1][0] as i32, want, "median({s9}, 1, 256)");
@@ -391,7 +408,11 @@ fn v_movrels_b32_reads_the_vgpr_offset_by_m0() {
     setv(&mut st, 12, &[0xaaaa, 0xbbbb]);
     st.m0 = 3;
     run(V_MOVRELS, &mut st).unwrap();
-    assert_eq!(getv(&st, 4, 2), vec![0xaaaa, 0xbbbb], "v9 + M0=3 = v12, per lane");
+    assert_eq!(
+        getv(&st, 4, 2),
+        vec![0xaaaa, 0xbbbb],
+        "v9 + M0=3 = v12, per lane"
+    );
     st.m0 = 0;
     run(V_MOVRELS, &mut st).unwrap();
     assert_eq!(getv(&st, 4, 2), vec![0x9, 0x99]);
@@ -415,7 +436,11 @@ fn v_add_nc_u32_e64_adds_a_literal() {
 fn v_add_co_ci_u32_e32_carries_through_vcc() {
     let mut st = state();
     st.exec = 0b1111;
-    setv(&mut st, 5, &[0xffff_ffff, 0xffff_ffff, 0xffff_ffff, 0x7fff_ffff]);
+    setv(
+        &mut st,
+        5,
+        &[0xffff_ffff, 0xffff_ffff, 0xffff_ffff, 0x7fff_ffff],
+    );
     setv(&mut st, 7, &[0, 1, 0xffff_ffff, 0x8000_0000]);
     st.vcc = 0b0101; // carry-in on lanes 0 and 2
     run(V_ADD_CO_CI_E32, &mut st).unwrap();
@@ -638,7 +663,11 @@ fn v_or_b32_dpp_row_shl_reads_the_next_lane_and_zero_at_the_row_end() {
     run(V_OR_B32_DPP, &mut st).unwrap();
     assert_eq!(st.v[5][0], 0b11);
     assert_eq!(st.v[5][7], (1 << 7) | (1 << 8));
-    assert_eq!(st.v[5][15], 1 << 15, "row end: src0 out of range reads 0 (bound_ctrl)");
+    assert_eq!(
+        st.v[5][15],
+        1 << 15,
+        "row end: src0 out of range reads 0 (bound_ctrl)"
+    );
     assert_eq!(st.v[5][16], (1 << 16) | (1 << 17));
     assert_eq!(st.v[5][31], 1 << 31);
 }
@@ -651,10 +680,16 @@ fn v_lshlrev_b16_shifts_a_half_and_preserves_the_other() {
     let mut st = state();
     st.v[8][0] = 0xabcd_00f1;
     run(V_LSHLREV_B16_IMM, &mut st).unwrap(); // v8.l = v8.l << 5
-    assert_eq!(st.v[8][0], 0xabcd_1e20, "0x00f1 << 5 = 0x1e20, high half untouched");
+    assert_eq!(
+        st.v[8][0], 0xabcd_1e20,
+        "0x00f1 << 5 = 0x1e20, high half untouched"
+    );
     st.v[8][0] = 0xabcd_ffff;
     run(V_LSHLREV_B16_IMM, &mut st).unwrap();
-    assert_eq!(st.v[8][0], 0xabcd_ffe0, "bits shifted out of the half are dropped, not carried into the other half");
+    assert_eq!(
+        st.v[8][0], 0xabcd_ffe0,
+        "bits shifted out of the half are dropped, not carried into the other half"
+    );
     // v8.h = v3.h << (v2.l & 15): count 0x13 & 15 = 3.
     st.v[8][0] = 0x1111_2222;
     st.v[2][0] = 0x0000_0013;
@@ -704,7 +739,10 @@ fn v_cvt_f16_u16_e64_converts_the_selected_half() {
     st.v[164][0] = 0x0007_0000;
     st.v[229][0] = 0x5555_0000;
     run(V_CVT_F16_U16_E64, &mut st).unwrap();
-    assert_eq!(st.v[229][0], 0x5555_4700, "7 -> 0x4700, destination high half preserved");
+    assert_eq!(
+        st.v[229][0], 0x5555_4700,
+        "7 -> 0x4700, destination high half preserved"
+    );
     st.v[164][0] = 2049 << 16; // exactly halfway between 2048 and 2050: ties to even = 2048 (0x6800)
     run(V_CVT_F16_U16_E64, &mut st).unwrap();
     assert_eq!(st.v[229][0] & 0xffff, 0x6800);
@@ -721,7 +759,10 @@ fn v_cvt_u32_u16_e64_zero_extends_the_selected_half() {
     run(V_CVT_U32_U16_E64_LO, &mut st).unwrap();
     assert_eq!(st.v[143][0], 0x1234);
     run(V_CVT_U32_U16_E64_HI, &mut st).unwrap();
-    assert_eq!(st.v[143][0], 0xabcd, "the high half is zero-extended, not sign-extended");
+    assert_eq!(
+        st.v[143][0], 0xabcd,
+        "the high half is zero-extended, not sign-extended"
+    );
 }
 
 /// RDNA3 ISA V_PK_MUL_F16: `D0[31:16] = S0[31:16] * S1[31:16]; D0[15:0] = S0[15:0] * S1[15:0]`.
@@ -777,14 +818,32 @@ fn v_trunc_f32_rounds_toward_zero() {
     setv(
         &mut st,
         5,
-        &[0x4030_0000, 0xc030_0000, 0x3f00_0000, 0xbf00_0000, 0x5015_02f9, INF, 0x0000_0001, NEG_ZERO],
+        &[
+            0x4030_0000,
+            0xc030_0000,
+            0x3f00_0000,
+            0xbf00_0000,
+            0x5015_02f9,
+            INF,
+            0x0000_0001,
+            NEG_ZERO,
+        ],
     );
     run(V_TRUNC, &mut st).unwrap();
     assert_eq!(
         getv(&st, 5, 8),
         // 2.75 -> 2; -2.75 -> -2; 0.5 -> +0; -0.5 -> -0 (IEEE round-toward-zero keeps the sign); 1e10 is an integer already;
         // +inf; the smallest denormal -> +0; -0 -> -0.
-        vec![0x4000_0000, 0xc000_0000, 0, NEG_ZERO, 0x5015_02f9, INF, 0, NEG_ZERO]
+        vec![
+            0x4000_0000,
+            0xc000_0000,
+            0,
+            NEG_ZERO,
+            0x5015_02f9,
+            INF,
+            0,
+            NEG_ZERO
+        ]
     );
     // A NaN operand is refused (propagation is not specified for this opcode).
     st.exec = 1;
@@ -797,14 +856,30 @@ fn v_trunc_f32_rounds_toward_zero() {
 fn v_floor_f32_rounds_toward_negative_infinity() {
     let mut st = state();
     st.exec = 0b1_1111;
-    setv(&mut st, 67, &[0x4030_0000, 0xc030_0000, 0xbf00_0000, 0x3f00_0000, 0xc040_0000]);
+    setv(
+        &mut st,
+        67,
+        &[
+            0x4030_0000,
+            0xc030_0000,
+            0xbf00_0000,
+            0x3f00_0000,
+            0xc040_0000,
+        ],
+    );
     run(V_FLOOR, &mut st).unwrap();
     // 2.75 -> 2.0; -2.75 -> -3.0; -0.5 -> -1.0; 0.5 -> +0; -3.0 -> -3.0.
-    assert_eq!(getv(&st, 67, 5), vec![0x4000_0000, 0xc040_0000, 0xbf80_0000, 0, 0xc040_0000]);
+    assert_eq!(
+        getv(&st, 67, 5),
+        vec![0x4000_0000, 0xc040_0000, 0xbf80_0000, 0, 0xc040_0000]
+    );
     st.exec = 1;
     st.v[67][0] = NEG_ZERO;
     run(V_FLOOR, &mut st).unwrap();
-    assert_eq!(st.v[67][0], NEG_ZERO, "S0 = -0 is not < 0: trunc(-0) = -0 is kept");
+    assert_eq!(
+        st.v[67][0], NEG_ZERO,
+        "S0 = -0 is not < 0: trunc(-0) = -0 is kept"
+    );
     st.v[67][0] = NAN;
     assert!(run(V_FLOOR, &mut st).is_err());
 }
@@ -815,9 +890,16 @@ fn v_med3_f32_is_a_clamp_when_the_bounds_are_ordered() {
     let mut st = state();
     st.exec = 0b1111;
     st.s[17] = 0xc2fe_0000; // -127.0; the third source is the literal 127.0
-    setv(&mut st, 67, &[0x4348_0000, 0xc396_0000, 0x40b0_0000, 0x42fe_0000]); // 200, -300, 5.5, 127
+    setv(
+        &mut st,
+        67,
+        &[0x4348_0000, 0xc396_0000, 0x40b0_0000, 0x42fe_0000],
+    ); // 200, -300, 5.5, 127
     run(V_MED3_F32, &mut st).unwrap();
-    assert_eq!(getv(&st, 67, 4), vec![0x42fe_0000, 0xc2fe_0000, 0x40b0_0000, 0x42fe_0000]);
+    assert_eq!(
+        getv(&st, 67, 4),
+        vec![0x42fe_0000, 0xc2fe_0000, 0x40b0_0000, 0x42fe_0000]
+    );
     // Infinities order normally.
     st.exec = 0b11;
     setv(&mut st, 67, &[INF, NINF]);
@@ -837,7 +919,11 @@ fn v_med3_f32_is_a_clamp_when_the_bounds_are_ordered() {
 fn v_frexp_exp_i32_f32_returns_the_binary_exponent_of_a_half_open_significand() {
     let mut st = state();
     st.exec = 0b1_1111_1;
-    setv(&mut st, 5, &[0x4100_0000, ONE, 0x3f00_0000, 0xbf40_0000, INF, 0x7f7f_ffff]);
+    setv(
+        &mut st,
+        5,
+        &[0x4100_0000, ONE, 0x3f00_0000, 0xbf40_0000, INF, 0x7f7f_ffff],
+    );
     run(V_FREXP_EXP, &mut st).unwrap();
     // 8 = 0.5 * 2^4; 1 = 0.5 * 2^1; 0.5 = 0.5 * 2^0; -0.75 = -0.75 * 2^0; inf -> 0; f32::MAX < 2^128 -> 128.
     assert_eq!(getv(&st, 7, 6), vec![4, 1, 0, 0, 0, 128]);
@@ -860,7 +946,10 @@ fn v_frexp_mant_f32_returns_the_significand() {
     setv(&mut st, 5, &[0x4100_0000, 0xc040_0000, ONE, NINF]);
     run(V_FREXP_MANT, &mut st).unwrap();
     // 8 -> 0.5; -3 = -1.5 * 2 -> -0.75; 1 -> 0.5; -inf -> -inf.
-    assert_eq!(getv(&st, 6, 4), vec![0x3f00_0000, 0xbf40_0000, 0x3f00_0000, NINF]);
+    assert_eq!(
+        getv(&st, 6, 4),
+        vec![0x3f00_0000, 0xbf40_0000, 0x3f00_0000, NINF]
+    );
     // With |src|: -3.0 -> 3.0 -> 0.75.
     st.exec = 1;
     st.v[6][0] = 0xc040_0000;
@@ -885,8 +974,14 @@ fn ds_2addr_b32_and_stride64_and_b96_address_the_documented_dwords() {
     setv(&mut st, 5, &[0x1111_1111, 0xaabb_ccdd]);
     setv(&mut st, 6, &[0x2222_2222, 0x0102_0304]);
     mem_run(DS_STORE_2ADDR_B32, &mut st, &mut mem, &mut lds).unwrap();
-    assert_eq!(lds[16..24], [0x11, 0x11, 0x11, 0x11, 0x22, 0x22, 0x22, 0x22]);
-    assert_eq!(lds[64..72], [0xdd, 0xcc, 0xbb, 0xaa, 0x04, 0x03, 0x02, 0x01]);
+    assert_eq!(
+        lds[16..24],
+        [0x11, 0x11, 0x11, 0x11, 0x22, 0x22, 0x22, 0x22]
+    );
+    assert_eq!(
+        lds[64..72],
+        [0xdd, 0xcc, 0xbb, 0xaa, 0x04, 0x03, 0x02, 0x01]
+    );
     assert_eq!(lds[24], 0, "nothing past the second dword");
     // ds_load_2addr_stride64_b32 v[4:5], v3 offset1:2: elements at addr + 0*64*4 and addr + 2*64*4 = addr + 512.
     lds[100..104].copy_from_slice(&0x0a0b_0c0du32.to_le_bytes());
@@ -919,19 +1014,29 @@ fn global_sub_dword_stores_and_wide_loads() {
     st.v[1][0] = 0;
     st.v[4][0] = 0xdead_be42;
     mem_run(GLOBAL_STORE_B8, &mut st, &mut mem, &mut lds).unwrap();
-    assert_eq!(mem.read(0x1000, 8).unwrap(), [0xaa, 0xaa, 0xaa, 0x42, 0xaa, 0xaa, 0xaa, 0xaa]);
+    assert_eq!(
+        mem.read(0x1000, 8).unwrap(),
+        [0xaa, 0xaa, 0xaa, 0x42, 0xaa, 0xaa, 0xaa, 0xaa]
+    );
     // global_store_d16_hi_b16 v[69:70], v68, off: v68[31:16] as two bytes.
     st.v[69][0] = 0x1010;
     st.v[70][0] = 0;
     st.v[68][0] = 0x1234_5678;
     mem_run(GLOBAL_STORE_D16_HI_B16, &mut st, &mut mem, &mut lds).unwrap();
-    assert_eq!(mem.read(0x100e, 6).unwrap(), [0xaa, 0xaa, 0x34, 0x12, 0xaa, 0xaa]);
+    assert_eq!(
+        mem.read(0x100e, 6).unwrap(),
+        [0xaa, 0xaa, 0x34, 0x12, 0xaa, 0xaa]
+    );
     // global_load_b96 v[40:42], v[36:37], off.
-    mem.write(0x1020, &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]).unwrap();
+    mem.write(0x1020, &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12])
+        .unwrap();
     st.v[36][0] = 0x1020;
     st.v[37][0] = 0;
     mem_run(GLOBAL_LOAD_B96, &mut st, &mut mem, &mut lds).unwrap();
-    assert_eq!((st.v[40][0], st.v[41][0], st.v[42][0]), (0x0403_0201, 0x0807_0605, 0x0c0b_0a09));
+    assert_eq!(
+        (st.v[40][0], st.v[41][0], st.v[42][0]),
+        (0x0403_0201, 0x0807_0605, 0x0c0b_0a09)
+    );
     // flat_load_b64 v[36:37], v[9:10] and flat_load_b128 v[33:36], v[22:23].
     st.v[9][0] = 0x1020;
     st.v[10][0] = 0;
@@ -953,7 +1058,15 @@ fn global_atomic_add_u32_adds_in_memory_and_returns_the_old_value() {
     let mut st = state();
     let mut mem = Memory::default();
     let mut lds = [];
-    mem.map("buf".into(), 0x2000, [100u32, 200, 10].iter().flat_map(|w| w.to_le_bytes()).collect()).unwrap();
+    mem.map(
+        "buf".into(),
+        0x2000,
+        [100u32, 200, 10]
+            .iter()
+            .flat_map(|w| w.to_le_bytes())
+            .collect(),
+    )
+    .unwrap();
     // Returning, SADDR form (`v2, v2, v3, s[4:5] glc`): address = s[4:5] + v2 (32-bit offset), data v3, old value into v2.
     st.exec = 0b11;
     st.s[4] = 0x2000;
@@ -983,21 +1096,79 @@ fn global_atomic_add_u32_adds_in_memory_and_returns_the_old_value() {
 
 #[test]
 fn buffer_gl1_inv_is_a_wait_class_no_op_and_every_new_row_is_in_the_table() {
-    assert_eq!(crate::emu::semantic_class(dec(BUFFER_GL1_INV).1), Some("wait"));
+    assert_eq!(
+        crate::emu::semantic_class(dec(BUFFER_GL1_INV).1),
+        Some("wait")
+    );
     // Every opcode of this file decodes to a row the semantics table knows.
     for words in [
-        S_OR_SAVEEXEC, S_LSHR_B64, S_XOR_B64, V_ALIGNBYTE_IMM, V_BFREV, V_NOT, V_CLZ, V_XOR3, V_BCNT, V_MIN3_I32,
-        V_MED3_I32, V_MOVRELS, V_LSHLREV_B16_IMM, V_OR_B16, V_CNDMASK_B16, V_CVT_F32_F16_E32, V_CVT_F16_U16_E64,
-        V_CVT_U32_U16_E64_LO, V_PK_MUL_F16, V_SUB_F32_E64, V_FMAC_F32_E64, V_TRUNC, V_FLOOR, V_MED3_F32, V_FREXP_EXP,
-        V_FREXP_MANT, V_FREXP_MANT_ABS, V_ADD_CO_CI_E32, V_SUB_CO, V_SUB_CO_CI_NULL, V_SUBREV_CO_CI_NULL, V_ADD_NC_E64,
-        V_CMP_EQ_F32, V_CMP_NEQ_F32, V_CMP_O_F32, V_CMP_LE_F32, V_CMP_GE_I32, V_CMP_GE_U32, V_CMP_LT_I64_E64,
-        V_CMP_NE_U64_E64, V_CMPX_NE_U32, V_CMPX_LE_I32, V_CMPX_LE_U32, V_CMPX_LT_U32, V_CMPX_EQ_F32, V_CMPX_NLT_F32,
-        V_CMPX_NGT_F32_E64, V_CMPX_LE_F32_E64, V_CMPX_GT_I64_E32, V_MIN_I32_DPP, V_OR_B32_DPP, DS_STORE_2ADDR_B32,
-        DS_LOAD_2ADDR_STRIDE64_B32, DS_LOAD_B96, GLOBAL_STORE_B8, GLOBAL_STORE_D16_HI_B16, GLOBAL_LOAD_B96,
-        GLOBAL_ATOMIC_ADD_RTN, GLOBAL_ATOMIC_ADD, FLAT_LOAD_B64, FLAT_LOAD_B128,
+        S_OR_SAVEEXEC,
+        S_LSHR_B64,
+        S_XOR_B64,
+        V_ALIGNBYTE_IMM,
+        V_BFREV,
+        V_NOT,
+        V_CLZ,
+        V_XOR3,
+        V_BCNT,
+        V_MIN3_I32,
+        V_MED3_I32,
+        V_MOVRELS,
+        V_LSHLREV_B16_IMM,
+        V_OR_B16,
+        V_CNDMASK_B16,
+        V_CVT_F32_F16_E32,
+        V_CVT_F16_U16_E64,
+        V_CVT_U32_U16_E64_LO,
+        V_PK_MUL_F16,
+        V_SUB_F32_E64,
+        V_FMAC_F32_E64,
+        V_TRUNC,
+        V_FLOOR,
+        V_MED3_F32,
+        V_FREXP_EXP,
+        V_FREXP_MANT,
+        V_FREXP_MANT_ABS,
+        V_ADD_CO_CI_E32,
+        V_SUB_CO,
+        V_SUB_CO_CI_NULL,
+        V_SUBREV_CO_CI_NULL,
+        V_ADD_NC_E64,
+        V_CMP_EQ_F32,
+        V_CMP_NEQ_F32,
+        V_CMP_O_F32,
+        V_CMP_LE_F32,
+        V_CMP_GE_I32,
+        V_CMP_GE_U32,
+        V_CMP_LT_I64_E64,
+        V_CMP_NE_U64_E64,
+        V_CMPX_NE_U32,
+        V_CMPX_LE_I32,
+        V_CMPX_LE_U32,
+        V_CMPX_LT_U32,
+        V_CMPX_EQ_F32,
+        V_CMPX_NLT_F32,
+        V_CMPX_NGT_F32_E64,
+        V_CMPX_LE_F32_E64,
+        V_CMPX_GT_I64_E32,
+        V_MIN_I32_DPP,
+        V_OR_B32_DPP,
+        DS_STORE_2ADDR_B32,
+        DS_LOAD_2ADDR_STRIDE64_B32,
+        DS_LOAD_B96,
+        GLOBAL_STORE_B8,
+        GLOBAL_STORE_D16_HI_B16,
+        GLOBAL_LOAD_B96,
+        GLOBAL_ATOMIC_ADD_RTN,
+        GLOBAL_ATOMIC_ADD,
+        FLAT_LOAD_B64,
+        FLAT_LOAD_B128,
     ] {
         let (_, name) = dec(words);
-        assert!(crate::emu::semantic_class(name).is_some(), "{name} has no semantics row");
+        assert!(
+            crate::emu::semantic_class(name).is_some(),
+            "{name} has no semantics row"
+        );
     }
 }
 
@@ -1040,7 +1211,11 @@ fn every_gfx1100_alu_row_reaches_a_handler() {
         }
     }
     assert!(checked > 200, "only {checked} rows were exercised");
-    assert!(missing.is_empty(), "semantics rows without a handler:\n{}", missing.join("\n"));
+    assert!(
+        missing.is_empty(),
+        "semantics rows without a handler:\n{}",
+        missing.join("\n")
+    );
 }
 
 // ---- scratch (per-lane private memory) -----------------------------------------------------------------------------
@@ -1083,9 +1258,17 @@ fn scratch_access_is_lane_private_and_addressed_by_sgpr_vgpr_and_offset() {
     setv(&mut st, 11, &[0x1122_3344, 0xaabb_ccdd]);
     mem_run(SCRATCH_STORE_B32_S, &mut st, &mut mem, &mut lds).unwrap();
     assert_eq!(st.scratch[0][8..12], [0x44, 0x33, 0x22, 0x11]);
-    assert_eq!(st.scratch[1][8..12], [0xdd, 0xcc, 0xbb, 0xaa], "lane 1 wrote its own private bytes");
+    assert_eq!(
+        st.scratch[1][8..12],
+        [0xdd, 0xcc, 0xbb, 0xaa],
+        "lane 1 wrote its own private bytes"
+    );
     assert_eq!(st.scratch[0][12..16], [0, 0, 0, 0]);
-    assert_eq!(st.scratch[2][8..12], [0, 0, 0, 0], "an inactive lane's private memory is untouched");
+    assert_eq!(
+        st.scratch[2][8..12],
+        [0, 0, 0, 0],
+        "an inactive lane's private memory is untouched"
+    );
     // scratch_load_b32 v90, off, off offset:528: only the immediate offset.
     st.scratch[0][528..532].copy_from_slice(&0x0102_0304u32.to_le_bytes());
     st.scratch[1][528..532].copy_from_slice(&0x0506_0708u32.to_le_bytes());
@@ -1097,15 +1280,24 @@ fn scratch_access_is_lane_private_and_addressed_by_sgpr_vgpr_and_offset() {
     mem_run(SCRATCH_STORE_B64_OFF, &mut st, &mut mem, &mut lds).unwrap();
     setv(&mut st, 5, &[16, 16]);
     mem_run(SCRATCH_LOAD_B64_V, &mut st, &mut mem, &mut lds).unwrap();
-    assert_eq!((st.v[0][0], st.v[1][0], st.v[0][1], st.v[1][1]), (0x10, 0x30, 0x20, 0x40));
+    assert_eq!(
+        (st.v[0][0], st.v[1][0], st.v[0][1], st.v[1][1]),
+        (0x10, 0x30, 0x20, 0x40)
+    );
     // 128- and 96-bit round trips keep dword order.
     for (r, vals) in [(72, [1, 5]), (73, [2, 6]), (74, [3, 7]), (75, [4, 8])] {
         setv(&mut st, r, &vals);
     }
     mem_run(SCRATCH_STORE_B128_OFF, &mut st, &mut mem, &mut lds).unwrap();
     mem_run(SCRATCH_LOAD_B128_OFF, &mut st, &mut mem, &mut lds).unwrap();
-    assert_eq!((st.v[0][0], st.v[1][0], st.v[2][0], st.v[3][0]), (1, 2, 3, 4));
-    assert_eq!((st.v[0][1], st.v[1][1], st.v[2][1], st.v[3][1]), (5, 6, 7, 8));
+    assert_eq!(
+        (st.v[0][0], st.v[1][0], st.v[2][0], st.v[3][0]),
+        (1, 2, 3, 4)
+    );
+    assert_eq!(
+        (st.v[0][1], st.v[1][1], st.v[2][1], st.v[3][1]),
+        (5, 6, 7, 8)
+    );
     for (r, vals) in [(39, [0xa, 0xd]), (40, [0xb, 0xe]), (41, [0xc, 0xf])] {
         setv(&mut st, r, &vals);
     }
@@ -1148,14 +1340,19 @@ fn every_gfx1100_memory_row_is_a_plain_access_or_a_dedicated_handler() {
             continue;
         }
         checked += 1;
-        let prefixed = ["s_load_", "ds_", "buffer_", "global_", "flat_", "scratch_"].iter().any(|p| row.name.starts_with(p));
+        let prefixed = ["s_load_", "ds_", "buffer_", "global_", "flat_", "scratch_"]
+            .iter()
+            .any(|p| row.name.starts_with(p));
         let plain = row.name.contains("load") || row.name.contains("store");
         if !prefixed || !(plain || DEDICATED.contains(&row.name)) {
             bad.push(row.name);
         }
     }
     assert!(checked > 40, "only {checked} memory rows were seen");
-    assert!(bad.is_empty(), "memory rows with no plain or dedicated handler: {bad:?}");
+    assert!(
+        bad.is_empty(),
+        "memory rows with no plain or dedicated handler: {bad:?}"
+    );
 }
 
 // ---- flat / generic addressing: the shared (LDS) aperture ---------------------------------------------------------
@@ -1201,11 +1398,26 @@ fn flat_access_to_the_shared_aperture_is_an_lds_access() {
     setv(&mut st, 0, &[0x100, 0x200]);
     setv(&mut st, 1, &[2, 2]);
     setv(&mut st, 2, &[0x1122_3344, 0x5566_7788]);
-    memory::execute_tracked(store_name, &store, &mut st, &mut mem, &mut lds, Some(&mut defined), Some(&mut log)).unwrap();
+    memory::execute_tracked(
+        store_name,
+        &store,
+        &mut st,
+        &mut mem,
+        &mut lds,
+        Some(&mut defined),
+        Some(&mut log),
+    )
+    .unwrap();
     assert_eq!(lds[0x108..0x10c], [0x44, 0x33, 0x22, 0x11]);
     assert_eq!(lds[0x208..0x20c], [0x88, 0x77, 0x66, 0x55]);
-    assert_eq!(mem.read(0x1000, 64).unwrap(), [0xaa; 64], "global memory untouched");
-    assert!(defined.first_unwritten(0x108, 4).is_none() && defined.first_unwritten(0x208, 4).is_none());
+    assert_eq!(
+        mem.read(0x1000, 64).unwrap(),
+        [0xaa; 64],
+        "global memory untouched"
+    );
+    assert!(
+        defined.first_unwritten(0x108, 4).is_none() && defined.first_unwritten(0x208, 4).is_none()
+    );
     let touched: Vec<(usize, usize, bool)> = log.iter().map(|t| (t.lo, t.len, t.write)).collect();
     assert_eq!(touched, vec![(0x108, 4, true), (0x208, 4, true)]);
     // ds_load sees it.
@@ -1218,12 +1430,34 @@ fn flat_access_to_the_shared_aperture_is_an_lds_access() {
     setv(&mut st, 4, &[0x208]);
     setv(&mut st, 5, &[2]);
     log.clear();
-    memory::execute_tracked(load_name, &load, &mut st, &mut mem, &mut lds, Some(&mut defined), Some(&mut log)).unwrap();
+    memory::execute_tracked(
+        load_name,
+        &load,
+        &mut st,
+        &mut mem,
+        &mut lds,
+        Some(&mut defined),
+        Some(&mut log),
+    )
+    .unwrap();
     assert_eq!(st.v[3][0], 0x5566_7788);
-    assert_eq!(log.iter().map(|t| (t.lo, t.len, t.write)).collect::<Vec<_>>(), vec![(0x208, 4, false)]);
+    assert_eq!(
+        log.iter()
+            .map(|t| (t.lo, t.len, t.write))
+            .collect::<Vec<_>>(),
+        vec![(0x208, 4, false)]
+    );
     // A flat load of LDS bytes nobody wrote is the same strict-LDS error as ds_load.
     setv(&mut st, 4, &[0x300]);
-    let strict = memory::execute_tracked(load_name, &load, &mut st, &mut mem, &mut lds, Some(&mut defined), None);
+    let strict = memory::execute_tracked(
+        load_name,
+        &load,
+        &mut st,
+        &mut mem,
+        &mut lds,
+        Some(&mut defined),
+        None,
+    );
     assert!(strict.unwrap_err().contains("never written"));
     // Out of the LDS allocation through the aperture: error. The 64-bit address {2, 0xfffffff0} is not global either.
     setv(&mut st, 4, &[0xffff_fff0]);

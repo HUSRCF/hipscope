@@ -1165,7 +1165,8 @@ pub(crate) fn relayout(
             } else {
                 INST_PREF_MAX_GFX11
             };
-            if inst_pref_field(d.compute_pgm_rsrc3, pref_max) != inst_pref_size(old_size, pref_max) {
+            if inst_pref_field(d.compute_pgm_rsrc3, pref_max) != inst_pref_size(old_size, pref_max)
+            {
                 return Err(fail(format!("kernel {} changed size but its INST_PREF_SIZE {} does not follow min(ceil(size/128), {pref_max}) = {}",
                     slot.name, inst_pref_field(d.compute_pgm_rsrc3, pref_max), inst_pref_size(old_size, pref_max))));
             }

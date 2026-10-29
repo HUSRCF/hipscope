@@ -273,7 +273,9 @@ pub(super) fn execute(_arch: Arch, name: &str, i: &Inst, s: &mut State) -> Resul
         }
     }
     match op {
-        "v_subrev_co_u32" | "v_sub_co_u32" | "v_sub_co_ci_u32" | "v_subrev_co_ci_u32" if explicit_carry => {
+        "v_subrev_co_u32" | "v_sub_co_u32" | "v_sub_co_ci_u32" | "v_subrev_co_ci_u32"
+            if explicit_carry =>
+        {
             s.put_mask(src(1)?, carry)?
         }
         "v_sub_co_ci_u32" | "v_subrev_co_ci_u32" => s.vcc = carry,

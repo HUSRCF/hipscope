@@ -17,8 +17,17 @@ use std::collections::BTreeMap;
 fn main() {
     for path in std::env::args().skip(1) {
         let bytes = std::fs::read(&path).unwrap();
-        println!("== {path} ({} bytes, sha256 {:x})", bytes.len(), Sha256::digest(&bytes));
-        let lifted = match lift_object(&bytes, Options { frontend: Frontend::Hipcc }) {
+        println!(
+            "== {path} ({} bytes, sha256 {:x})",
+            bytes.len(),
+            Sha256::digest(&bytes)
+        );
+        let lifted = match lift_object(
+            &bytes,
+            Options {
+                frontend: Frontend::Hipcc,
+            },
+        ) {
             Ok(l) => l,
             Err(e) => {
                 println!("LIFT FAIL: {e}");
@@ -27,8 +36,16 @@ fn main() {
         };
         let program = lifted.program;
         let arch = program.target.arch;
-        println!("LIFT OK: {} kernel(s), arch {arch:?}", program.kernels.len());
-        match emit::checked(&program, Options { frontend: Frontend::Hipcc }) {
+        println!(
+            "LIFT OK: {} kernel(s), arch {arch:?}",
+            program.kernels.len()
+        );
+        match emit::checked(
+            &program,
+            Options {
+                frontend: Frontend::Hipcc,
+            },
+        ) {
             Ok((out, _)) => println!("emit::checked OK, identical to input: {}", out == bytes),
             Err(e) => println!("emit::checked FAIL: {e}"),
         }
@@ -78,9 +95,14 @@ fn main() {
                     Ok(a) => {
                         let mut kinds: BTreeMap<String, usize> = BTreeMap::new();
                         for o in &a.obligations {
-                            *kinds.entry(format!("{:?}/{}", o.kind, o.rule_id)).or_default() += 1;
+                            *kinds
+                                .entry(format!("{:?}/{}", o.kind, o.rule_id))
+                                .or_default() += 1;
                         }
-                        println!("    analyze OK, {} obligations {kinds:?}", a.obligations.len());
+                        println!(
+                            "    analyze OK, {} obligations {kinds:?}",
+                            a.obligations.len()
+                        );
                     }
                     Err(e) => println!("    analyze FAIL: {e}"),
                 }

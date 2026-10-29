@@ -275,7 +275,9 @@ pub(super) fn execute(arch: Arch, name: &str, i: &Inst, s: &mut State) -> Result
         "v_writelane_b32" => writelane(i, s),
         _ if name.starts_with("v_wmma") || name.starts_with("v_swmmac") => {
             if s.lanes != 32 {
-                return Err(format!("{name}: the WMMA/SWMMAC fragment layouts are modeled for wave32 only"));
+                return Err(format!(
+                    "{name}: the WMMA/SWMMAC fragment layouts are modeled for wave32 only"
+                ));
             }
             super::wmma::execute(arch, name, i, s)
         }
@@ -444,14 +446,16 @@ fn readfirstlane(i: &Inst, s: &mut State) -> Result<()> {
 /// `v_readlane_b32 sdst, vsrc, lane`: reads the lane selected by the low five bits of the third
 /// operand whatever EXEC says.
 fn readlane(i: &Inst, s: &mut State) -> Result<()> {
-    let lane = (s.read(i.operands.get(2).ok_or("missing lane select")?, 0, 0)? as usize) & (s.lanes - 1);
+    let lane =
+        (s.read(i.operands.get(2).ok_or("missing lane select")?, 0, 0)? as usize) & (s.lanes - 1);
     let v = s.read(&i.operands[1], lane, 0)?;
     s.put(&i.operands[0], 0, 0, v)
 }
 
 /// `v_writelane_b32 vdst, ssrc, lane`: writes one lane of `vdst`, whatever EXEC says.
 fn writelane(i: &Inst, s: &mut State) -> Result<()> {
-    let lane = (s.read(i.operands.get(2).ok_or("missing lane select")?, 0, 0)? as usize) & (s.lanes - 1);
+    let lane =
+        (s.read(i.operands.get(2).ok_or("missing lane select")?, 0, 0)? as usize) & (s.lanes - 1);
     let v = s.read(&i.operands[1], 0, 0)?;
     s.put(&i.operands[0], lane, 0, v)
 }
@@ -924,7 +928,9 @@ fn vector(
         // 16-bit operand on gfx11 (OPSEL[2] picks the half of a VGPR); only the unselected-low-half form is modeled.
         "v_alignbyte_b32" => {
             if m.op_sel != 0 {
-                return Err("v_alignbyte_b32: OPSEL (16-bit source half select) is not modeled".into());
+                return Err(
+                    "v_alignbyte_b32: OPSEL (16-bit source half select) is not modeled".into(),
+                );
             }
             (
                 Class::Int,
@@ -1209,7 +1215,11 @@ fn vector(
             for (h, slot) in half.iter_mut().enumerate() {
                 let sel = if h == 0 { m.op_sel } else { m.op_sel_hi };
                 let mut w = [0u32; 3];
-                for (n, wn) in w.iter_mut().enumerate().take(if kind == "v_pk_fma_f16" { 3 } else { 2 }) {
+                for (n, wn) in
+                    w.iter_mut()
+                        .enumerate()
+                        .take(if kind == "v_pk_fma_f16" { 3 } else { 2 })
+                {
                     let word = raw(n)?;
                     let hv = (if sel >> n & 1 != 0 { word >> 16 } else { word }) as u16;
                     if hv & 0x7c00 == 0x7c00 {
@@ -1428,7 +1438,10 @@ fn vector(
         // D.i = index of the first 1 bit counting from the MSB, -1 if S0 == 0 (V_CLZ_I32_U32).
         "v_clz_i32_u32" => {
             let x = raw(0)?;
-            (Class::Int, if x == 0 { u32::MAX } else { x.leading_zeros() })
+            (
+                Class::Int,
+                if x == 0 { u32::MAX } else { x.leading_zeros() },
+            )
         }
         "v_xor3_b32" => (Class::Int, raw(0)? ^ raw(1)? ^ raw(2)?),
         // D = S1 + popcount(S0), wrapping (V_BCNT_U32_B32).
@@ -1465,7 +1478,11 @@ fn vector(
             } else {
                 a.max(b)
             };
-            let zeros: Vec<bool> = [a, b, c].iter().filter(|x| **x == 0.0).map(|x| x.is_sign_negative()).collect();
+            let zeros: Vec<bool> = [a, b, c]
+                .iter()
+                .filter(|x| **x == 0.0)
+                .map(|x| x.is_sign_negative())
+                .collect();
             if zeros.iter().any(|z| *z != zeros[0]) {
                 return Err("v_med3_f32: operand zeros of both signs: the sign of the median zero is not specified".into());
             }
@@ -1485,7 +1502,14 @@ fn vector(
             if e == 0 {
                 return Err("v_frexp_exp_i32_f32: zero/denormal input is not modeled (pseudocode and frexp() disagree)".into());
             }
-            (Class::FloatToInt, if e == 0xff { 0 } else { (e as i32 - 126) as u32 })
+            (
+                Class::FloatToInt,
+                if e == 0xff {
+                    0
+                } else {
+                    (e as i32 - 126) as u32
+                },
+            )
         }
         // D.f = S0.f for +-infinity (a NaN is refused: payload/quieting not specified), else the significand
         // mantissa(S0.f) in [0.5, 1) with the input sign: exponent field forced to 126. Zero/denormal refused as above.
@@ -1526,7 +1550,10 @@ fn vector(
             plain_16(i, d, false)?;
             let mask = s.read(o.get(3).ok_or("missing vector operand")?, lane, 0)?;
             let pick = if mask >> lane & 1 != 0 { 2 } else { 1 };
-            (Class::Own, u32::from(half_src(s, &o[pick], i, lane, pick - 1)?))
+            (
+                Class::Own,
+                u32::from(half_src(s, &o[pick], i, lane, pick - 1)?),
+            )
         }
         // D = VGPR[lane][SRC0 + M0] (RDNA3 ISA V_MOVRELS_B32): SRC0 names a VGPR, M0 is the relative offset.
         "v_movrels_b32" => {
@@ -1627,7 +1654,9 @@ fn permlane(name: &str, i: &Inst, s: &mut State) -> Result<()> {
         return Err(format!("{name}: abs/neg/omod/clamp and OPSEL[2]/OPSEL[3] are not modeled (only OPSEL[0]=FI, OPSEL[1]=BC)"));
     }
     if s.lanes != 32 {
-        return Err(format!("{name}: permlane16 rows are modeled for wave32 only"));
+        return Err(format!(
+            "{name}: permlane16 rows are modeled for wave32 only"
+        ));
     }
     let sel = u64::from(s.read(&o[2], 0, 0)?) | (u64::from(s.read(&o[3], 0, 0)?) << 32);
     let cross = name == "v_permlanex16_b32";
@@ -2338,7 +2367,10 @@ fn scalar(name: &str, i: &Inst, s: &mut State) -> Result<()> {
     }
     // SOP1 64-bit saveexec family: D = EXEC; EXEC = S0 op EXEC (`and_not1`: S0 & ~EXEC); SCC = EXEC != 0.
     // S0 is captured first because native divergence masks alias the saved destination.
-    if matches!(name, "s_and_saveexec_b64" | "s_or_saveexec_b64" | "s_and_not1_saveexec_b64") {
+    if matches!(
+        name,
+        "s_and_saveexec_b64" | "s_or_saveexec_b64" | "s_and_not1_saveexec_b64"
+    ) {
         let mask = s.read_wide(o.get(1).ok_or("missing scalar operand")?, 0, Wide::Unsigned)?;
         let old = s.exec;
         s.put_wide(o.first().ok_or("missing scalar operand")?, 0, old)?;
@@ -5505,7 +5537,7 @@ mod tests {
     ) -> Result<(u32, u32, u32)> {
         let i = insn_on(arch, name, ops);
         let mut st = state();
-        st.exec = (1u64 << lanes.len()).wrapping_sub(1) ;
+        st.exec = (1u64 << lanes.len()).wrapping_sub(1);
         st.s[10] = u32::MAX;
         st.vcc = 0xffff_ffff;
         for (lane, (a, b)) in lanes.iter().enumerate() {

@@ -154,7 +154,10 @@ pub(super) fn build_step_hw(arch: Arch, wave: Wave, step: &Step, reads_at_issue:
     // an explicit operand takes that operand's real width (`wave` decides it: one SGPR in wave32, a pair in wave64), or `v_add_co_u32 v, s1, ...` would "write" s2 as well.
     let exact: Vec<RegRef> = (0..inst.operands.len()).filter_map(operand_reg).collect();
     let fit = |r: &RegRef| -> RegRef {
-        match exact.iter().find(|e| e.kind == r.kind && e.base == r.base && e.len < r.len) {
+        match exact
+            .iter()
+            .find(|e| e.kind == r.kind && e.base == r.base && e.len < r.len)
+        {
             Some(e) => *e,
             None => *r,
         }
@@ -167,20 +170,21 @@ pub(super) fn build_step_hw(arch: Arch, wave: Wave, step: &Step, reads_at_issue:
         .chain(uses.iter())
         .flat_map(|r| (0..u16::from(r.len)).map(move |w| (r.kind, r.base + w)))
         .collect();
-    let mut add = |key: (Kind, u16), read: bool, write: bool| {
-        match touch.iter_mut().find(|t| (t.kind, t.dword) == key) {
-            Some(t) => {
-                t.read |= read;
-                t.write |= write;
-            }
-            None => touch.push(Touch {
-                kind: key.0,
-                dword: key.1,
-                mask: mask_of(key),
-                read,
-                write,
-            }),
+    let mut add = |key: (Kind, u16), read: bool, write: bool| match touch
+        .iter_mut()
+        .find(|t| (t.kind, t.dword) == key)
+    {
+        Some(t) => {
+            t.read |= read;
+            t.write |= write;
         }
+        None => touch.push(Touch {
+            kind: key.0,
+            dword: key.1,
+            mask: mask_of(key),
+            read,
+            write,
+        }),
     };
     for reg in &defs {
         for w in 0..u16::from(reg.len) {
@@ -227,8 +231,7 @@ pub(super) fn build_step_hw(arch: Arch, wave: Wave, step: &Step, reads_at_issue:
             // gdn_chunk_scan, gdn_chunk_kkt_solve, attention_fp8_e4m3_fa2_gqa_qresident_gfx1201,
             // gemm_mq4g256v2_residual_mmq_iu4_gfx12_symfold, sample_top_p_parallel: 6 of 38 objects of the pristine
             // kernel cache) contain exactly that pattern and run correctly.
-            locks: if load || m.src_read != SrcRead::Deferred || reads_at_issue
-            {
+            locks: if load || m.src_read != SrcRead::Deferred || reads_at_issue {
                 Vec::new()
             } else {
                 eff.uses
@@ -372,7 +375,8 @@ impl WaveHw {
             if matches!(counter, Counter::Km | Counter::Store | Counter::Vs) {
                 return;
             }
-            let live = |p: &&Pending| p.counters.contains(counter) && !p.satisfied.contains(counter);
+            let live =
+                |p: &&Pending| p.counters.contains(counter) && !p.satisfied.contains(counter);
             if counter == Counter::Lgkm
                 && self.pending.iter().filter(live).any(|p| {
                     !matches!(
@@ -417,7 +421,10 @@ impl WaveHw {
         }
         // `done` is youngest-first: remove from the back (indices stay valid), then apply oldest-first so
         // back-to-back loads of one register land in issue order.
-        let mut finished: Vec<Pending> = done.into_iter().map(|pos| self.pending.remove(pos)).collect();
+        let mut finished: Vec<Pending> = done
+            .into_iter()
+            .map(|pos| self.pending.remove(pos))
+            .collect();
         finished.reverse();
         for p in finished {
             self.complete(st, p);
@@ -540,7 +547,10 @@ impl<'a> Emulator<'a> {
         let arch = self.decode_arch;
         let hipcc = matches!(
             self.kernel.origin,
-            crate::inst::KernelOrigin::Frontend { kind: crate::inst::Frontend::Hipcc, .. }
+            crate::inst::KernelOrigin::Frontend {
+                kind: crate::inst::Frontend::Hipcc,
+                ..
+            }
         );
         let reads_at_issue =
             !strict_store_sources && (hipcc || matches!(arch, Arch::Gfx1100 | Arch::Gfx1151));
@@ -640,7 +650,12 @@ impl<'a> Emulator<'a> {
         }
         let nw = n.div_ceil(kernel.wave.lanes());
         let states = (0..nw)
-            .map(|w| State::new(self.arch, kernel, launch, w).map(|mut s| { s.nan_loose = self.nan_loose; s }))
+            .map(|w| {
+                State::new(self.arch, kernel, launch, w).map(|mut s| {
+                    s.nan_loose = self.nan_loose;
+                    s
+                })
+            })
             .collect::<Result<Vec<_>>>()?;
         let lds_len = d
             .group_segment_fixed_size
@@ -661,7 +676,8 @@ impl<'a> Emulator<'a> {
             _ => 1,
         };
         while ctx.states.iter().any(|s| !s.ended) {
-            let runnable = |ctx: &Ctx, i: usize| !ctx.states[i].ended && ctx.states[i].barrier.is_none();
+            let runnable =
+                |ctx: &Ctx, i: usize| !ctx.states[i].ended && ctx.states[i].barrier.is_none();
             let round_robin = |ctx: &Ctx, cursor: usize| {
                 (1..=nw)
                     .map(|k| (cursor + k) % nw)
@@ -718,7 +734,13 @@ impl<'a> Emulator<'a> {
         Ok(ctx.executed)
     }
 
-    fn exec_one(&self, launch: &Launch, mem: &mut Memory, ctx: &mut Ctx, wave: usize) -> Result<()> {
+    fn exec_one(
+        &self,
+        launch: &Launch,
+        mem: &mut Memory,
+        ctx: &mut Ctx,
+        wave: usize,
+    ) -> Result<()> {
         let pc = ctx.states[wave].pc;
         let step = self.steps.get(pc).ok_or("PC ran past kernel end")?;
         ctx.states[wave].pc += 1;
@@ -741,7 +763,14 @@ impl<'a> Emulator<'a> {
         self.steps.get(pc).map_or("?", |s| s.name)
     }
 
-    fn exec_inner(&self, mem: &mut Memory, ctx: &mut Ctx, wave: usize, pc: usize, step: &Step) -> Result<()> {
+    fn exec_inner(
+        &self,
+        mem: &mut Memory,
+        ctx: &mut Ctx,
+        wave: usize,
+        pc: usize,
+        step: &Step,
+    ) -> Result<()> {
         let shw = &self.hw.as_ref().expect("hw model")[pc];
         let inst = step.inst;
         let name = step.name;
@@ -843,7 +872,11 @@ impl<'a> Emulator<'a> {
         if let Some(m) = shw.mem.as_ref().filter(|m| m.load) {
             for r in &m.def_regs {
                 for w in 0..u16::from(r.len) {
-                    snap.push((r.kind, r.base + w, read_dword(&states[wave], r.kind, r.base + w)));
+                    snap.push((
+                        r.kind,
+                        r.base + w,
+                        read_dword(&states[wave], r.kind, r.base + w),
+                    ));
                 }
             }
         }
@@ -997,7 +1030,12 @@ mod tests {
     use super::*;
 
     fn touch(write: bool, atomic: bool) -> LdsTouch {
-        LdsTouch { lo: 0, len: 4, write, atomic }
+        LdsTouch {
+            lo: 0,
+            len: 4,
+            write,
+            atomic,
+        }
     }
     /// Nothing is ordered: every cross-wave pair is a race unless exempt.
     fn unordered(_: usize, _: u32) -> std::result::Result<(), &'static str> {

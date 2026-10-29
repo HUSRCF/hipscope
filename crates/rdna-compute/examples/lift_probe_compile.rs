@@ -22,7 +22,11 @@ const QSA_SRC: &str = concat!(
 );
 
 fn main() {
-    let out = PathBuf::from(std::env::args().nth(1).expect("usage: lift_probe_compile OUT_DIR"));
+    let out = PathBuf::from(
+        std::env::args()
+            .nth(1)
+            .expect("usage: lift_probe_compile OUT_DIR"),
+    );
     std::fs::create_dir_all(&out).unwrap();
     let work = out.join("kernel-cache");
     std::fs::create_dir_all(&work).unwrap();

@@ -122,9 +122,9 @@ impl QsaHg4 {
             Some("late") => ("late".to_owned(), 21 * TILE_ROWS),
             Some("emu") => ("emu".to_owned(), EMU_POSITION),
             Some(n) => {
-                let p = n
-                    .parse::<usize>()
-                    .map_err(|e| format!("--shape pos={n}: expected mid|late|emu|<position_start>: {e}"))?;
+                let p = n.parse::<usize>().map_err(|e| {
+                    format!("--shape pos={n}: expected mid|late|emu|<position_start>: {e}")
+                })?;
                 (format!("p{p}"), p)
             }
         };
@@ -137,7 +137,10 @@ impl QsaHg4 {
         // The emulator gate maps the K/V cache exactly: no tokens past the last visible one.
         let full_capacity = if cap != 0 {
             if cap < position_start + rows {
-                return Err(format!("--shape cap={cap} is below position_start + rows = {}", position_start + rows));
+                return Err(format!(
+                    "--shape cap={cap} is below position_start + rows = {}",
+                    position_start + rows
+                ));
             }
             cap
         } else if emu {
@@ -145,7 +148,13 @@ impl QsaHg4 {
         } else {
             (position_start + rows).max(FN_TOKENS)
         };
-        Ok(Self { label, rows, position_start, full_capacity, dev: None })
+        Ok(Self {
+            label,
+            rows,
+            position_start,
+            full_capacity,
+            dev: None,
+        })
     }
 
     fn end_position(&self) -> usize {
@@ -158,7 +167,9 @@ impl QsaHg4 {
 
     /// Sum over rows of the selected length.
     fn total_selected(&self) -> u64 {
-        (0..self.rows).map(|r| selected_len(self.position_start, r) as u64).sum()
+        (0..self.rows)
+            .map(|r| selected_len(self.position_start, r) as u64)
+            .sum()
     }
 }
 
@@ -214,10 +225,16 @@ impl Node for QsaHg4 {
             return Err(format!("hip_loop header block={block} outside 1..=1024"));
         }
         if lds > LDS_LIMIT {
-            return Err(format!("hip_loop header lds_dynamic={lds} exceeds {LDS_LIMIT}"));
+            return Err(format!(
+                "hip_loop header lds_dynamic={lds} exceeds {LDS_LIMIT}"
+            ));
         }
         let g = Geometry {
-            grid: [(N_HEADS / heads_per_wg) as u32, 1, (self.rows / rows_per_wg) as u32],
+            grid: [
+                (N_HEADS / heads_per_wg) as u32,
+                1,
+                (self.rows / rows_per_wg) as u32,
+            ],
             block: [block as u32, 1, 1],
             lds: lds as u32,
         };
@@ -262,16 +279,23 @@ impl Node for QsaHg4 {
     fn extent_shapes(&self) -> Vec<String> {
         // Judge shapes at the FN capacity (16896 tokens), then the K/V capacity at max_seq scale: the
         // late window of a 262144-token cache, and a 16-row window at its far end (cache populated to 261016).
-        ["pos=mid", "pos=late", "pos=late,cap=262144", "pos=261000,rows=16,cap=262144"]
-            .iter()
-            .map(|s| (*s).to_owned())
-            .collect()
+        [
+            "pos=mid",
+            "pos=late",
+            "pos=late,cap=262144",
+            "pos=261000,rows=16,cap=262144",
+        ]
+        .iter()
+        .map(|s| (*s).to_owned())
+        .collect()
     }
     fn out_owner<'a>(&'a self, hdr: &Header) -> Result<Box<dyn Fn(usize) -> [u32; 3] + 'a>> {
         // out is f32 [rows][n_heads][head_dim]; the workgroup is (head group, 0, row group).
         let get = |k: &str, d: usize| -> Result<usize> {
             match hdr.kv.get(k) {
-                Some(v) => v.parse::<usize>().map_err(|e| format!("hip_loop header {k}={v}: {e}")),
+                Some(v) => v
+                    .parse::<usize>()
+                    .map_err(|e| format!("hip_loop header {k}={v}: {e}")),
                 None => Ok(d),
             }
         };
@@ -286,9 +310,20 @@ impl Node for QsaHg4 {
     }
     fn emu_case(&self, seed: u64) -> Result<EmuCase> {
         let inputs = generate(self.rows, self.position_start, self.full_capacity, seed);
-        validate_selection(&inputs.sel, self.rows, self.position_start, self.full_capacity)?;
+        validate_selection(
+            &inputs.sel,
+            self.rows,
+            self.position_start,
+            self.full_capacity,
+        )?;
         let out_bytes = self.rows * OUT_ROW_FLOATS * 4;
-        let mut args = vec![EmuArg::Buf(0), EmuArg::Buf(1), EmuArg::Buf(2), EmuArg::Buf(3), EmuArg::Buf(4)];
+        let mut args = vec![
+            EmuArg::Buf(0),
+            EmuArg::Buf(1),
+            EmuArg::Buf(2),
+            EmuArg::Buf(3),
+            EmuArg::Buf(4),
+        ];
         for v in [
             self.rows,
             self.position_start,
@@ -304,12 +339,27 @@ impl Node for QsaHg4 {
         }
         Ok(EmuCase {
             bufs: vec![
-                EmuBuf { name: "q", bytes: inputs.q },
-                EmuBuf { name: "k", bytes: inputs.k },
-                EmuBuf { name: "v", bytes: inputs.v },
-                EmuBuf { name: "sel", bytes: bytemuck_i32(&inputs.sel).to_vec() },
+                EmuBuf {
+                    name: "q",
+                    bytes: inputs.q,
+                },
+                EmuBuf {
+                    name: "k",
+                    bytes: inputs.k,
+                },
+                EmuBuf {
+                    name: "v",
+                    bytes: inputs.v,
+                },
+                EmuBuf {
+                    name: "sel",
+                    bytes: bytemuck_i32(&inputs.sel).to_vec(),
+                },
                 // NaN-filled like the card's pristine output.
-                EmuBuf { name: "out", bytes: vec![0xFFu8; out_bytes] },
+                EmuBuf {
+                    name: "out",
+                    bytes: vec![0xFFu8; out_bytes],
+                },
             ],
             args,
             out: 4,
@@ -324,7 +374,12 @@ impl Node for QsaHg4 {
             return Err("qsa_hg4: LDS over the device limit".into());
         }
         let inputs = generate(self.rows, self.position_start, self.full_capacity, seed);
-        validate_selection(&inputs.sel, self.rows, self.position_start, self.full_capacity)?;
+        validate_selection(
+            &inputs.sel,
+            self.rows,
+            self.position_start,
+            self.full_capacity,
+        )?;
         let q = Buf::from_bytes(gpu, &inputs.q)?;
         let k = Buf::from_bytes(gpu, &inputs.k)?;
         let v = Buf::from_bytes(gpu, &inputs.v)?;
@@ -335,7 +390,14 @@ impl Node for QsaHg4 {
         // as a byte difference only if the other arm wrote it.
         let pristine = Buf::from_bytes(gpu, &vec![0xFFu8; out_bytes])?;
         out.copy_from(gpu, &pristine)?;
-        self.dev = Some(Dev { q, k, v, sel, out, pristine });
+        self.dev = Some(Dev {
+            q,
+            k,
+            v,
+            sel,
+            out,
+            pristine,
+        });
         Ok(())
     }
 
@@ -365,7 +427,11 @@ impl Node for QsaHg4 {
     }
 
     fn read_output(&self, gpu: &Gpu) -> Result<Vec<u8>> {
-        self.dev.as_ref().ok_or("qsa_hg4: read before setup")?.out.download(gpu)
+        self.dev
+            .as_ref()
+            .ok_or("qsa_hg4: read before setup")?
+            .out
+            .download(gpu)
     }
 
     fn teardown(&mut self, gpu: &Gpu) {
@@ -479,7 +545,9 @@ pub fn validate_selection(
         for (i, &t) in row.iter().enumerate() {
             if i >= sl {
                 if t != -1 {
-                    return Err(format!("row {r} slot {i}: expected -1 past selected_len {sl}"));
+                    return Err(format!(
+                        "row {r} slot {i}: expected -1 past selected_len {sl}"
+                    ));
                 }
                 continue;
             }
@@ -493,7 +561,9 @@ pub fn validate_selection(
             if i < chosen * COMPRESS {
                 let base = row[i - i % COMPRESS];
                 if base as usize % COMPRESS != 0 || t != base + (i % COMPRESS) as i32 {
-                    return Err(format!("row {r} slot {i}: not a whole {COMPRESS}-token block"));
+                    return Err(format!(
+                        "row {r} slot {i}: not a whole {COMPRESS}-token block"
+                    ));
                 }
             } else if t as usize != block_count * COMPRESS + (i - chosen * COMPRESS) {
                 return Err(format!("row {r} slot {i}: tail token {t} out of order"));
@@ -540,14 +610,19 @@ mod tests {
             "const QSA_ATTENTION_DYNAMIC_LDS_LIMIT_BYTES: usize = 64 * 1024;",
             "\"indexed_attention_attention_q8_batched_hg4\",",
         ] {
-            assert!(ops.contains(needle), "tensor_ops.rs no longer contains `{needle}`");
+            assert!(
+                ops.contains(needle),
+                "tensor_ops.rs no longer contains `{needle}`"
+            );
         }
         assert!(SRC.contains("indexed_attention_attention_##TAG##_batched_hg4"));
         assert!(SRC.contains("QSA_ATTENTION_KERNELS(q8, QSA_KV_Q8, unsigned char)"));
         let cfg = include_str!("../../../hipfire-arch-qwen4/src/config.rs");
         assert!(cfg.contains("self.indexer_budget + self.indexer_compress_ratio.saturating_sub(1)"));
         assert!(cfg.contains("expect(self.indexer_budget, 2048, \"indexer_budget\")?;"));
-        assert!(cfg.contains("expect(self.indexer_compress_ratio, 4, \"indexer_compress_ratio\")?;"));
+        assert!(
+            cfg.contains("expect(self.indexer_compress_ratio, 4, \"indexer_compress_ratio\")?;")
+        );
     }
 
     #[test]
@@ -621,7 +696,10 @@ mod tests {
     fn selection_is_score_rank_not_sorted_and_corruption_is_caught() {
         let mut inp = generate(2, 8448, FN_TOKENS, 3);
         let row = &inp.sel[..CAPACITY];
-        assert!(row[..2048].windows(2).any(|w| w[1] < w[0]), "rank order, not ascending");
+        assert!(
+            row[..2048].windows(2).any(|w| w[1] < w[0]),
+            "rank order, not ascending"
+        );
         inp.sel[5] = 1 << 30;
         assert!(validate_selection(&inp.sel, 2, 8448, FN_TOKENS).is_err());
         let mut inp = generate(2, 8448, FN_TOKENS, 3);

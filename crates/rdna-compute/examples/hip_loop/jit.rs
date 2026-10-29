@@ -51,7 +51,10 @@ impl Built {
 /// the device runtime keeps its normal cache. Call before the first compile, before
 /// other threads start.
 pub fn isolate_caches(workdir: &Path) -> Result<()> {
-    for (var, sub) in [("HIPFIRE_KERNEL_CACHE", "kernel-cache"), ("HIPFIRE_HOME", "home")] {
+    for (var, sub) in [
+        ("HIPFIRE_KERNEL_CACHE", "kernel-cache"),
+        ("HIPFIRE_HOME", "home"),
+    ] {
         if std::env::var_os(var).is_none() {
             let dir = workdir.join(sub);
             std::fs::create_dir_all(&dir).map_err(err)?;
@@ -68,7 +71,13 @@ pub fn compile(workdir: &Path, tag: &str, inc: &Incumbent, source: &str) -> Resu
 }
 
 /// [`compile`] for `arch` (the node's own arch).
-pub fn compile_for(arch: &str, workdir: &Path, tag: &str, inc: &Incumbent, source: &str) -> Result<Built> {
+pub fn compile_for(
+    arch: &str,
+    workdir: &Path,
+    tag: &str,
+    inc: &Incumbent,
+    source: &str,
+) -> Result<Built> {
     let dir = workdir.join(tag);
     std::fs::create_dir_all(&dir).map_err(err)?;
     let src = dir.join(format!("{}.hip", inc.module));
@@ -96,16 +105,16 @@ pub fn compile_for(arch: &str, workdir: &Path, tag: &str, inc: &Incumbent, sourc
 
 /// Compile the baseline and candidate sources concurrently (independent
 /// compiler instances, separate directories).
-pub fn compile_pair(
-    workdir: &Path,
-    inc: &Incumbent,
-    cand_source: &str,
-) -> Result<(Built, Built)> {
+pub fn compile_pair(workdir: &Path, inc: &Incumbent, cand_source: &str) -> Result<(Built, Built)> {
     std::thread::scope(|s| {
         let b = s.spawn(|| compile(workdir, "baseline", inc, &inc.source));
         let c = s.spawn(|| compile(workdir, "candidate", inc, cand_source));
-        let b = b.join().map_err(|_| "baseline compile thread panicked".to_owned())?;
-        let c = c.join().map_err(|_| "candidate compile thread panicked".to_owned())?;
+        let b = b
+            .join()
+            .map_err(|_| "baseline compile thread panicked".to_owned())?;
+        let c = c
+            .join()
+            .map_err(|_| "candidate compile thread panicked".to_owned())?;
         Ok((b?, c?))
     })
 }
@@ -126,7 +135,8 @@ pub fn from_object_for(arch: &str, tag: &str, path: &Path) -> Result<Built> {
     if image.is_empty() {
         return Err(format!("{tag}: {} is empty", path.display()));
     }
-    let kernels = elf::kernels(&image, arch).map_err(|e| format!("{tag}: {}: {e}", path.display()))?;
+    let kernels =
+        elf::kernels(&image, arch).map_err(|e| format!("{tag}: {}: {e}", path.display()))?;
     Ok(Built {
         tag: tag.to_owned(),
         image_sha256: elf::sha256_hex(&image),

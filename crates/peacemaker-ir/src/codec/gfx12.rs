@@ -689,9 +689,8 @@ fn fields_from(
             continue;
         }
         let (wi, raw) = match rule.name {
-            "w0_extra" | "smem_len" | "wait_unused" | "vbuffer_tfe" | "vbuffer_nv" | "global_nv" => {
-                (0, words[0] & rule.mask)
-            }
+            "w0_extra" | "smem_len" | "wait_unused" | "vbuffer_tfe" | "vbuffer_nv"
+            | "global_nv" => (0, words[0] & rule.mask),
             "w1_extra" | "vsrc_unused" | "vbuffer_format" | "vbuffer_offen" | "vbuffer_idxen"
             | "vbuffer_scope" | "vbuffer_th" | "global_sve" | "global_scope" | "global_th"
             | "dpp_fi" => (1, words[1] & rule.mask),
@@ -1373,9 +1372,8 @@ pub fn encode_for(arch: Arch, inst: &Inst) -> Result<SmallVec<[u32; 3]>, DecodeE
             match field.name {
                 "src2_unused" => encode_field(arch, "SRC2", row, &mut words, field.value)?,
                 "src1_unused" => encode_field(arch, "SRC1", row, &mut words, field.value)?,
-                "w0_extra" | "smem_len" | "wait_unused" | "vbuffer_tfe" | "vbuffer_nv" | "global_nv" => {
-                    words[0] |= field.value
-                }
+                "w0_extra" | "smem_len" | "wait_unused" | "vbuffer_tfe" | "vbuffer_nv"
+                | "global_nv" => words[0] |= field.value,
                 "w1_extra" | "vsrc_unused" | "vbuffer_format" | "vbuffer_offen"
                 | "vbuffer_idxen" | "vbuffer_scope" | "vbuffer_th" | "global_sve"
                 | "global_scope" | "global_th" | "dpp_fi" => words[1] |= field.value,

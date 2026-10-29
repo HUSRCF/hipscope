@@ -181,8 +181,11 @@ pub trait Node {
         // SAFETY: `kernarg` packs the kernel's declared explicit arguments per the
         // production launcher and every pointer addresses a live allocation owned
         // by the node (allocated in `setup`).
-        unsafe { gpu.hip.launch_kernel_blob(f, g.grid, g.block, g.lds, None, karg) }
-            .map_err(err)
+        unsafe {
+            gpu.hip
+                .launch_kernel_blob(f, g.grid, g.block, g.lds, None, karg)
+        }
+        .map_err(err)
     }
     /// The output bytes the identity gate compares (after a `reset` + `dispatch`
     /// + device sync).
@@ -246,7 +249,12 @@ pub struct ShapeSpec {
 impl ShapeSpec {
     pub fn parse(s: Option<&str>) -> Result<Self> {
         let mut out = Self::default();
-        for item in s.unwrap_or("").split(',').map(str::trim).filter(|i| !i.is_empty()) {
+        for item in s
+            .unwrap_or("")
+            .split(',')
+            .map(str::trim)
+            .filter(|i| !i.is_empty())
+        {
             match item.split_once('=') {
                 Some((k, v)) => {
                     let (k, v) = (k.trim(), v.trim());
@@ -338,7 +346,11 @@ impl Buf {
     }
     pub fn upload(&self, gpu: &Gpu, data: &[u8]) -> Result<()> {
         if data.len() > self.bytes {
-            return Err(format!("upload of {} B into a {} B buffer", data.len(), self.bytes));
+            return Err(format!(
+                "upload of {} B into a {} B buffer",
+                data.len(),
+                self.bytes
+            ));
         }
         gpu.hip.memcpy_htod(&self.buf, data).map_err(err)
     }
@@ -458,7 +470,10 @@ impl Header {
             return Ok(());
         }
         let keys: Vec<&str> = self.kv.keys().map(String::as_str).collect();
-        Err(format!("hip_loop header: unknown key(s) {}", keys.join(", ")))
+        Err(format!(
+            "hip_loop header: unknown key(s) {}",
+            keys.join(", ")
+        ))
     }
 }
 
@@ -491,13 +506,19 @@ pub fn tiled_geometry(
     let lds = hdr.take_usize("lds_dynamic", 0)?;
     hdr.no_leftover()?;
     if tile_m == 0 || tile_n == 0 {
-        return Err(format!("hip_loop header: tile_m={tile_m} tile_n={tile_n} must be positive"));
+        return Err(format!(
+            "hip_loop header: tile_m={tile_m} tile_n={tile_n} must be positive"
+        ));
     }
     if block == 0 || block % 32 != 0 || block > 1024 {
-        return Err(format!("hip_loop header: block={block} must be a multiple of 32 in 32..=1024"));
+        return Err(format!(
+            "hip_loop header: block={block} must be a multiple of 32 in 32..=1024"
+        ));
     }
     if lds > 64 * 1024 {
-        return Err(format!("hip_loop header: lds_dynamic={lds} exceeds the 64 KiB workgroup LDS"));
+        return Err(format!(
+            "hip_loop header: lds_dynamic={lds} exceeds the 64 KiB workgroup LDS"
+        ));
     }
     let (gx, gy) = (m.div_ceil(tile_m), n.div_ceil(tile_n));
     if gx * tile_m < m || gy * tile_n < n {
@@ -518,7 +539,9 @@ pub fn tiled_geometry(
 pub fn header_tiles(hdr: &Header, def_tile_m: usize, def_tile_n: usize) -> Result<(usize, usize)> {
     let get = |k: &str, d: usize| -> Result<usize> {
         match hdr.kv.get(k) {
-            Some(v) => v.parse::<usize>().map_err(|e| format!("hip_loop header {k}={v}: {e}")),
+            Some(v) => v
+                .parse::<usize>()
+                .map_err(|e| format!("hip_loop header {k}={v}: {e}")),
             None => Ok(d),
         }
     };

@@ -348,14 +348,27 @@ fn resolve_delay(
     if pos + 1 >= end || pos + 1 + fwd >= end {
         let last = pos + 1 + fwd;
         if body.layout.get(last).is_none() {
-            return if lenient { Ok(ambiguous) } else { Err(WindowError::DelayCrossesLeader { index: pos }) };
+            return if lenient {
+                Ok(ambiguous)
+            } else {
+                Err(WindowError::DelayCrossesLeader { index: pos })
+            };
         }
         let mut b = block.0;
         while body.blocks[b].range.1 <= last {
             let fall = body.blocks[b].term == Terminator::FallThrough;
             let next = b + 1;
-            if !fall || body.blocks.get(next).is_none_or(|n| n.range.0 != body.blocks[b].range.1) {
-                return if lenient { Ok(ambiguous) } else { Err(WindowError::DelayCrossesLeader { index: pos }) };
+            if !fall
+                || body
+                    .blocks
+                    .get(next)
+                    .is_none_or(|n| n.range.0 != body.blocks[b].range.1)
+            {
+                return if lenient {
+                    Ok(ambiguous)
+                } else {
+                    Err(WindowError::DelayCrossesLeader { index: pos })
+                };
             }
             b = next;
         }
@@ -609,9 +622,18 @@ mod tests {
     fn hipcc_delay_skip_over_a_branch_is_accepted_as_ambiguous() {
         // Same shape as `delay_skip_over_a_branch_rejects`: hipcc emits such hints (consumer in the fall-through
         // block of a conditional branch); the lenient check keeps them as ambiguous, performance-only facts.
-        let mut body = body_of(vec![delay_hint(1, 2, 1), valu(), branch_to(1), valu(), endpgm()]);
+        let mut body = body_of(vec![
+            delay_hint(1, 2, 1),
+            valu(),
+            branch_to(1),
+            valu(),
+            endpgm(),
+        ]);
         build_blocks(&mut body, crate::inst::Arch::Gfx1201).unwrap();
-        assert_eq!(check_windows(&body), Err(WindowError::DelayCrossesLeader { index: 0 }));
+        assert_eq!(
+            check_windows(&body),
+            Err(WindowError::DelayCrossesLeader { index: 0 })
+        );
         let facts = check_windows_with(&body, true).unwrap();
         assert_eq!(facts.delays.len(), 1);
         assert!(facts.delays[0].is_ambiguous());

@@ -68,16 +68,44 @@ struct Data {
     act: Act,
 }
 const DATA_MODES: [(&str, Data); 4] = [
-    ("random", Data { hdr: Hdr::Random, act: Act::Random }),
-    ("wild-mixed", Data { hdr: Hdr::WildMixed, act: Act::Random }),
-    ("wild-all", Data { hdr: Hdr::WildAll, act: Act::Random }),
-    ("special-x", Data { hdr: Hdr::Random, act: Act::Special }),
+    (
+        "random",
+        Data {
+            hdr: Hdr::Random,
+            act: Act::Random,
+        },
+    ),
+    (
+        "wild-mixed",
+        Data {
+            hdr: Hdr::WildMixed,
+            act: Act::Random,
+        },
+    ),
+    (
+        "wild-all",
+        Data {
+            hdr: Hdr::WildAll,
+            act: Act::Random,
+        },
+    ),
+    (
+        "special-x",
+        Data {
+            hdr: Hdr::Random,
+            act: Act::Special,
+        },
+    ),
 ];
 
 fn half_bits(rng: &mut Rng, mode: Hdr, zp: bool) -> u16 {
     let finite = |rng: &mut Rng| -> u16 {
         // exponent field 6..=15 (2^-9..2^0) for scales, 10..=17 for zero points
-        let e = if zp { 10 + rng.below(8) } else { 6 + rng.below(10) } as u16;
+        let e = if zp {
+            10 + rng.below(8)
+        } else {
+            6 + rng.below(10)
+        } as u16;
         (((rng.below(2) as u16) << 15) | (e << 10)) | rng.below(1024) as u16
     };
     match mode {
@@ -133,16 +161,23 @@ fn f32_bytes(v: &[f32]) -> Vec<u8> {
     v.iter().flat_map(|x| x.to_le_bytes()).collect()
 }
 fn words(b: &[u8]) -> Vec<u32> {
-    b.chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect()
+    b.chunks_exact(4)
+        .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+        .collect()
 }
 
 // ---------------------------------------------------------------------------------------------------------------
 // objects, buffers, launches
 // ---------------------------------------------------------------------------------------------------------------
 fn lift(bytes: &[u8]) -> Res<Program> {
-    peacemaker_lift::lift_object(bytes, peacemaker_lift::Options { frontend: Frontend::Hipcc })
-        .map(|l| l.program)
-        .map_err(|e| format!("lift refused the object: {e}"))
+    peacemaker_lift::lift_object(
+        bytes,
+        peacemaker_lift::Options {
+            frontend: Frontend::Hipcc,
+        },
+    )
+    .map(|l| l.program)
+    .map_err(|e| format!("lift refused the object: {e}"))
 }
 fn load_program(path: &str) -> Res<(Vec<u8>, Program)> {
     let image = std::fs::read(path).map_err(|e| format!("{path}: {e}"))?;
@@ -190,14 +225,24 @@ fn map_job(job: &Job) -> Res<Mapped> {
         .iter()
         .find(|k| k.symbol.0 == job.symbol)
         .ok_or_else(|| format!("no kernel {}", job.symbol))?;
-    let Abi::Hsa { descriptor, metadata } = &kernel.abi else {
+    let Abi::Hsa {
+        descriptor,
+        metadata,
+    } = &kernel.abi
+    else {
         return Err("not an HSA kernel".into());
     };
     let mut mem = Memory::default();
     let mut bases = Vec::new();
     for b in &job.bufs {
-        let init = if b.undef { vec![0xA5u8; b.bytes.len()] } else { b.bytes.clone() };
-        let base = mem.map_guarded(b.name.clone(), init, GUARD).map_err(|e| format!("map {}: {e}", b.name))?;
+        let init = if b.undef {
+            vec![0xA5u8; b.bytes.len()]
+        } else {
+            b.bytes.clone()
+        };
+        let base = mem
+            .map_guarded(b.name.clone(), init, GUARD)
+            .map_err(|e| format!("map {}: {e}", b.name))?;
         if b.undef {
             mem.set_strict_read(&b.name)?;
         }
@@ -212,23 +257,54 @@ fn map_job(job: &Job) -> Res<Mapped> {
             ArgSrc::I32(v) => KArg::I32(*v),
         })
         .collect();
-    let explicit: Vec<_> = metadata.parsed.args.iter().filter(|a| !a.value_kind.starts_with("hidden_")).collect();
+    let explicit: Vec<_> = metadata
+        .parsed
+        .args
+        .iter()
+        .filter(|a| !a.value_kind.starts_with("hidden_"))
+        .collect();
     if explicit.len() != vals.len() {
-        return Err(format!("object declares {} explicit args, job passes {}", explicit.len(), vals.len()));
+        return Err(format!(
+            "object declares {} explicit args, job passes {}",
+            explicit.len(),
+            vals.len()
+        ));
     }
-    let end = metadata.parsed.args.iter().map(|a| (a.offset + a.size) as usize).max().unwrap_or(0);
-    let mut kern = vec![0u8; (metadata.parsed.kernarg_segment_size.max(descriptor.kernarg_size) as usize).max(end)];
+    let end = metadata
+        .parsed
+        .args
+        .iter()
+        .map(|a| (a.offset + a.size) as usize)
+        .max()
+        .unwrap_or(0);
+    let mut kern = vec![
+        0u8;
+        (metadata
+            .parsed
+            .kernarg_segment_size
+            .max(descriptor.kernarg_size) as usize)
+            .max(end)
+    ];
     for (m, v) in explicit.iter().zip(&vals) {
         let bytes: Vec<u8> = match v {
             KArg::Ptr(p) => p.to_le_bytes().to_vec(),
             KArg::I32(x) => x.to_le_bytes().to_vec(),
         };
         if bytes.len() != m.size as usize {
-            return Err(format!("explicit arg is {} B in the object, {} B passed", m.size, bytes.len()));
+            return Err(format!(
+                "explicit arg is {} B in the object, {} B passed",
+                m.size,
+                bytes.len()
+            ));
         }
         kern[m.offset as usize..m.offset as usize + bytes.len()].copy_from_slice(&bytes);
     }
-    for a in metadata.parsed.args.iter().filter(|a| a.value_kind.starts_with("hidden_")) {
+    for a in metadata
+        .parsed
+        .args
+        .iter()
+        .filter(|a| a.value_kind.starts_with("hidden_"))
+    {
         let v: u64 = match a.value_kind.as_str() {
             "hidden_block_count_x" => u64::from(job.grid),
             "hidden_block_count_y" | "hidden_block_count_z" => 1,
@@ -243,11 +319,19 @@ fn map_job(job: &Job) -> Res<Mapped> {
     }
     kern.resize(kern.len().next_multiple_of(16), 0);
     let kernarg = mem.map_guarded("kernarg".into(), kern, GUARD)?;
-    Ok(Mapped { mem, kernarg, bases })
+    Ok(Mapped {
+        mem,
+        kernarg,
+        bases,
+    })
 }
 
 fn emulator<'p>(program: &'p Program, symbol: &str) -> Res<Emulator<'p>> {
-    Ok(Emulator::new(program, symbol)?.strict_lds().hw_model().nan_meets_nan().gfx1100_as_gfx1151())
+    Ok(Emulator::new(program, symbol)?
+        .strict_lds()
+        .hw_model()
+        .nan_meets_nan()
+        .gfx1100_as_gfx1151())
 }
 
 /// Findings of a run: (workgroup, message).
@@ -260,7 +344,9 @@ fn run_wgs(job: &Job, m: &mut Mapped, wgs: &[u32], threads: usize) -> Res<(Findi
     let mut findings: Findings = Vec::new();
     let mut instructions = 0u64;
     let nthreads = threads.min(wgs.len()).max(1);
-    let chunks: Vec<Vec<u32>> = (0..nthreads).map(|t| wgs.iter().copied().skip(t).step_by(nthreads).collect()).collect();
+    let chunks: Vec<Vec<u32>> = (0..nthreads)
+        .map(|t| wgs.iter().copied().skip(t).step_by(nthreads).collect())
+        .collect();
     let (kernarg, block, lds) = (m.kernarg, job.block, job.dynamic_lds);
     let results: Vec<(Memory, Findings, u64)> = std::thread::scope(|scope| {
         let handles: Vec<_> = chunks
@@ -271,15 +357,25 @@ fn run_wgs(job: &Job, m: &mut Mapped, wgs: &[u32], threads: usize) -> Res<(Findi
                 scope.spawn(move || {
                     let (mut fs, mut n) = (Findings::new(), 0u64);
                     for &wg in chunk {
-                        let launch = Launch { kernarg_ptr: kernarg, workgroup: [wg, 0, 0], block: [block, 1, 1], dynamic_lds: lds };
-                        match catch_unwind(AssertUnwindSafe(|| emu.run_workgroup_report(&launch, &mut mem))) {
+                        let launch = Launch {
+                            kernarg_ptr: kernarg,
+                            workgroup: [wg, 0, 0],
+                            block: [block, 1, 1],
+                            dynamic_lds: lds,
+                        };
+                        match catch_unwind(AssertUnwindSafe(|| {
+                            emu.run_workgroup_report(&launch, &mut mem)
+                        })) {
                             Ok(Ok(r)) => n += r.instructions,
                             Ok(Err(e)) => fs.push((wg, e)),
                             Err(p) => fs.push((
                                 wg,
                                 format!(
                                     "emulator panic: {}",
-                                    p.downcast_ref::<String>().cloned().or_else(|| p.downcast_ref::<&str>().map(|s| s.to_string())).unwrap_or_default()
+                                    p.downcast_ref::<String>()
+                                        .cloned()
+                                        .or_else(|| p.downcast_ref::<&str>().map(|s| s.to_string()))
+                                        .unwrap_or_default()
                                 ),
                             )),
                         }
@@ -288,7 +384,10 @@ fn run_wgs(job: &Job, m: &mut Mapped, wgs: &[u32], threads: usize) -> Res<(Findi
                 })
             })
             .collect();
-        handles.into_iter().map(|h| h.join().expect("worker thread")).collect()
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("worker thread"))
+            .collect()
     });
     for (mem, fs, n) in results {
         findings.extend(fs);
@@ -308,7 +407,13 @@ fn run_wgs(job: &Job, m: &mut Mapped, wgs: &[u32], threads: usize) -> Res<(Findi
                 if l != 0 {
                     let base = m.mem.regions[i].base;
                     if (s..s + l).any(|b| m.mem.regions[i].written.contains(b)) {
-                        findings.push((u32::MAX, format!("two workgroups stored to byte range {:#x}+{l} of `{}`", s, r.name)));
+                        findings.push((
+                            u32::MAX,
+                            format!(
+                                "two workgroups stored to byte range {:#x}+{l} of `{}`",
+                                s, r.name
+                            ),
+                        ));
                     }
                     m.mem.write(base + s as u64, &r.bytes[s..s + l])?;
                 }
@@ -346,15 +451,28 @@ fn sample_wgs(grid: u32, k: usize, seed: u64) -> Vec<u32> {
 }
 
 fn output_region<'a>(m: &'a Mapped, name: &str) -> &'a peacemaker_ir::emu::Region {
-    m.mem.regions.iter().find(|r| r.name == name).expect("output region")
+    m.mem
+        .regions
+        .iter()
+        .find(|r| r.name == name)
+        .expect("output region")
 }
 
 /// Compare an output buffer against the reference words. With `full` every word must have been stored.
-fn compare_out(m: &Mapped, name: &str, want: &[u32], full: bool) -> Res<(lane_ref::WordCmp, usize)> {
+fn compare_out(
+    m: &Mapped,
+    name: &str,
+    want: &[u32],
+    full: bool,
+) -> Res<(lane_ref::WordCmp, usize)> {
     let r = output_region(m, name);
     let got = words(&r.bytes);
     if got.len() != want.len() {
-        return Err(format!("{name}: {} words, reference {}", got.len(), want.len()));
+        return Err(format!(
+            "{name}: {} words, reference {}",
+            got.len(),
+            want.len()
+        ));
     }
     let mut cmp = lane_ref::WordCmp::default();
     let (mut g, mut w) = (Vec::new(), Vec::new());
@@ -372,7 +490,10 @@ fn compare_out(m: &Mapped, name: &str, want: &[u32], full: bool) -> Res<(lane_re
     cmp.nan_payload_diffs += c.nan_payload_diffs;
     cmp.words += c.words;
     if full && unwritten != 0 {
-        return Err(format!("{name}: {unwritten} of {} words were never stored", got.len()));
+        return Err(format!(
+            "{name}: {unwritten} of {} words were never stored",
+            got.len()
+        ));
     }
     if let Some(i) = lane_ref::first_mismatch(&g, &w) {
         return Err(format!("{name}: word {i} of the stored set differs: got {:#010x} want {:#010x} ({} mismatches)", g[i], w[i], c.mismatches));
@@ -389,14 +510,26 @@ struct ProjCase {
     data: Data,
     seed: u64,
 }
-fn proj_job<'p>(program: &'p Program, c: &ProjCase, w: &[Vec<u8>], x: &[f32], rows_arg: [i32; 4], grid: u32) -> Job<'p> {
+fn proj_job<'p>(
+    program: &'p Program,
+    c: &ProjCase,
+    w: &[Vec<u8>],
+    x: &[f32],
+    rows_arg: [i32; 4],
+    grid: u32,
+) -> Job<'p> {
     let mut bufs = Vec::new();
     let mut args = Vec::new();
     let mut wi = [None; 4];
     for s in 0..4 {
         if c.rows[s] != 0 {
             wi[s] = Some(bufs.len());
-            bufs.push(BufSpec { name: format!("A{s}"), bytes: w[s].clone(), output: false, undef: false });
+            bufs.push(BufSpec {
+                name: format!("A{s}"),
+                bytes: w[s].clone(),
+                output: false,
+                undef: false,
+            });
         }
     }
     for s in 0..4 {
@@ -409,7 +542,12 @@ fn proj_job<'p>(program: &'p Program, c: &ProjCase, w: &[Vec<u8>], x: &[f32], ro
     for s in 0..4 {
         if c.rows[s] != 0 {
             yi[s] = Some(bufs.len());
-            bufs.push(BufSpec { name: format!("y{s}"), bytes: vec![0; c.n * c.rows[s] * 4], output: true, undef: true });
+            bufs.push(BufSpec {
+                name: format!("y{s}"),
+                bytes: vec![0; c.n * c.rows[s] * 4],
+                output: true,
+                undef: true,
+            });
         }
     }
     for s in 0..4 {
@@ -419,7 +557,12 @@ fn proj_job<'p>(program: &'p Program, c: &ProjCase, w: &[Vec<u8>], x: &[f32], ro
         });
     }
     let xi = bufs.len();
-    bufs.push(BufSpec { name: "x".into(), bytes: f32_bytes(x), output: false, undef: false });
+    bufs.push(BufSpec {
+        name: "x".into(),
+        bytes: f32_bytes(x),
+        output: false,
+        undef: false,
+    });
     args.push(ArgSrc::Buf(xi));
     for v in rows_arg {
         args.push(ArgSrc::I32(v));
@@ -439,7 +582,9 @@ fn proj_grid(total: usize) -> u32 {
 }
 fn proj_inputs(c: &ProjCase) -> (Vec<Vec<u8>>, Vec<f32>) {
     let mut rng = Rng(c.seed | 1);
-    let w: Vec<Vec<u8>> = (0..4).map(|s| gen_weights(&mut rng, c.rows[s], 8, c.data.hdr)).collect();
+    let w: Vec<Vec<u8>> = (0..4)
+        .map(|s| gen_weights(&mut rng, c.rows[s], 8, c.data.hdr))
+        .collect();
     let x = gen_x(&mut rng, c.n * 2048, c.data.act);
     (w, x)
 }
@@ -450,17 +595,37 @@ fn proj_reference(c: &ProjCase, w: &[Vec<u8>], x: &[f32]) -> Vec<Vec<u32>> {
     lane_ref::lane_proj_ref(&ws, &rows, x, c.n)
 }
 /// Returns (instructions, words compared, nan payload diffs) or an error naming the first failure.
-fn check_proj(program: &Program, c: &ProjCase, wgs: Option<Vec<u32>>, threads: usize) -> Res<(u64, usize, usize)> {
+fn check_proj(
+    program: &Program,
+    c: &ProjCase,
+    wgs: Option<Vec<u32>>,
+    threads: usize,
+) -> Res<(u64, usize, usize)> {
     let (w, x) = proj_inputs(c);
     let total: usize = c.rows.iter().sum();
     let grid = proj_grid(total);
-    let job = proj_job(program, c, &w, &x, [c.rows[0] as i32, c.rows[1] as i32, c.rows[2] as i32, c.rows[3] as i32], grid);
+    let job = proj_job(
+        program,
+        c,
+        &w,
+        &x,
+        [
+            c.rows[0] as i32,
+            c.rows[1] as i32,
+            c.rows[2] as i32,
+            c.rows[3] as i32,
+        ],
+        grid,
+    );
     let mut m = map_job(&job)?;
     let full = wgs.is_none();
     let wgs = wgs.unwrap_or_else(|| (0..grid).collect());
     let (findings, n) = run_wgs(&job, &mut m, &wgs, threads)?;
     if let Some((wg, e)) = findings.first() {
-        return Err(format!("{} finding(s); first (wg {wg}): {e}", findings.len()));
+        return Err(format!(
+            "{} finding(s); first (wg {wg}): {e}",
+            findings.len()
+        ));
     }
     let want = proj_reference(c, &w, &x);
     let (mut words_cmp, mut nan_diffs) = (0, 0);
@@ -479,7 +644,16 @@ fn suite_proj(program: &Program, threads: usize, seed: u64) -> (usize, usize) {
     for &n in &[1usize, 2, 3, 5, 8] {
         for (si, rows) in shapes.iter().enumerate() {
             for (di, (dname, data)) in DATA_MODES.iter().enumerate() {
-                let c = ProjCase { n, rows: *rows, data: *data, seed: seed ^ ((n as u64) << 40) ^ ((si as u64) << 32) ^ ((di as u64) << 24) ^ 0x51 };
+                let c = ProjCase {
+                    n,
+                    rows: *rows,
+                    data: *data,
+                    seed: seed
+                        ^ ((n as u64) << 40)
+                        ^ ((si as u64) << 32)
+                        ^ ((di as u64) << 24)
+                        ^ 0x51,
+                };
                 let t = Instant::now();
                 let r = check_proj(program, &c, None, threads);
                 match r {
@@ -515,22 +689,55 @@ fn res_inputs(c: &ResCase) -> (Vec<u8>, Vec<f32>, Vec<f32>) {
     let y: Vec<f32> = (0..c.b * c.m).map(|_| rng.unit() * 2.0 - 1.0).collect();
     (w, x, y)
 }
-fn res_job<'p>(program: &'p Program, c: &ResCase, w: &[u8], x: &[f32], y: &[f32], m_arg: i32) -> Job<'p> {
+fn res_job<'p>(
+    program: &'p Program,
+    c: &ResCase,
+    w: &[u8],
+    x: &[f32],
+    y: &[f32],
+    m_arg: i32,
+) -> Job<'p> {
     Job {
         program,
         symbol: RES_SYMBOL.into(),
         bufs: vec![
-            BufSpec { name: "A".into(), bytes: w.to_vec(), output: false, undef: false },
-            BufSpec { name: "x".into(), bytes: f32_bytes(x), output: false, undef: false },
-            BufSpec { name: "y".into(), bytes: f32_bytes(y), output: true, undef: false },
+            BufSpec {
+                name: "A".into(),
+                bytes: w.to_vec(),
+                output: false,
+                undef: false,
+            },
+            BufSpec {
+                name: "x".into(),
+                bytes: f32_bytes(x),
+                output: false,
+                undef: false,
+            },
+            BufSpec {
+                name: "y".into(),
+                bytes: f32_bytes(y),
+                output: true,
+                undef: false,
+            },
         ],
-        args: vec![ArgSrc::Buf(0), ArgSrc::Buf(1), ArgSrc::Buf(2), ArgSrc::I32(m_arg), ArgSrc::I32(c.b as i32)],
+        args: vec![
+            ArgSrc::Buf(0),
+            ArgSrc::Buf(1),
+            ArgSrc::Buf(2),
+            ArgSrc::I32(m_arg),
+            ArgSrc::I32(c.b as i32),
+        ],
         grid: c.m.div_ceil(8) as u32,
         block: 128,
         dynamic_lds: 0,
     }
 }
-fn check_res(program: &Program, c: &ResCase, wgs: Option<Vec<u32>>, threads: usize) -> Res<(u64, usize, usize)> {
+fn check_res(
+    program: &Program,
+    c: &ResCase,
+    wgs: Option<Vec<u32>>,
+    threads: usize,
+) -> Res<(u64, usize, usize)> {
     let (w, x, y0) = res_inputs(c);
     let job = res_job(program, c, &w, &x, &y0, c.m as i32);
     let mut m = map_job(&job)?;
@@ -538,7 +745,10 @@ fn check_res(program: &Program, c: &ResCase, wgs: Option<Vec<u32>>, threads: usi
     let wgs = wgs.unwrap_or_else(|| (0..job.grid).collect());
     let (findings, n) = run_wgs(&job, &mut m, &wgs, threads)?;
     if let Some((wg, e)) = findings.first() {
-        return Err(format!("{} finding(s); first (wg {wg}): {e}", findings.len()));
+        return Err(format!(
+            "{} finding(s); first (wg {wg}): {e}",
+            findings.len()
+        ));
     }
     let mut y = y0.clone();
     lane_ref::residual_lanes_ref(&w, &x, &mut y, c.m, c.b);
@@ -554,12 +764,34 @@ fn suite_res(program: &Program, threads: usize, seed: u64) -> (usize, usize) {
     for &m in &[20usize, 19] {
         for b in 1..=8usize {
             for (di, (dname, data)) in DATA_MODES.iter().enumerate() {
-                cases.push((ResCase { m, b, data: *data, seed: seed ^ ((m as u64) << 36) ^ ((b as u64) << 28) ^ ((di as u64) << 20) ^ 0x77 }, None, dname));
+                cases.push((
+                    ResCase {
+                        m,
+                        b,
+                        data: *data,
+                        seed: seed
+                            ^ ((m as u64) << 36)
+                            ^ ((b as u64) << 28)
+                            ^ ((di as u64) << 20)
+                            ^ 0x77,
+                    },
+                    None,
+                    dname,
+                ));
             }
         }
     }
     for (di, (dname, data)) in DATA_MODES.iter().enumerate() {
-        cases.push((ResCase { m: 2048, b: 8, data: *data, seed: seed ^ ((di as u64) << 20) ^ 0x1234 }, Some(sample_wgs(256, 8, seed ^ di as u64)), dname));
+        cases.push((
+            ResCase {
+                m: 2048,
+                b: 8,
+                data: *data,
+                seed: seed ^ ((di as u64) << 20) ^ 0x1234,
+            },
+            Some(sample_wgs(256, 8, seed ^ di as u64)),
+            dname,
+        ));
     }
     for (c, wgs, dname) in cases {
         let t = Instant::now();
@@ -598,12 +830,19 @@ fn patch_dwords(image: &[u8], pat: u32, repl: u32, expect_at_least: usize) -> Re
         }
     }
     if n < expect_at_least {
-        return Err(format!("expected at least {expect_at_least} occurrences of {pat:#010x}, found {n}"));
+        return Err(format!(
+            "expected at least {expect_at_least} occurrences of {pat:#010x}, found {n}"
+        ));
     }
     Ok(out)
 }
 /// As `patch_dwords` for every dword satisfying `pred`.
-fn patch_where(image: &[u8], pred: impl Fn(u32) -> bool, repl: u32, expect_at_least: usize) -> Res<Vec<u8>> {
+fn patch_where(
+    image: &[u8],
+    pred: impl Fn(u32) -> bool,
+    repl: u32,
+    expect_at_least: usize,
+) -> Res<Vec<u8>> {
     let mut out = image.to_vec();
     let mut n = 0;
     for off in (0..out.len().saturating_sub(3)).step_by(4) {
@@ -613,7 +852,9 @@ fn patch_where(image: &[u8], pred: impl Fn(u32) -> bool, repl: u32, expect_at_le
         }
     }
     if n < expect_at_least {
-        return Err(format!("expected at least {expect_at_least} matching dwords, found {n}"));
+        return Err(format!(
+            "expected at least {expect_at_least} matching dwords, found {n}"
+        ));
     }
     Ok(out)
 }
@@ -632,7 +873,10 @@ fn expect_finding(what: &str, r: Res<(u64, usize, usize)>, needles: &[&str]) -> 
         Err(e) => {
             let hit = needles.iter().any(|n| e.contains(n));
             let first: String = e.chars().take(230).collect();
-            println!("  {} {what}: rejected as expected = {hit} :: {first}", if hit { "PASS" } else { "FAIL" });
+            println!(
+                "  {} {what}: rejected as expected = {hit} :: {first}",
+                if hit { "PASS" } else { "FAIL" }
+            );
             hit
         }
     }
@@ -649,10 +893,23 @@ fn suite_neg(proj_path: &str, res_path: &str, threads: usize, seed: u64) -> (usi
     };
     let proj_img = std::fs::read(proj_path).expect("lane_proj object");
     let res_img = std::fs::read(res_path).expect("residual_lanes object");
-    let rnd = Data { hdr: Hdr::Random, act: Act::Random };
+    let rnd = Data {
+        hdr: Hdr::Random,
+        act: Act::Random,
+    };
     // sanity: the unmutated objects are clean on the same cases
-    let pc = ProjCase { n: 2, rows: [37, 5, 3, 1], data: rnd, seed: seed ^ 0xABCD };
-    let rc = ResCase { m: 20, b: 8, data: rnd, seed: seed ^ 0xDCBA };
+    let pc = ProjCase {
+        n: 2,
+        rows: [37, 5, 3, 1],
+        data: rnd,
+        seed: seed ^ 0xABCD,
+    };
+    let rc = ResCase {
+        m: 20,
+        b: 8,
+        data: rnd,
+        seed: seed ^ 0xDCBA,
+    };
     let base_p = lift(&proj_img).unwrap();
     let base_r = lift(&res_img).unwrap();
     tally(check_proj(&base_p, &pc, None, threads).is_ok());
@@ -684,14 +941,30 @@ fn suite_neg(proj_path: &str, res_path: &str, threads: usize, seed: u64) -> (usi
                 continue;
             }
         };
-        let r = if what.starts_with("lane_proj") { check_proj(&prog, &pc, None, threads) } else { check_res(&prog, &rc, None, threads) };
+        let r = if what.starts_with("lane_proj") {
+            check_proj(&prog, &pc, None, threads)
+        } else {
+            check_res(&prog, &rc, None, threads)
+        };
         tally(expect_finding(what, r, needles));
     }
     // 2. an extra-row overrun: the kernel is told one more row than the exact-size buffers hold
     {
         let (w, x) = proj_inputs(&pc);
         let total: usize = pc.rows.iter().sum();
-        let job = proj_job(&base_p, &pc, &w, &x, [pc.rows[0] as i32 + 1, pc.rows[1] as i32, pc.rows[2] as i32, pc.rows[3] as i32], proj_grid(total + 1));
+        let job = proj_job(
+            &base_p,
+            &pc,
+            &w,
+            &x,
+            [
+                pc.rows[0] as i32 + 1,
+                pc.rows[1] as i32,
+                pc.rows[2] as i32,
+                pc.rows[3] as i32,
+            ],
+            proj_grid(total + 1),
+        );
         let r = map_job(&job).and_then(|mut m| {
             let wgs: Vec<u32> = (0..job.grid).collect();
             let (f, n) = run_wgs(&job, &mut m, &wgs, threads)?;
@@ -700,7 +973,11 @@ fn suite_neg(proj_path: &str, res_path: &str, threads: usize, seed: u64) -> (usi
                 None => Ok((n, 0, 0)),
             }
         });
-        tally(expect_finding("lane_proj with m0 one row larger than the buffer (row overrun)", r, &["unmapped memory"]));
+        tally(expect_finding(
+            "lane_proj with m0 one row larger than the buffer (row overrun)",
+            r,
+            &["unmapped memory"],
+        ));
         let (w, x, y) = res_inputs(&rc);
         let job = res_job(&base_r, &rc, &w, &x, &y, rc.m as i32 + 8);
         let r = map_job(&job).and_then(|mut m| {
@@ -711,7 +988,11 @@ fn suite_neg(proj_path: &str, res_path: &str, threads: usize, seed: u64) -> (usi
                 None => Ok((n, 0, 0)),
             }
         });
-        tally(expect_finding("residual_lanes with M 8 larger than the buffers (row overrun)", r, &["unmapped memory"]));
+        tally(expect_finding(
+            "residual_lanes with M 8 larger than the buffers (row overrun)",
+            r,
+            &["unmapped memory"],
+        ));
     }
     (ok, bad)
 }
@@ -719,9 +1000,23 @@ fn suite_neg(proj_path: &str, res_path: &str, threads: usize, seed: u64) -> (usi
 // ---------------------------------------------------------------------------------------------------------------
 // production-grid timing
 // ---------------------------------------------------------------------------------------------------------------
-fn suite_time(proj: &Program, res: &Program, threads: usize, seed: u64, sample: Option<usize>) -> (usize, usize) {
+fn suite_time(
+    proj: &Program,
+    res: &Program,
+    threads: usize,
+    seed: u64,
+    sample: Option<usize>,
+) -> (usize, usize) {
     let (mut ok, mut bad) = (0, 0);
-    let c = ProjCase { n: 8, rows: [8192, 4096, 32, 32], data: Data { hdr: Hdr::Random, act: Act::Random }, seed: seed ^ 0xD00D };
+    let c = ProjCase {
+        n: 8,
+        rows: [8192, 4096, 32, 32],
+        data: Data {
+            hdr: Hdr::Random,
+            act: Act::Random,
+        },
+        seed: seed ^ 0xD00D,
+    };
     let grid = proj_grid(c.rows.iter().sum());
     let wgs = sample.map(|k| sample_wgs(grid, k, seed));
     let t = Instant::now();
@@ -744,7 +1039,15 @@ fn suite_time(proj: &Program, res: &Program, threads: usize, seed: u64, sample: 
         t.elapsed().as_secs_f64(),
         if wgs.is_some() { " [SAMPLED]" } else { "" }
     );
-    let rc = ResCase { m: 2048, b: 8, data: Data { hdr: Hdr::Random, act: Act::Random }, seed: seed ^ 0xBEEF };
+    let rc = ResCase {
+        m: 2048,
+        b: 8,
+        data: Data {
+            hdr: Hdr::Random,
+            act: Act::Random,
+        },
+        seed: seed ^ 0xBEEF,
+    };
     let wgs = sample.map(|k| sample_wgs(256, k, seed));
     let t = Instant::now();
     let r = check_res(res, &rc, wgs.clone(), threads);
@@ -773,31 +1076,67 @@ fn suite_time(proj: &Program, res: &Program, threads: usize, seed: u64, sample: 
 fn emit_spec(dir: &str, case: &str, obj_path: &str, program: &Program, seed: u64) -> Res<()> {
     use sha2::{Digest, Sha256};
     let parts: Vec<&str> = case.split(':').collect();
-    let mode = |m: &str| DATA_MODES.iter().find(|(n, _)| *n == m).map(|(_, d)| *d).ok_or_else(|| format!("unknown data mode {m}"));
+    let mode = |m: &str| {
+        DATA_MODES
+            .iter()
+            .find(|(n, _)| *n == m)
+            .map(|(_, d)| *d)
+            .ok_or_else(|| format!("unknown data mode {m}"))
+    };
     let job_holder;
     let (job, name) = match parts.as_slice() {
         ["proj", n, rows, m] => {
-            let r: Vec<usize> = rows.split(',').map(|v| v.parse::<usize>().map_err(|e| e.to_string())).collect::<Res<_>>()?;
+            let r: Vec<usize> = rows
+                .split(',')
+                .map(|v| v.parse::<usize>().map_err(|e| e.to_string()))
+                .collect::<Res<_>>()?;
             if r.len() != 4 {
                 return Err("proj case needs 4 row counts".into());
             }
-            let c = ProjCase { n: n.parse().map_err(|_| "N")?, rows: [r[0], r[1], r[2], r[3]], data: mode(m)?, seed };
+            let c = ProjCase {
+                n: n.parse().map_err(|_| "N")?,
+                rows: [r[0], r[1], r[2], r[3]],
+                data: mode(m)?,
+                seed,
+            };
             let (w, x) = proj_inputs(&c);
             let g = proj_grid(c.rows.iter().sum());
-            job_holder = proj_job(program, &c, &w, &x, [r[0] as i32, r[1] as i32, r[2] as i32, r[3] as i32], g);
-            (&job_holder, format!("lane_proj_n{}_{}_{}", c.n, rows.replace(',', "_"), m))
+            job_holder = proj_job(
+                program,
+                &c,
+                &w,
+                &x,
+                [r[0] as i32, r[1] as i32, r[2] as i32, r[3] as i32],
+                g,
+            );
+            (
+                &job_holder,
+                format!("lane_proj_n{}_{}_{}", c.n, rows.replace(',', "_"), m),
+            )
         }
         ["res", mm, b, m] => {
-            let c = ResCase { m: mm.parse().map_err(|_| "M")?, b: b.parse().map_err(|_| "B")?, data: mode(m)?, seed };
+            let c = ResCase {
+                m: mm.parse().map_err(|_| "M")?,
+                b: b.parse().map_err(|_| "B")?,
+                data: mode(m)?,
+                seed,
+            };
             let (w, x, y) = res_inputs(&c);
             job_holder = res_job(program, &c, &w, &x, &y, c.m as i32);
-            (&job_holder, format!("residual_lanes_M{}_B{}_{}", c.m, c.b, m))
+            (
+                &job_holder,
+                format!("residual_lanes_M{}_B{}_{}", c.m, c.b, m),
+            )
         }
         _ => return Err(format!("bad --emit-spec case `{case}`")),
     };
     std::fs::create_dir_all(dir).map_err(|e| format!("{dir}: {e}"))?;
     let obj = std::fs::read(obj_path).map_err(|e| format!("{obj_path}: {e}"))?;
-    let obj_name = obj_path.rsplit('/').next().unwrap_or("object.elf").to_owned();
+    let obj_name = obj_path
+        .rsplit('/')
+        .next()
+        .unwrap_or("object.elf")
+        .to_owned();
     std::fs::write(format!("{dir}/{obj_name}"), &obj).map_err(|e| e.to_string())?;
     let mut buffers = Vec::new();
     for b in &job.bufs {
@@ -814,7 +1153,9 @@ fn emit_spec(dir: &str, case: &str, obj_path: &str, program: &Program, seed: u64
         .iter()
         .enumerate()
         .map(|(i, a)| match a {
-            ArgSrc::Buf(k) => serde_json::json!({"name": format!("arg{i}"), "buf": job.bufs[*k].name}),
+            ArgSrc::Buf(k) => {
+                serde_json::json!({"name": format!("arg{i}"), "buf": job.bufs[*k].name})
+            }
             ArgSrc::Null => serde_json::json!({"name": format!("arg{i}"), "null": true}),
             ArgSrc::I32(v) => serde_json::json!({"name": format!("arg{i}"), "i32": v}),
         })
@@ -827,7 +1168,11 @@ fn emit_spec(dir: &str, case: &str, obj_path: &str, program: &Program, seed: u64
         "notes": format!("emitted by lane_emu_check --emit-spec; case {case}; seed {seed}"),
     });
     let p = format!("{dir}/spec.json");
-    std::fs::write(&p, serde_json::to_vec_pretty(&spec).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+    std::fs::write(
+        &p,
+        serde_json::to_vec_pretty(&spec).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())?;
     println!("wrote {p}");
     Ok(())
 }
@@ -843,9 +1188,20 @@ fn main() {
         match a.as_str() {
             "--proj" => proj_path = args.next().expect("--proj PATH"),
             "--res" => res_path = args.next().expect("--res PATH"),
-            "--threads" => threads = args.next().and_then(|v| v.parse().ok()).expect("--threads N"),
+            "--threads" => {
+                threads = args
+                    .next()
+                    .and_then(|v| v.parse().ok())
+                    .expect("--threads N")
+            }
             "--seed" => seed = args.next().and_then(|v| v.parse().ok()).expect("--seed S"),
-            "--sample" => sample = Some(args.next().and_then(|v| v.parse().ok()).expect("--sample K")),
+            "--sample" => {
+                sample = Some(
+                    args.next()
+                        .and_then(|v| v.parse().ok())
+                        .expect("--sample K"),
+                )
+            }
             "--emit-spec" => {
                 let dir = args.next().expect("--emit-spec DIR CASE");
                 let case = args.next().expect("--emit-spec DIR CASE");
@@ -866,7 +1222,11 @@ fn main() {
         std::process::exit(2)
     });
     if let Some((dir, case)) = emit {
-        let (path, which) = if case.starts_with("proj") { (&proj_path, &proj) } else { (&res_path, &res) };
+        let (path, which) = if case.starts_with("proj") {
+            (&proj_path, &proj)
+        } else {
+            (&res_path, &res)
+        };
         if let Err(e) = emit_spec(&dir, &case, path, which, seed) {
             eprintln!("lane_emu_check: {e}");
             std::process::exit(2);
@@ -887,7 +1247,12 @@ fn main() {
                 std::process::exit(2)
             }
         };
-        println!("== {s}: {} passed, {} failed [{:.1} s]", r.0, r.1, t.elapsed().as_secs_f64());
+        println!(
+            "== {s}: {} passed, {} failed [{:.1} s]",
+            r.0,
+            r.1,
+            t.elapsed().as_secs_f64()
+        );
         totals.insert(s.clone(), r);
     }
     let bad: usize = totals.values().map(|v| v.1).sum();

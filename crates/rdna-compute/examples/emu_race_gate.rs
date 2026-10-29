@@ -56,7 +56,10 @@ fn main() {
 }
 
 fn parse_wg(s: &str) -> Res<[u32; 3]> {
-    let v: Vec<u32> = s.split(',').map(|x| x.parse::<u32>().map_err(|e| format!("--wg {s}: {e}"))).collect::<Res<_>>()?;
+    let v: Vec<u32> = s
+        .split(',')
+        .map(|x| x.parse::<u32>().map_err(|e| format!("--wg {s}: {e}")))
+        .collect::<Res<_>>()?;
     if v.len() != 3 {
         return Err("--wg requires x,y,z".into());
     }
@@ -70,7 +73,10 @@ fn u32s(v: &Value, key: &str) -> Res<[u32; 3]> {
     }
     let mut r = [0u32; 3];
     for i in 0..3 {
-        r[i] = a[i].as_u64().and_then(|x| u32::try_from(x).ok()).ok_or_else(|| format!("{key}[{i}] not a u32"))?;
+        r[i] = a[i]
+            .as_u64()
+            .and_then(|x| u32::try_from(x).ok())
+            .ok_or_else(|| format!("{key}[{i}] not a u32"))?;
     }
     Ok(r)
 }
@@ -84,7 +90,10 @@ fn classify(msg: &str) -> &'static str {
         "uninit"
     } else if msg.contains("[schedule]") {
         "schedule"
-    } else if msg.contains("unmapped memory") || msg.contains("out of bounds") || msg.contains("out of range") {
+    } else if msg.contains("unmapped memory")
+        || msg.contains("out of bounds")
+        || msg.contains("out of range")
+    {
         "oob"
     } else {
         "other"
@@ -93,11 +102,17 @@ fn classify(msg: &str) -> &'static str {
 
 /// `inst=PC name` as the emulator names the faulting instruction.
 fn pc_inst(msg: &str) -> (Option<u64>, Option<String>) {
-    let Some(at) = msg.find("inst=") else { return (None, None) };
+    let Some(at) = msg.find("inst=") else {
+        return (None, None);
+    };
     let rest = &msg[at + 5..];
     let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
     let pc = digits.parse::<u64>().ok();
-    let name = rest[digits.len()..].trim_start().split(|c: char| c.is_whitespace() || c == ',' || c == ';').next().map(str::to_owned);
+    let name = rest[digits.len()..]
+        .trim_start()
+        .split(|c: char| c.is_whitespace() || c == ',' || c == ';')
+        .next()
+        .map(str::to_owned);
     (pc, name.filter(|n| !n.is_empty()))
 }
 
@@ -114,7 +129,10 @@ fn lift(image: &[u8]) -> Res<(peacemaker_ir::Program, &'static str)> {
 
 fn run() -> Res<i32> {
     let mut args = std::env::args().skip(1);
-    let spec_path = PathBuf::from(args.next().ok_or("usage: emu_race_gate SPEC.json [--wg x,y,z]... [--json OUT] [--max-findings N]")?);
+    let spec_path =
+        PathBuf::from(args.next().ok_or(
+            "usage: emu_race_gate SPEC.json [--wg x,y,z]... [--json OUT] [--max-findings N]",
+        )?);
     let mut selected: Vec<[u32; 3]> = Vec::new();
     let mut json_out: Option<PathBuf> = None;
     let mut max_findings = 50usize;
@@ -124,27 +142,40 @@ fn run() -> Res<i32> {
             "--order" => order_opt = args.next().ok_or("missing --order value")?,
             "--wg" => selected.push(parse_wg(&args.next().ok_or("missing --wg value")?)?),
             "--json" => json_out = Some(PathBuf::from(args.next().ok_or("missing --json value")?)),
-            "--max-findings" => max_findings = args.next().ok_or("missing value")?.parse().map_err(|e| format!("--max-findings: {e}"))?,
+            "--max-findings" => {
+                max_findings = args
+                    .next()
+                    .ok_or("missing value")?
+                    .parse()
+                    .map_err(|e| format!("--max-findings: {e}"))?
+            }
             other => return Err(format!("unknown option {other}")),
         }
     }
     let started = Instant::now();
-    let dir = spec_path.parent().map(Path::to_path_buf).unwrap_or_default();
-    let spec: Value = serde_json::from_slice(&std::fs::read(&spec_path).map_err(|e| format!("{}: {e}", spec_path.display()))?)
-        .map_err(|e| format!("spec json: {e}"))?;
+    let dir = spec_path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_default();
+    let spec: Value = serde_json::from_slice(
+        &std::fs::read(&spec_path).map_err(|e| format!("{}: {e}", spec_path.display()))?,
+    )
+    .map_err(|e| format!("spec json: {e}"))?;
     if spec["spec_version"].as_u64() != Some(1) {
         return Err("spec_version must be 1".into());
     }
     let name = spec["name"].as_str().unwrap_or("?").to_owned();
     let symbol = spec["symbol"].as_str().ok_or("missing symbol")?.to_owned();
-    let image = std::fs::read(dir.join(spec["object"].as_str().ok_or("missing object")?)).map_err(|e| format!("object: {e}"))?;
+    let image = std::fs::read(dir.join(spec["object"].as_str().ok_or("missing object")?))
+        .map_err(|e| format!("object: {e}"))?;
     let sha = format!("{:x}", Sha256::digest(&image));
     if Some(sha.as_str()) != spec["object_sha256"].as_str() {
         return Err(format!("object sha256 {sha} differs from the spec"));
     }
     let grid = u32s(&spec, "grid_wg")?;
     let block = u32s(&spec, "block")?;
-    let dynamic_lds = u32::try_from(spec["dynamic_lds"].as_u64().ok_or("missing dynamic_lds")?).map_err(|_| "dynamic_lds")?;
+    let dynamic_lds = u32::try_from(spec["dynamic_lds"].as_u64().ok_or("missing dynamic_lds")?)
+        .map_err(|_| "dynamic_lds")?;
 
     let (program, frontend) = lift(&image)?;
     let kernel = program
@@ -152,12 +183,20 @@ fn run() -> Res<i32> {
         .iter()
         .find(|k| k.symbol.0 == symbol)
         .ok_or_else(|| format!("the object does not define `{symbol}`"))?;
-    let Abi::Hsa { descriptor, metadata } = &kernel.abi else {
+    let Abi::Hsa {
+        descriptor,
+        metadata,
+    } = &kernel.abi
+    else {
         return Err("not an HSA kernel".into());
     };
     let mut missing = std::collections::BTreeMap::<&str, usize>::new();
     for id in &kernel.body.layout {
-        let inst = kernel.body.insts.get(*id).ok_or("layout names a missing instruction")?;
+        let inst = kernel
+            .body
+            .insts
+            .get(*id)
+            .ok_or("layout names a missing instruction")?;
         match peacemaker_ir::isa::lookup(program.target.arch, inst.op, inst.form) {
             Some(row) if peacemaker_ir::emu::semantic_class(row.name).is_some() => {}
             Some(row) => *missing.entry(row.name).or_default() += 1,
@@ -182,13 +221,20 @@ fn run() -> Res<i32> {
     for b in bspec {
         let bname = b["name"].as_str().ok_or("buffer without name")?.to_owned();
         let init = b["init"].as_str().unwrap_or("seeded").to_owned();
-        let n = usize::try_from(b["bytes"].as_u64().ok_or("buffer without bytes")?).map_err(|_| "bytes")?;
+        let n = usize::try_from(b["bytes"].as_u64().ok_or("buffer without bytes")?)
+            .map_err(|_| "bytes")?;
         let bytes = match init.as_str() {
             "seeded" => {
-                let f = b["file"].as_str().ok_or_else(|| format!("seeded buffer {bname} has no file"))?;
-                let v = std::fs::read(dir.join(f)).map_err(|e| format!("buffer {bname}: {f}: {e}"))?;
+                let f = b["file"]
+                    .as_str()
+                    .ok_or_else(|| format!("seeded buffer {bname} has no file"))?;
+                let v =
+                    std::fs::read(dir.join(f)).map_err(|e| format!("buffer {bname}: {f}: {e}"))?;
                 if v.len() != n {
-                    return Err(format!("buffer {bname}: file is {} B, spec says {n}", v.len()));
+                    return Err(format!(
+                        "buffer {bname}: file is {} B, spec says {n}",
+                        v.len()
+                    ));
                 }
                 v
             }
@@ -196,17 +242,32 @@ fn run() -> Res<i32> {
             "ptrtable" => vec![0u8; n],
             other => return Err(format!("buffer {bname}: unknown init {other}")),
         };
-        bufs.push(Buf { name: bname, output: b["output"].as_bool().unwrap_or(false), init, bytes, addr: 0 });
+        bufs.push(Buf {
+            name: bname,
+            output: b["output"].as_bool().unwrap_or(false),
+            init,
+            bytes,
+            addr: 0,
+        });
     }
     let mut mem = Memory::default();
     // map every non-ptrtable buffer first (ptrtable entries need their targets' addresses)
-    let mut order: Vec<usize> = (0..bufs.len()).filter(|&i| bufs[i].init != "ptrtable").collect();
+    let mut order: Vec<usize> = (0..bufs.len())
+        .filter(|&i| bufs[i].init != "ptrtable")
+        .collect();
     order.extend((0..bufs.len()).filter(|&i| bufs[i].init == "ptrtable"));
     for &i in &order {
         if bufs[i].init == "ptrtable" {
-            let entries = bspec[i]["entries"].as_array().ok_or_else(|| format!("ptrtable {} has no entries", bufs[i].name))?;
+            let entries = bspec[i]["entries"]
+                .as_array()
+                .ok_or_else(|| format!("ptrtable {} has no entries", bufs[i].name))?;
             if entries.len() * 8 != bufs[i].bytes.len() {
-                return Err(format!("ptrtable {}: {} entries x 8 != {} B", bufs[i].name, entries.len(), bufs[i].bytes.len()));
+                return Err(format!(
+                    "ptrtable {}: {} entries x 8 != {} B",
+                    bufs[i].name,
+                    entries.len(),
+                    bufs[i].bytes.len()
+                ));
             }
             for (k, e) in entries.iter().enumerate() {
                 let v: u64 = if e.is_null() {
@@ -215,33 +276,64 @@ fn run() -> Res<i32> {
                     0xDEAD_BEEF_0000_0000
                 } else {
                     let tn = e["buf"].as_str().ok_or("ptrtable entry without buf")?;
-                    let t = bufs.iter().find(|x| x.name == tn).ok_or_else(|| format!("ptrtable entry -> unknown buffer {tn}"))?;
+                    let t = bufs
+                        .iter()
+                        .find(|x| x.name == tn)
+                        .ok_or_else(|| format!("ptrtable entry -> unknown buffer {tn}"))?;
                     t.addr + e["offset"].as_u64().unwrap_or(0)
                 };
                 bufs[i].bytes[k * 8..k * 8 + 8].copy_from_slice(&v.to_le_bytes());
             }
         }
         let data = std::mem::take(&mut bufs[i].bytes);
-        bufs[i].addr = mem.map_guarded(bufs[i].name.clone(), data, GUARD_BYTES).map_err(|e| format!("map {}: {e}", bufs[i].name))?;
+        bufs[i].addr = mem
+            .map_guarded(bufs[i].name.clone(), data, GUARD_BYTES)
+            .map_err(|e| format!("map {}: {e}", bufs[i].name))?;
         if bufs[i].init == "undef" {
-            mem.set_strict_read(&bufs[i].name).map_err(|e| format!("strict_read {}: {e}", bufs[i].name))?;
+            mem.set_strict_read(&bufs[i].name)
+                .map_err(|e| format!("strict_read {}: {e}", bufs[i].name))?;
         }
     }
 
     // ---- kernarg segment (explicit args from the spec, hidden args from the geometry) ----
-    let segment = metadata.parsed.kernarg_segment_size.max(descriptor.kernarg_size) as usize;
-    let explicit: Vec<_> = metadata.parsed.args.iter().filter(|a| !a.value_kind.starts_with("hidden_")).collect();
+    let segment = metadata
+        .parsed
+        .kernarg_segment_size
+        .max(descriptor.kernarg_size) as usize;
+    let explicit: Vec<_> = metadata
+        .parsed
+        .args
+        .iter()
+        .filter(|a| !a.value_kind.starts_with("hidden_"))
+        .collect();
     let aspec = spec["args"].as_array().ok_or("missing args")?;
     if explicit.len() != aspec.len() {
-        return Err(format!("abi: the object declares {} explicit kernel arguments, the spec passes {}", explicit.len(), aspec.len()));
+        return Err(format!(
+            "abi: the object declares {} explicit kernel arguments, the spec passes {}",
+            explicit.len(),
+            aspec.len()
+        ));
     }
-    let end = metadata.parsed.args.iter().map(|a| (a.offset + a.size) as usize).max().unwrap_or(0);
+    let end = metadata
+        .parsed
+        .args
+        .iter()
+        .map(|a| (a.offset + a.size) as usize)
+        .max()
+        .unwrap_or(0);
     let mut kern = vec![0u8; segment.max(end)];
     for (i, (m, a)) in explicit.iter().zip(aspec).enumerate() {
         let bytes: Vec<u8> = if let Some(bn) = a["buf"].as_str() {
-            let b = bufs.iter().find(|x| x.name == bn).ok_or_else(|| format!("arg {i}: unknown buffer {bn}"))?;
+            let b = bufs
+                .iter()
+                .find(|x| x.name == bn)
+                .ok_or_else(|| format!("arg {i}: unknown buffer {bn}"))?;
             let off = a["off"].as_u64().unwrap_or(0);
-            let len = bspec.iter().find(|x| x["name"].as_str() == Some(bn)).and_then(|x| x["bytes"].as_u64()).unwrap_or(0);
+            let len = bspec
+                .iter()
+                .find(|x| x["name"].as_str() == Some(bn))
+                .and_then(|x| x["bytes"].as_u64())
+                .unwrap_or(0);
             if off > len {
                 return Err(format!("arg {i}: off {off} beyond buffer {bn} ({len} B)"));
             }
@@ -249,23 +341,44 @@ fn run() -> Res<i32> {
         } else if a["null"].as_bool() == Some(true) {
             0u64.to_le_bytes().to_vec()
         } else if let Some(x) = a["i32"].as_i64() {
-            i32::try_from(x).map_err(|_| format!("arg {i}: i32 out of range"))?.to_le_bytes().to_vec()
+            i32::try_from(x)
+                .map_err(|_| format!("arg {i}: i32 out of range"))?
+                .to_le_bytes()
+                .to_vec()
         } else if let Some(x) = a["u32"].as_u64() {
-            u32::try_from(x).map_err(|_| format!("arg {i}: u32 out of range"))?.to_le_bytes().to_vec()
+            u32::try_from(x)
+                .map_err(|_| format!("arg {i}: u32 out of range"))?
+                .to_le_bytes()
+                .to_vec()
         } else if let Some(x) = a["f32"].as_f64() {
             (x as f32).to_le_bytes().to_vec()
         } else if let Some(h) = a["bytes_hex"].as_str() {
-            (0..h.len() / 2).map(|k| u8::from_str_radix(&h[2 * k..2 * k + 2], 16).map_err(|e| format!("arg {i}: bytes_hex: {e}"))).collect::<Res<_>>()?
+            (0..h.len() / 2)
+                .map(|k| {
+                    u8::from_str_radix(&h[2 * k..2 * k + 2], 16)
+                        .map_err(|e| format!("arg {i}: bytes_hex: {e}"))
+                })
+                .collect::<Res<_>>()?
         } else {
             return Err(format!("arg {i}: unrecognised value {a}"));
         };
         if bytes.len() != m.size as usize {
-            return Err(format!("abi: explicit argument {i} `{}` is {} B in the object, {} B in the spec", a["name"].as_str().unwrap_or(""), m.size, bytes.len()));
+            return Err(format!(
+                "abi: explicit argument {i} `{}` is {} B in the object, {} B in the spec",
+                a["name"].as_str().unwrap_or(""),
+                m.size,
+                bytes.len()
+            ));
         }
         let off = m.offset as usize;
         kern[off..off + bytes.len()].copy_from_slice(&bytes);
     }
-    for a in metadata.parsed.args.iter().filter(|a| a.value_kind.starts_with("hidden_")) {
+    for a in metadata
+        .parsed
+        .args
+        .iter()
+        .filter(|a| a.value_kind.starts_with("hidden_"))
+    {
         let (off, size) = (a.offset as usize, a.size as usize);
         let v: u64 = match a.value_kind.as_str() {
             "hidden_block_count_x" => u64::from(grid[0]),
@@ -282,10 +395,15 @@ fn run() -> Res<i32> {
         kern[off..off + size].copy_from_slice(&v.to_le_bytes()[..size.min(8)]);
     }
     kern.resize(kern.len().next_multiple_of(16), 0);
-    let kva = mem.map_guarded("kernarg".to_owned(), kern, GUARD_BYTES).map_err(|e| format!("map kernarg: {e}"))?;
+    let kva = mem
+        .map_guarded("kernarg".to_owned(), kern, GUARD_BYTES)
+        .map_err(|e| format!("map kernarg: {e}"))?;
 
     // ---- run ----
-    let mut emu = Emulator::new(&program, &symbol).map_err(|e| format!("emulator: {e}"))?.hw_model().gfx1100_as_gfx1151();
+    let mut emu = Emulator::new(&program, &symbol)
+        .map_err(|e| format!("emulator: {e}"))?
+        .hw_model()
+        .gfx1100_as_gfx1151();
     let nan_policy = spec["nan_policy"].as_str().unwrap_or("strict").to_owned();
     match nan_policy.as_str() {
         "strict" => {}
@@ -316,7 +434,10 @@ fn run() -> Res<i32> {
         "forward" => {}
         "reverse" => wgs.reverse(),
         o if o.starts_with("random:") => {
-            let mut x: u64 = o[7..].parse::<u64>().map_err(|e| format!("--order random: {e}"))? ^ 0x9E37_79B9_7F4A_7C15;
+            let mut x: u64 = o[7..]
+                .parse::<u64>()
+                .map_err(|e| format!("--order random: {e}"))?
+                ^ 0x9E37_79B9_7F4A_7C15;
             for i in (1..wgs.len()).rev() {
                 x ^= x << 13;
                 x ^= x >> 7;
@@ -324,7 +445,11 @@ fn run() -> Res<i32> {
                 wgs.swap(i, (x % (i as u64 + 1)) as usize);
             }
         }
-        other => return Err(format!("--order {other}: expected forward|reverse|random:SEED")),
+        other => {
+            return Err(format!(
+                "--order {other}: expected forward|reverse|random:SEED"
+            ))
+        }
     }
     let (mut instructions, mut ran, mut nfind) = (0u64, 0u64, 0usize);
     let mut findings: Vec<Value> = Vec::new();
@@ -344,12 +469,21 @@ fn run() -> Res<i32> {
         *nfind += 1;
         let (pc, inst) = pc_inst(&msg);
         if findings.len() < max_findings {
-            findings.push(json!({"class": class, "workgroup": wg, "pc": pc, "inst": inst, "message": msg}));
+            findings.push(
+                json!({"class": class, "workgroup": wg, "pc": pc, "inst": inst, "message": msg}),
+            );
         }
     }
     for wg in &wgs {
-        let launch = Launch { kernarg_ptr: kva, workgroup: *wg, block, dynamic_lds };
-        match catch_unwind(AssertUnwindSafe(|| emu.run_workgroup_report(&launch, &mut mem))) {
+        let launch = Launch {
+            kernarg_ptr: kva,
+            workgroup: *wg,
+            block,
+            dynamic_lds,
+        };
+        match catch_unwind(AssertUnwindSafe(|| {
+            emu.run_workgroup_report(&launch, &mut mem)
+        })) {
             Ok(Ok(rep)) => {
                 instructions += rep.instructions;
                 ran += 1;
@@ -357,27 +491,73 @@ fn run() -> Res<i32> {
                     schedules = rep.schedules;
                 }
             }
-            Ok(Err(e)) => note(&mut by_class, *wg, e, None, &mut nfind, &mut findings, max_findings),
+            Ok(Err(e)) => note(
+                &mut by_class,
+                *wg,
+                e,
+                None,
+                &mut nfind,
+                &mut findings,
+                max_findings,
+            ),
             Err(p) => {
-                let m = p.downcast_ref::<String>().cloned().or_else(|| p.downcast_ref::<&str>().map(|s| (*s).to_owned())).unwrap_or_default();
-                note(&mut by_class, *wg, format!("emulator panic: {m}"), None, &mut nfind, &mut findings, max_findings);
+                let m = p
+                    .downcast_ref::<String>()
+                    .cloned()
+                    .or_else(|| p.downcast_ref::<&str>().map(|s| (*s).to_owned()))
+                    .unwrap_or_default();
+                note(
+                    &mut by_class,
+                    *wg,
+                    format!("emulator panic: {m}"),
+                    None,
+                    &mut nfind,
+                    &mut findings,
+                    max_findings,
+                );
             }
         }
     }
     // stores outside the declared output buffers
     let mut outputs = Vec::new();
     for b in &bufs {
-        let r = mem.regions.iter().find(|r| r.name == b.name).ok_or("mapped region vanished")?;
+        let r = mem
+            .regions
+            .iter()
+            .find(|r| r.name == b.name)
+            .ok_or("mapped region vanished")?;
         let w = r.written.count();
         if b.output {
             outputs.push(json!({"buffer": b.name, "written_bytes": w, "bytes": r.bytes.len(), "sha256": format!("{:x}", Sha256::digest(&r.bytes))}));
         } else if w != 0 {
-            note(&mut by_class, [0, 0, 0], format!("{w} byte(s) of the read-only buffer `{}` were stored", b.name), Some("write-to-input"), &mut nfind, &mut findings, max_findings);
+            note(
+                &mut by_class,
+                [0, 0, 0],
+                format!(
+                    "{w} byte(s) of the read-only buffer `{}` were stored",
+                    b.name
+                ),
+                Some("write-to-input"),
+                &mut nfind,
+                &mut findings,
+                max_findings,
+            );
         }
     }
     if let Some(r) = mem.regions.iter().find(|r| r.name == "kernarg") {
         if r.written.count() != 0 {
-            note(&mut by_class, [0, 0, 0], format!("{} byte(s) of the kernarg segment were stored", r.written.count()), Some("write-to-input"), &mut nfind, &mut findings, max_findings);
+            note(
+                &mut by_class,
+                [0, 0, 0],
+                format!(
+                    "{} byte(s) of the kernarg segment were stored",
+                    r.written.count()
+                ),
+                Some("write-to-input"),
+                &mut nfind,
+                &mut findings,
+                max_findings,
+            );
         }
     }
     let verdict = if nfind == 0 { "clean" } else { "FINDINGS" };
@@ -392,12 +572,32 @@ fn run() -> Res<i32> {
         "model": format!("Emulator::hw_model(){}.gfx1100_as_gfx1151() (arch {:?}, wave{wave})", if nan_policy == "meets_nan" { ".nan_meets_nan()" } else { "" }, program.target.arch),
         "inter_workgroup_races": "not modelled: workgroups run one after another on shared memory",
     });
-    println!("{} {} wg {}/{} clean, {} finding(s) {:?}  [{} ms]", verdict, name, ran, wgs.len(), nfind, by_class, started.elapsed().as_millis());
+    println!(
+        "{} {} wg {}/{} clean, {} finding(s) {:?}  [{} ms]",
+        verdict,
+        name,
+        ran,
+        wgs.len(),
+        nfind,
+        by_class,
+        started.elapsed().as_millis()
+    );
     for f in &findings {
-        println!("  {} wg={:?} pc={} inst={} :: {}", f["class"].as_str().unwrap_or(""), f["workgroup"], f["pc"], f["inst"], f["message"].as_str().unwrap_or(""));
+        println!(
+            "  {} wg={:?} pc={} inst={} :: {}",
+            f["class"].as_str().unwrap_or(""),
+            f["workgroup"],
+            f["pc"],
+            f["inst"],
+            f["message"].as_str().unwrap_or("")
+        );
     }
     if let Some(p) = json_out {
-        std::fs::write(&p, serde_json::to_vec_pretty(&report).map_err(|e| e.to_string())?).map_err(|e| format!("{}: {e}", p.display()))?;
+        std::fs::write(
+            &p,
+            serde_json::to_vec_pretty(&report).map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| format!("{}: {e}", p.display()))?;
     }
     Ok(if nfind == 0 { 0 } else { 1 })
 }

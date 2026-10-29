@@ -122,11 +122,17 @@ impl LaneProj {
             Some("emu") => true,
             Some(g) if Group::parse(g).is_ok() => {
                 if s.kv.insert("group".to_owned(), g.to_owned()).is_some() {
-                    return Err(format!("lane_proj: shape names the group twice (`{g}` and group=)"));
+                    return Err(format!(
+                        "lane_proj: shape names the group twice (`{g}` and group=)"
+                    ));
                 }
                 false
             }
-            Some(p) => return Err(format!("lane_proj: unknown shape preset `{p}` (have emu, dn, fa, moe)")),
+            Some(p) => {
+                return Err(format!(
+                    "lane_proj: unknown shape preset `{p}` (have emu, dn, fa, moe)"
+                ))
+            }
         };
         let group = match s.kv.remove("group") {
             Some(g) => Group::parse(&g)?,
@@ -137,7 +143,10 @@ impl LaneProj {
         let rows = match s.kv.remove("rows") {
             Some(r) => r
                 .split(':')
-                .map(|t| t.parse::<usize>().map_err(|e| format!("--shape rows={r}: {e}")))
+                .map(|t| {
+                    t.parse::<usize>()
+                        .map_err(|e| format!("--shape rows={r}: {e}"))
+                })
                 .collect::<Result<Vec<_>>>()?,
             None if emu => group.emu_rows(),
             None => group.rows(),
@@ -151,9 +160,18 @@ impl LaneProj {
             return Err(format!("lane_proj: lanes={lanes} must be 1..={MAX_LANES}"));
         }
         if rows.is_empty() || rows.len() > 4 || rows.contains(&0) {
-            return Err(format!("lane_proj: segment rows {rows:?}: need 1..=4 positive segments"));
+            return Err(format!(
+                "lane_proj: segment rows {rows:?}: need 1..=4 positive segments"
+            ));
         }
-        Ok(Self { group, lanes, rows, flush, emu, st: None })
+        Ok(Self {
+            group,
+            lanes,
+            rows,
+            flush,
+            emu,
+            st: None,
+        })
     }
 
     /// The same node at another lane count (the identity matrix).
@@ -183,7 +201,9 @@ impl LaneProj {
     }
 
     fn st(&self) -> Result<&State> {
-        self.st.as_ref().ok_or_else(|| "lane_proj: setup has not run".to_owned())
+        self.st
+            .as_ref()
+            .ok_or_else(|| "lane_proj: setup has not run".to_owned())
     }
 
     /// Seeded host buffers: the weights of every segment (Small), the activations `[lanes][2048]`.
@@ -237,7 +257,13 @@ impl LaneProj {
         }
         let parts = par_map(tasks.len(), |t| {
             let (s, r0, nr) = tasks[t];
-            lane_ref::lane_proj_ref(&[&w[s][r0 * ROW_BYTES..(r0 + nr) * ROW_BYTES]], &[nr], x, lanes).remove(0)
+            lane_ref::lane_proj_ref(
+                &[&w[s][r0 * ROW_BYTES..(r0 + nr) * ROW_BYTES]],
+                &[nr],
+                x,
+                lanes,
+            )
+            .remove(0)
         });
         let mut out: Vec<Vec<u32>> = rows.iter().map(|&m| vec![0u32; lanes * m]).collect();
         for ((s, r0, nr), part) in tasks.iter().zip(parts) {
@@ -323,7 +349,12 @@ impl Node for LaneProj {
         GFX1201
     }
     fn shape_label(&self) -> String {
-        format!("{}{}-n{}", if self.emu { "emu-" } else { "" }, self.group.name(), self.lanes)
+        format!(
+            "{}{}-n{}",
+            if self.emu { "emu-" } else { "" },
+            self.group.name(),
+            self.lanes
+        )
     }
     fn shape_json(&self) -> Value {
         let sets = pool_sets(self.set_bytes());
@@ -355,7 +386,10 @@ impl Node for LaneProj {
         let wgs_per_wgp = hdr.take_usize("wgs_per_wgp", WGS_PER_WGP)?;
         let lds_per_lane = hdr.take_usize("lds_per_lane", LDS_PER_LANE)?;
         let fixed = match hdr.kv.remove("grid_fixed") {
-            Some(v) => Some(v.parse::<usize>().map_err(|e| format!("hip_loop header grid_fixed={v}: {e}"))?),
+            Some(v) => Some(
+                v.parse::<usize>()
+                    .map_err(|e| format!("hip_loop header grid_fixed={v}: {e}"))?,
+            ),
             None => None,
         };
         hdr.no_leftover()?;
@@ -374,14 +408,24 @@ impl Node for LaneProj {
         let grid = match fixed {
             Some(0) => return Err("hip_loop header: grid_fixed must be positive".into()),
             Some(g) => g,
-            None => self.total_rows().div_ceil(rows_per_wg).clamp(1, WGP_COUNT * wgs_per_wgp),
+            None => self
+                .total_rows()
+                .div_ceil(rows_per_wg)
+                .clamp(1, WGP_COUNT * wgs_per_wgp),
         };
         let grid = u32::try_from(grid).map_err(|_| format!("grid {grid} exceeds u32"))?;
-        Ok(Geometry { grid: [grid, 1, 1], block: [block as u32, 1, 1], lds: lds as u32 })
+        Ok(Geometry {
+            grid: [grid, 1, 1],
+            block: [block as u32, 1, 1],
+            lds: lds as u32,
+        })
     }
     fn work(&self) -> Work {
         let (t, l) = (self.total_rows() as f64, self.lanes as f64);
-        Work { flops: 2.0 * t * K as f64 * l, bytes: t * ROW_BYTES as f64 + l * K as f64 * 4.0 + t * l * 4.0 }
+        Work {
+            flops: 2.0 * t * K as f64 * l,
+            bytes: t * ROW_BYTES as f64 + l * K as f64 * 4.0 + t * l * 4.0,
+        }
     }
     fn record_extra(&self) -> Value {
         json!({"lanes": self.lanes, "group": self.group.name(), "flush": self.flush,
@@ -397,7 +441,10 @@ impl Node for LaneProj {
         true
     }
     fn identity_shapes(&self) -> Vec<String> {
-        Group::ALL.iter().map(|g| format!("group={},lanes={}", g.name(), self.lanes)).collect()
+        Group::ALL
+            .iter()
+            .map(|g| format!("group={},lanes={}", g.name(), self.lanes))
+            .collect()
     }
     fn extent_shapes(&self) -> Vec<String> {
         let mut v = Vec::new();
@@ -439,12 +486,21 @@ impl Node for LaneProj {
         let mut bufs: Vec<EmuBuf> = Vec::new();
         const WN: [&str; 4] = ["w0", "w1", "w2", "w3"];
         for (i, wb) in w.into_iter().enumerate() {
-            bufs.push(EmuBuf { name: WN[i], bytes: wb });
+            bufs.push(EmuBuf {
+                name: WN[i],
+                bytes: wb,
+            });
         }
         let xi = bufs.len();
-        bufs.push(EmuBuf { name: "x", bytes: f32_bytes(&x) });
+        bufs.push(EmuBuf {
+            name: "x",
+            bytes: f32_bytes(&x),
+        });
         let yi = bufs.len();
-        bufs.push(EmuBuf { name: "y", bytes: word_bytes(&poison_words(total)) });
+        bufs.push(EmuBuf {
+            name: "y",
+            bytes: word_bytes(&poison_words(total)),
+        });
         let seg = |i: usize| if i < self.rows.len() { i } else { 0 };
         let mut args = Vec::new();
         for i in 0..4 {
@@ -457,13 +513,20 @@ impl Node for LaneProj {
         for m in self.m4() {
             args.push(EmuArg::I32(m));
         }
-        Ok(EmuCase { bufs, args, out: yi })
+        Ok(EmuCase {
+            bufs,
+            args,
+            out: yi,
+        })
     }
 
     fn setup(&mut self, gpu: &Gpu, seed: u64) -> Result<()> {
         let wgp = gpu
             .hip
-            .get_device_attribute(rdna_compute::profiler::HIP_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, gpu.device_id)
+            .get_device_attribute(
+                rdna_compute::profiler::HIP_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT,
+                gpu.device_id,
+            )
             .map_err(err)?;
         if wgp as usize != WGP_COUNT {
             return Err(format!(
@@ -477,7 +540,12 @@ impl Node for LaneProj {
         for s in 0..n_sets {
             let mut bufs = Vec::new();
             for (i, &m) in self.rows.iter().enumerate() {
-                let w = synth_weights(m, K / 256, seed ^ ((i as u64 + 1) << 32) ^ ((s as u64) << 8), WKind::Small);
+                let w = synth_weights(
+                    m,
+                    K / 256,
+                    seed ^ ((i as u64 + 1) << 32) ^ ((s as u64) << 8),
+                    WKind::Small,
+                );
                 bufs.push(Buf::from_bytes(gpu, &w)?);
             }
             let p = |i: usize| bufs[if i < self.rows.len() { i } else { 0 }].ptr() as u64;
@@ -492,7 +560,13 @@ impl Node for LaneProj {
             y.push(Buf::from_bytes(gpu, &poison)?);
             y0.push(Buf::from_bytes(gpu, &poison)?);
         }
-        self.st = Some(State { sets, set_ptrs, x, y, y0 });
+        self.st = Some(State {
+            sets,
+            set_ptrs,
+            x,
+            y,
+            y0,
+        });
         Ok(())
     }
     fn reset(&mut self, gpu: &Gpu) -> Result<()> {
@@ -548,12 +622,24 @@ impl Node for LaneProj {
         }
     }
 
-    fn adversarial(&mut self, gpu: &Gpu, base: &ArmImage, cand: &ArmImage, seed: u64) -> Result<Option<Value>> {
+    fn adversarial(
+        &mut self,
+        gpu: &Gpu,
+        base: &ArmImage,
+        cand: &ArmImage,
+        seed: u64,
+    ) -> Result<Option<Value>> {
         let mut lanes = vec![self.lanes, 1, 2, 3, 5, 8];
         lanes.sort_unstable();
         lanes.dedup();
-        let arms = [LoadedArm::load(gpu, base.image)?, LoadedArm::load(gpu, cand.image)?];
-        let mut mx = Matrix { lanes: lanes.clone(), ..Default::default() };
+        let arms = [
+            LoadedArm::load(gpu, base.image)?,
+            LoadedArm::load(gpu, cand.image)?,
+        ];
+        let mut mx = Matrix {
+            lanes: lanes.clone(),
+            ..Default::default()
+        };
         let rows = self.rows.clone();
         let xbuf = Buf::alloc(gpu, MAX_LANES * K * 4)?;
         let ybufs: Vec<Buf> = rows
@@ -561,34 +647,63 @@ impl Node for LaneProj {
             .map(|&m| Buf::alloc(gpu, MAX_LANES * m * 4))
             .collect::<Result<_>>()?;
         let result = (|| -> Result<()> {
-            for (wi, wk) in [WKind::Small, WKind::Large, WKind::Wild].into_iter().enumerate() {
+            for (wi, wk) in [WKind::Small, WKind::Large, WKind::Wild]
+                .into_iter()
+                .enumerate()
+            {
                 mx.wkinds.push(wk.name());
                 let w: Vec<Vec<u8>> = rows
                     .iter()
                     .enumerate()
                     .map(|(i, &m)| {
-                        synth_weights(m, K / 256, seed ^ 0x1000 ^ ((wi as u64) * 17 + self.group as u64) ^ ((i as u64 + 1) << 32), wk)
+                        synth_weights(
+                            m,
+                            K / 256,
+                            seed ^ 0x1000
+                                ^ ((wi as u64) * 17 + self.group as u64)
+                                ^ ((i as u64 + 1) << 32),
+                            wk,
+                        )
                     })
                     .collect();
-                let wbufs: Vec<Buf> = w.iter().map(|b| Buf::from_bytes(gpu, b)).collect::<Result<_>>()?;
+                let wbufs: Vec<Buf> = w
+                    .iter()
+                    .map(|b| Buf::from_bytes(gpu, b))
+                    .collect::<Result<_>>()?;
                 for &n in &lanes {
                     let node = self.at_lanes(n);
                     let sym = node.symbol();
-                    let geo = [node.geometry(), node.geometry_with(&mut cand.header.clone())?];
+                    let geo = [
+                        node.geometry(),
+                        node.geometry_with(&mut cand.header.clone())?,
+                    ];
                     let funcs = [arms[0].function(gpu, &sym)?, arms[1].function(gpu, &sym)?];
                     for case in 0..=XKINDS.len() {
-                        let mut r = Xs64::new(seed ^ 0xA11CE ^ ((n as u64) << 8) ^ ((case as u64) << 16) ^ ((wi as u64) << 24));
+                        let mut r = Xs64::new(
+                            seed ^ 0xA11CE
+                                ^ ((n as u64) << 8)
+                                ^ ((case as u64) << 16)
+                                ^ ((wi as u64) << 24),
+                        );
                         let mut x = Vec::with_capacity(n * K);
                         for b in 0..n {
                             // cases 0..7: every lane that activation kind; the last: every kind mixed across lanes
-                            let kind = if case < XKINDS.len() { XKINDS[case] } else { XKINDS[b % XKINDS.len()] };
+                            let kind = if case < XKINDS.len() {
+                                XKINDS[case]
+                            } else {
+                                XKINDS[b % XKINDS.len()]
+                            };
                             x.extend(make_x(kind, &mut r));
                         }
                         let tag = format!(
                             "{} {} n{n} {}",
                             self.group.name(),
                             wk.name(),
-                            if case < XKINDS.len() { format!("{:?}", XKINDS[case]) } else { "mixed".into() }
+                            if case < XKINDS.len() {
+                                format!("{:?}", XKINDS[case])
+                            } else {
+                                "mixed".into()
+                            }
                         );
                         xbuf.upload(gpu, &f32_bytes(&x))?;
                         let cpu = Self::cpu_reference(&w, &rows, &x, n);
@@ -609,8 +724,12 @@ impl Node for LaneProj {
                                 a.i32(m);
                             }
                             let mut karg = a.finish();
-                            launch_sync(gpu, &funcs[arm], &geo[arm], &mut karg)
-                                .map_err(|e| format!("{} arm, {tag}: {e}", if arm == 0 { "baseline" } else { "candidate" }))?;
+                            launch_sync(gpu, &funcs[arm], &geo[arm], &mut karg).map_err(|e| {
+                                format!(
+                                    "{} arm, {tag}: {e}",
+                                    if arm == 0 { "baseline" } else { "candidate" }
+                                )
+                            })?;
                             let mut per_seg = Vec::new();
                             for y in &ybufs {
                                 per_seg.push(words(&y.download(gpu)?));
@@ -624,11 +743,17 @@ impl Node for LaneProj {
                                 let o = &outs[arm][s];
                                 if o[written..].iter().any(|&v| v != POISON) {
                                     mx.guard_violations[arm] += 1;
-                                    mx.fail(format!("[{tag}] {} wrote lane rows >= {n} of segment {s}", ["baseline", "candidate"][arm]));
+                                    mx.fail(format!(
+                                        "[{tag}] {} wrote lane rows >= {n} of segment {s}",
+                                        ["baseline", "candidate"][arm]
+                                    ));
                                 }
                                 if o[..written].iter().any(|&v| v == POISON) {
                                     mx.poison_left[arm] += 1;
-                                    mx.fail(format!("[{tag}] {} left poison in segment {s}", ["baseline", "candidate"][arm]));
+                                    mx.fail(format!(
+                                        "[{tag}] {} left poison in segment {s}",
+                                        ["baseline", "candidate"][arm]
+                                    ));
                                 }
                             }
                             let (b, c) = (&outs[0][s][..written], &outs[1][s][..written]);
@@ -688,14 +813,24 @@ mod tests {
     fn production_geometry_is_the_launcher_grid() {
         // total 12384 rows: ceil(12384/48) = 258 -> clamp to 32 * 3 = 96.
         let g = node("group=dn,lanes=8").geometry();
-        assert_eq!((g.grid, g.block, g.lds), ([96, 1, 1], [512, 1, 1], 8 * 2048 * 4));
+        assert_eq!(
+            (g.grid, g.block, g.lds),
+            ([96, 1, 1], [512, 1, 1], 8 * 2048 * 4)
+        );
         // fa: 9216 rows -> 192 -> 96; moe: 1281 rows -> 27 workgroups.
         assert_eq!(node("group=fa,lanes=8").geometry().grid, [96, 1, 1]);
         let g = node("group=moe,lanes=1").geometry();
         assert_eq!((g.grid, g.lds), ([27, 1, 1], 2048 * 4));
         // defaults: dn, 8 lanes
         let d = node("");
-        assert_eq!((d.group, d.lanes, d.symbol()), (Group::Dn, 8, "gemv_mq4g256v2_lane_proj_k2048_gfx1201_n8".to_owned()));
+        assert_eq!(
+            (d.group, d.lanes, d.symbol()),
+            (
+                Group::Dn,
+                8,
+                "gemv_mq4g256v2_lane_proj_k2048_gfx1201_n8".to_owned()
+            )
+        );
     }
 
     #[test]
@@ -724,11 +859,21 @@ mod tests {
         let mut h = Header::parse("// hip_loop: block=256 rows_per_wg=24 wgs_per_wgp=2").unwrap();
         let g = n.geometry_with(&mut h).unwrap();
         // ceil(12384/24) = 516 -> clamp(1, 64)
-        assert_eq!((g.grid, g.block, g.lds), ([64, 1, 1], [256, 1, 1], 4 * 8192));
+        assert_eq!(
+            (g.grid, g.block, g.lds),
+            ([64, 1, 1], [256, 1, 1], 4 * 8192)
+        );
         let mut h = Header::parse("// hip_loop: grid_fixed=7 lds_per_lane=4096").unwrap();
         let g = n.geometry_with(&mut h).unwrap();
         assert_eq!((g.grid, g.lds), ([7, 1, 1], 4 * 4096));
-        for bad in ["block=100", "block=0", "rows_per_wg=0", "grid_fixed=0", "lds_per_lane=20000", "waves=4"] {
+        for bad in [
+            "block=100",
+            "block=0",
+            "rows_per_wg=0",
+            "grid_fixed=0",
+            "lds_per_lane=20000",
+            "waves=4",
+        ] {
             let mut h = Header::parse(&format!("// hip_loop: {bad}")).unwrap();
             assert!(n.geometry_with(&mut h).is_err(), "{bad}");
         }
@@ -736,8 +881,19 @@ mod tests {
 
     #[test]
     fn shapes_parse_and_refuse() {
-        for s in ["group=x", "lanes=0", "lanes=9", "group=dn,q=1", "rows=1:2:3:4:5", "rows=0", "nope"] {
-            assert!(LaneProj::new(&ShapeSpec::parse(Some(s)).unwrap()).is_err(), "{s}");
+        for s in [
+            "group=x",
+            "lanes=0",
+            "lanes=9",
+            "group=dn,q=1",
+            "rows=1:2:3:4:5",
+            "rows=0",
+            "nope",
+        ] {
+            assert!(
+                LaneProj::new(&ShapeSpec::parse(Some(s)).unwrap()).is_err(),
+                "{s}"
+            );
         }
         let n = node("emu");
         assert_eq!((n.lanes, n.rows.clone()), (5, vec![70, 33, 5, 3]));
@@ -750,7 +906,10 @@ mod tests {
     fn extent_shapes_cover_every_group_at_lanes_1_3_8() {
         let v = node("emu").extent_shapes();
         assert_eq!(v.len(), 9);
-        assert!(v.contains(&"group=fa,lanes=3".to_owned()) && v.contains(&"group=moe,lanes=8".to_owned()));
+        assert!(
+            v.contains(&"group=fa,lanes=3".to_owned())
+                && v.contains(&"group=moe,lanes=8".to_owned())
+        );
         for s in &v {
             LaneProj::new(&ShapeSpec::parse(Some(s)).unwrap()).unwrap();
         }
@@ -781,7 +940,10 @@ mod tests {
                 for w in 0..n.lanes * m + PAD_WORDS {
                     let o = own(offs[s] + w);
                     if w < n.lanes * m {
-                        assert!(o[0] < g.grid[0] && o[1] == 0 && o[2] == 0, "{shape} seg {s} word {w}: {o:?}");
+                        assert!(
+                            o[0] < g.grid[0] && o[1] == 0 && o[2] == 0,
+                            "{shape} seg {s} word {w}: {o:?}"
+                        );
                     } else {
                         assert_eq!(o, PAD_OWNER);
                     }
@@ -807,7 +969,11 @@ mod tests {
         let (w, x) = n.host_inputs(5);
         let t = std::time::Instant::now();
         let r = LaneProj::cpu_reference(&w, &n.rows, &x, 8);
-        eprintln!("lane_proj cpu reference dn n8: {:?} ({} words)", t.elapsed(), r.iter().map(Vec::len).sum::<usize>());
+        eprintln!(
+            "lane_proj cpu reference dn n8: {:?} ({} words)",
+            t.elapsed(),
+            r.iter().map(Vec::len).sum::<usize>()
+        );
     }
 
     #[test]

@@ -57,7 +57,12 @@ pub struct ArmFail {
 }
 
 fn fail(reason: impl Into<String>, json: Value) -> ArmFail {
-    ArmFail { reason: reason.into(), instructions: 0, workgroups: 0, json }
+    ArmFail {
+        reason: reason.into(),
+        instructions: 0,
+        workgroups: 0,
+        json,
+    }
 }
 
 /// The kernarg segment of one arm: explicit arguments from `case` (addresses of the mapped
@@ -69,7 +74,10 @@ fn kernarg_bytes(
     segment: usize,
     geo: &Geometry,
 ) -> Result<Vec<u8>> {
-    let explicit: Vec<_> = args.iter().filter(|a| !a.value_kind.starts_with("hidden_")).collect();
+    let explicit: Vec<_> = args
+        .iter()
+        .filter(|a| !a.value_kind.starts_with("hidden_"))
+        .collect();
     if explicit.len() != case.args.len() {
         return Err(format!(
             "abi: the object declares {} explicit kernel arguments, the node passes {}",
@@ -77,13 +85,26 @@ fn kernarg_bytes(
             case.args.len()
         ));
     }
-    let end = args.iter().map(|a| (a.offset + a.size) as usize).max().unwrap_or(0);
+    let end = args
+        .iter()
+        .map(|a| (a.offset + a.size) as usize)
+        .max()
+        .unwrap_or(0);
     let mut k = vec![0u8; segment.max(end)];
     for (i, (a, v)) in explicit.iter().zip(&case.args).enumerate() {
         let (off, size) = (a.offset as usize, a.size as usize);
         let bytes: Vec<u8> = match v {
-            EmuArg::Buf(b) => addrs.get(*b).ok_or("abi: argument names a missing buffer")?.to_le_bytes().to_vec(),
-            EmuArg::BufOff(b, off) => (addrs.get(*b).ok_or("abi: argument names a missing buffer")? + off).to_le_bytes().to_vec(),
+            EmuArg::Buf(b) => addrs
+                .get(*b)
+                .ok_or("abi: argument names a missing buffer")?
+                .to_le_bytes()
+                .to_vec(),
+            EmuArg::BufOff(b, off) => (addrs
+                .get(*b)
+                .ok_or("abi: argument names a missing buffer")?
+                + off)
+                .to_le_bytes()
+                .to_vec(),
             EmuArg::Null => 0u64.to_le_bytes().to_vec(),
             EmuArg::I32(x) => x.to_le_bytes().to_vec(),
             EmuArg::U32(x) => x.to_le_bytes().to_vec(),
@@ -137,10 +158,14 @@ fn lift(image: &[u8]) -> Result<(peacemaker_ir::Program, &'static str)> {
 /// The wavefront size (32 or 64) of `symbol`'s kernel in a lifted program.
 fn kernel_wave(program: &peacemaker_ir::Program, symbol: &str) -> Option<u32> {
     use peacemaker_ir::inst::Wave;
-    program.kernels.iter().find(|k| k.symbol.0 == symbol).map(|k| match k.wave {
-        Wave::Wave32 => 32,
-        Wave::Wave64 => 64,
-    })
+    program
+        .kernels
+        .iter()
+        .find(|k| k.symbol.0 == symbol)
+        .map(|k| match k.wave {
+            Wave::Wave32 => 32,
+            Wave::Wave64 => 64,
+        })
 }
 
 /// The receipt's `numerics_model` for an arm (`arch` from the lifted program).
@@ -163,24 +188,41 @@ pub fn hazards(image: &[u8], symbol: &str) -> (bool, Value) {
     use peacemaker_lift::hazards_gfx11::{check_kernel, Severity};
     let (program, frontend) = match lift(image) {
         Ok(l) => l,
-        Err(e) => return (false, json!({"pass": false, "reason": format!("lift: {e}")})),
+        Err(e) => {
+            return (
+                false,
+                json!({"pass": false, "reason": format!("lift: {e}")}),
+            )
+        }
     };
     let arch = program.target.arch;
     let Some(kernel) = program.kernels.iter().find(|k| k.symbol.0 == symbol) else {
-        return (false, json!({"pass": false, "reason": format!("the object does not define `{symbol}`")}));
+        return (
+            false,
+            json!({"pass": false, "reason": format!("the object does not define `{symbol}`")}),
+        );
     };
     let findings = check_kernel(kernel, arch, true);
-    let blocking: Vec<&_> = findings.iter().filter(|f| f.severity != Severity::Advisory).collect();
+    let blocking: Vec<&_> = findings
+        .iter()
+        .filter(|f| f.severity != Severity::Advisory)
+        .collect();
     let advisory = findings.len() - blocking.len();
     let analysis = pm::analyze(&kernel.body, arch, kernel.wave);
     let mut reasons: Vec<String> = Vec::new();
     if !blocking.is_empty() {
-        reasons.push(format!("{} required/unchecked hazard finding(s)", blocking.len()));
+        reasons.push(format!(
+            "{} required/unchecked hazard finding(s)",
+            blocking.len()
+        ));
     }
     let replay = match &analysis {
         Ok(a) => {
             if !a.obligations.is_empty() {
-                reasons.push(format!("{} hazard obligation(s) from the PM IR replay", a.obligations.len()));
+                reasons.push(format!(
+                    "{} hazard obligation(s) from the PM IR replay",
+                    a.obligations.len()
+                ));
             }
             json!({"count": a.obligations.len(), "obligations": a.obligations.iter().map(|o| {
                 let pc = o.insts.first().and_then(|id| kernel.body.insts.get(*id)).and_then(|i| i.prov.pc);
@@ -249,7 +291,10 @@ pub fn run_arm_model(
     sel: &WgSel,
     model: Model,
 ) -> std::result::Result<ArmRun, ArmFail> {
-    debug_assert!(model == Model::Gate || cfg!(test), "only tests may run a non-gate emulator model");
+    debug_assert!(
+        model == Model::Gate || cfg!(test),
+        "only tests may run a non-gate emulator model"
+    );
     let pristine = case.bufs[case.out].bytes.clone();
     let mut mem = Memory::default();
     let r = exec_arm(tag, image, symbol, geo, case, sel, &mut mem, model);
@@ -293,8 +338,17 @@ fn exec_arm(
         .kernels
         .iter()
         .find(|k| k.symbol.0 == symbol)
-        .ok_or_else(|| fail(format!("the object does not define `{symbol}`"), info.clone()))?;
-    let Abi::Hsa { descriptor, metadata } = &kernel.abi else {
+        .ok_or_else(|| {
+            fail(
+                format!("the object does not define `{symbol}`"),
+                info.clone(),
+            )
+        })?;
+    let Abi::Hsa {
+        descriptor,
+        metadata,
+    } = &kernel.abi
+    else {
         return Err(fail("not an HSA kernel", info));
     };
     info["group_segment_fixed_size"] = json!(descriptor.group_segment_fixed_size);
@@ -303,7 +357,11 @@ fn exec_arm(
     // Every opcode of the kernel the emulator cannot execute, named at once (fail closed).
     let mut missing = std::collections::BTreeMap::<&str, usize>::new();
     for id in &kernel.body.layout {
-        let inst = kernel.body.insts.get(*id).expect("layout names an instruction");
+        let inst = kernel
+            .body
+            .insts
+            .get(*id)
+            .expect("layout names an instruction");
         match peacemaker_ir::isa::lookup(program.target.arch, inst.op, inst.form) {
             Some(row) if peacemaker_ir::emu::semantic_class(row.name).is_some() => {}
             Some(row) => *missing.entry(row.name).or_default() += 1,
@@ -312,7 +370,10 @@ fn exec_arm(
     }
     if !missing.is_empty() {
         let list: Vec<String> = missing.iter().map(|(n, c)| format!("{n} x{c}")).collect();
-        return Err(fail(format!("no emulator semantics for: {}", list.join(", ")), info));
+        return Err(fail(
+            format!("no emulator semantics for: {}", list.join(", ")),
+            info,
+        ));
     }
     let emu = Emulator::new(&program, symbol)
         .map_err(|e| fail(format!("emulator: {e}"), info.clone()))?
@@ -322,7 +383,7 @@ fn exec_arm(
         Model::Gate => emu.hw_model(),
         Model::StrictStoreSources => emu.hw_model_strict_store_sources(),
     }
-        .gfx1100_as_gfx1151();
+    .gfx1100_as_gfx1151();
 
     let mut addrs = Vec::with_capacity(case.bufs.len());
     for b in &mut case.bufs {
@@ -332,7 +393,10 @@ fn exec_arm(
                 .map_err(|e| fail(format!("map {}: {e}", b.name), info.clone()))?,
         );
     }
-    let segment = metadata.parsed.kernarg_segment_size.max(descriptor.kernarg_size) as usize;
+    let segment = metadata
+        .parsed
+        .kernarg_segment_size
+        .max(descriptor.kernarg_size) as usize;
     let kern = kernarg_bytes(case, &addrs, &metadata.parsed.args, segment, geo)
         .map_err(|e| fail(e, info.clone()))?;
     // The compiler merges neighbouring kernarg dwords into one 16-byte `s_load_b128`, which can span past
@@ -371,7 +435,12 @@ fn exec_arm(
                 json: info,
             });
         }
-        let launch = Launch { kernarg_ptr: kva, workgroup: [x, y, z], block: geo.block, dynamic_lds: geo.lds };
+        let launch = Launch {
+            kernarg_ptr: kva,
+            workgroup: [x, y, z],
+            block: geo.block,
+            dynamic_lds: geo.lds,
+        };
         let r = catch_unwind(AssertUnwindSafe(|| emu.run_workgroup_report(&launch, mem)));
         match r {
             Ok(Ok(rep)) => {
@@ -412,16 +481,28 @@ fn exec_arm(
             .find(|r| r.name == b.name)
             .expect("every mapped region is still mapped");
         if i != case.out && r.written.count() != 0 {
-            violations.push(format!("wrote {} byte(s) of the read-only input buffer `{}`", r.written.count(), b.name));
+            violations.push(format!(
+                "wrote {} byte(s) of the read-only input buffer `{}`",
+                r.written.count(),
+                b.name
+            ));
         }
     }
     if let Some(r) = mem.regions.iter().find(|r| r.name == "kernarg") {
         if r.written.count() != 0 {
-            violations.push(format!("wrote {} byte(s) of the kernarg segment", r.written.count()));
+            violations.push(format!(
+                "wrote {} byte(s) of the kernarg segment",
+                r.written.count()
+            ));
         }
     }
     if !violations.is_empty() {
-        return Err(ArmFail { reason: violations.join("; "), instructions, workgroups, json: info });
+        return Err(ArmFail {
+            reason: violations.join("; "),
+            instructions,
+            workgroups,
+            json: info,
+        });
     }
     let out_written = mem
         .regions
@@ -433,10 +514,18 @@ fn exec_arm(
     info["workgroups"] = json!(workgroups);
     info["instructions"] = json!(instructions);
     info["schedules"] = json!(schedules);
-    info["geometry"] = json!({"grid_workgroups": geo.grid, "block": geo.block, "lds_dynamic_bytes": geo.lds});
+    info["geometry"] =
+        json!({"grid_workgroups": geo.grid, "block": geo.block, "lds_dynamic_bytes": geo.lds});
     info["output_written_bytes"] = json!(out_written);
     info["elapsed_ms"] = json!(started.elapsed().as_millis() as u64);
-    Ok(ArmRun { out: Vec::new(), instructions, workgroups, json: info, out_written, written: None })
+    Ok(ArmRun {
+        out: Vec::new(),
+        instructions,
+        workgroups,
+        json: info,
+        out_written,
+        written: None,
+    })
 }
 
 /// First differing byte and the number of differing bytes.
@@ -487,9 +576,26 @@ pub fn gate(
     // The two arms are independent runs on the same inputs: the baseline on its own copy of the case, side by side.
     let mut base_case = case.clone();
     let (b, c) = std::thread::scope(|s| {
-        let hb = s.spawn(|| run_arm("baseline", base.0, symbol, base.1, &mut base_case, &WgSel::All));
+        let hb = s.spawn(|| {
+            run_arm(
+                "baseline",
+                base.0,
+                symbol,
+                base.1,
+                &mut base_case,
+                &WgSel::All,
+            )
+        });
         let c = run_arm("candidate", cand.0, symbol, cand.1, case, &WgSel::All);
-        (hb.join().unwrap_or_else(|_| Err(fail("baseline arm thread panicked", json!({"tag": "baseline"})))), c)
+        (
+            hb.join().unwrap_or_else(|_| {
+                Err(fail(
+                    "baseline arm thread panicked",
+                    json!({"tag": "baseline"}),
+                ))
+            }),
+            c,
+        )
     });
     let (bn, cn) = (counts(&b), counts(&c));
     let mut rec = json!({
@@ -519,12 +625,14 @@ pub fn gate(
     }
     let (b, c) = (b.ok().unwrap(), c.ok().unwrap());
     if b.out_written == 0 {
-        rec["reason"] = json!("the baseline wrote none of the output buffer: the launch is not exercised");
+        rec["reason"] =
+            json!("the baseline wrote none of the output buffer: the launch is not exercised");
         return (false, rec);
     }
     let pristine = &case.bufs[case.out].bytes;
     if diff(pristine, &b.out).is_none() {
-        rec["reason"] = json!("the baseline left the output buffer unchanged: the launch is not exercised");
+        rec["reason"] =
+            json!("the baseline left the output buffer unchanged: the launch is not exercised");
         return (false, rec);
     }
     match diff(&b.out, &c.out) {
@@ -555,7 +663,9 @@ pub type Owner<'a> = &'a dyn Fn(usize) -> [u32; 3];
 pub const MAX_EXTENT_WGS: usize = 2000;
 
 fn fnv(s: &str) -> u64 {
-    s.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3))
+    s.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| {
+        (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3)
+    })
 }
 
 /// The sampled workgroups of a grid: every corner (first/last along each dim), the last tile of each dim
@@ -608,7 +718,11 @@ fn wg_list(g: [u32; 3], picked: &[bool]) -> Vec<[u32; 3]> {
         .filter(|(_, p)| **p)
         .map(|(i, _)| {
             let (gx, gy) = (g[0] as usize, g[1] as usize);
-            [(i % gx) as u32, (i / gx % gy) as u32, (i / (gx * gy)) as u32]
+            [
+                (i % gx) as u32,
+                (i / gx % gy) as u32,
+                (i / (gx * gy)) as u32,
+            ]
         })
         .collect()
 }
@@ -639,7 +753,10 @@ pub fn extent_gate(
         (false, rec.clone())
     };
     if case.bufs[case.out].bytes.len() % 4 != 0 {
-        return stop(&mut rec, "output buffer is not a whole number of 4-byte elements".into());
+        return stop(
+            &mut rec,
+            "output buffer is not a whole number of 4-byte elements".into(),
+        );
     }
     // 1. the baseline's sampled workgroups -> their output elements -> the candidate workgroups owning them.
     let sampled = sample_wgs(gb, seed, label);
@@ -653,7 +770,10 @@ pub fn extent_gate(
             continue;
         }
         let Some(lb) = lin(gb, (base.2)(e)) else {
-            return stop(&mut rec, format!("baseline geometry does not cover output element {e}"));
+            return stop(
+                &mut rec,
+                format!("baseline geometry does not cover output element {e}"),
+            );
         };
         if sel_b[lb] {
             let Some(lc) = lin(gc, (cand.2)(e)) else {
@@ -680,7 +800,8 @@ pub fn extent_gate(
         }
     }
     let (wb, wc) = (wg_list(gb, &sel_b2), wg_list(gc, &sel_c));
-    rec["sampled_wgs"] = json!({"baseline_seed": sampled.len(), "baseline": wb.len(), "candidate": wc.len()});
+    rec["sampled_wgs"] =
+        json!({"baseline_seed": sampled.len(), "baseline": wb.len(), "candidate": wc.len()});
     rec["elements_compared"] = json!(n_e);
     if wb.len() > MAX_EXTENT_WGS || wc.len() > MAX_EXTENT_WGS {
         return stop(&mut rec, format!("the closure of the sampled workgroups is too large ({} baseline, {} candidate; limit {MAX_EXTENT_WGS})", wb.len(), wc.len()));
@@ -728,7 +849,17 @@ pub fn extent_gate(
         }
         for (arm, wr) in [("baseline", wrb), ("candidate", wrc)] {
             if !(0..4).all(|k| wr.contains(e * 4 + k)) {
-                return stop(&mut rec, format!("{arm} did not write output element {e} (owner workgroup {:?})", if arm == "baseline" { (base.2)(e) } else { (cand.2)(e) }));
+                return stop(
+                    &mut rec,
+                    format!(
+                        "{arm} did not write output element {e} (owner workgroup {:?})",
+                        if arm == "baseline" {
+                            (base.2)(e)
+                        } else {
+                            (cand.2)(e)
+                        }
+                    ),
+                );
             }
         }
         let r = e * 4..e * 4 + 4;
@@ -737,7 +868,10 @@ pub fn extent_gate(
         sha_c.update(&c.out[r.clone()]);
         changed |= b.out[r.clone()] != pristine[r.clone()];
         if b.out[r.clone()] != c.out[r.clone()] {
-            let (x, y) = (u32::from_le_bytes(b.out[r.clone()].try_into().unwrap()), u32::from_le_bytes(c.out[r.clone()].try_into().unwrap()));
+            let (x, y) = (
+                u32::from_le_bytes(b.out[r.clone()].try_into().unwrap()),
+                u32::from_le_bytes(c.out[r.clone()].try_into().unwrap()),
+            );
             rec["identical_to_baseline"] = json!(false);
             return stop(&mut rec, format!("output element {e} differs from the emulated incumbent: baseline {x:#010x}, candidate {y:#010x} (baseline owner {:?}, candidate owner {:?})", (base.2)(e), (cand.2)(e)));
         }

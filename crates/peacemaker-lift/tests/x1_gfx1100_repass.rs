@@ -16,7 +16,9 @@ use peacemaker_lift::rewrite::{apply, EquivalenceKind, Rewrite};
 use peacemaker_lift::{emit, lift_object, Options};
 use sha2::{Digest, Sha256};
 
-const OPTS: Options = Options { frontend: Frontend::Hipcc };
+const OPTS: Options = Options {
+    frontend: Frontend::Hipcc,
+};
 const SHA: &str = "c81a1c46757a4c9c27ae696a750534d4d70e301d4716be45d5b8491f3b7c27da";
 const MIDDLE: &str = "gemm_gate_up_mq4g256v2_wmma_gfx11_mw4_lds";
 const HOT: &str = "gemm_mq6g256v2_residual_wmma_gfx11_mw8_lds";
@@ -25,7 +27,10 @@ fn fixture() -> Vec<u8> {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/x1/gemm_mqv2_wmma_gfx1100_mw_lds.hsaco");
     let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
-    let digest: String = Sha256::digest(&bytes).iter().map(|b| format!("{b:02x}")).collect();
+    let digest: String = Sha256::digest(&bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
     assert_eq!(digest, SHA, "not the pinned fixture");
     bytes
 }
@@ -61,7 +66,11 @@ fn identity_rewrite_reproduces_the_object() {
     let cert = apply(
         &bytes,
         OPTS,
-        Rewrite { kernel: SymbolId(MIDDLE.into()), script: Vec::new(), claim: EquivalenceKind::ByteIdentical },
+        Rewrite {
+            kernel: SymbolId(MIDDLE.into()),
+            script: Vec::new(),
+            claim: EquivalenceKind::ByteIdentical,
+        },
     )
     .unwrap();
     assert_eq!(cert.bytes, bytes);
@@ -76,8 +85,23 @@ fn strip_delay_in_a_middle_kernel_relays_out_the_module() {
     let k0 = base.kernels.iter().find(|k| k.symbol == sym).unwrap();
     let ids = delays(k0);
     assert!(ids.len() > 10, "hipcc places s_delay_alu in this kernel");
-    let script = vec![Edit::Batch(ids.iter().map(|id| Edit::Remove { range: InstRange::single(*id) }).collect())];
-    let cert = apply(&bytes, OPTS, Rewrite { kernel: sym.clone(), script, claim: EquivalenceKind::Unproved }).unwrap();
+    let script = vec![Edit::Batch(
+        ids.iter()
+            .map(|id| Edit::Remove {
+                range: InstRange::single(*id),
+            })
+            .collect(),
+    )];
+    let cert = apply(
+        &bytes,
+        OPTS,
+        Rewrite {
+            kernel: sym.clone(),
+            script,
+            claim: EquivalenceKind::Unproved,
+        },
+    )
+    .unwrap();
     assert_ne!(cert.bytes, bytes);
     assert_eq!(cert.receipt.definedness, Ok(()));
     let back = lift_object(&cert.bytes, OPTS).unwrap().program;
@@ -91,7 +115,17 @@ fn strip_delay_in_a_middle_kernel_relays_out_the_module() {
         } else {
             assert_eq!(ta, tb, "{} must keep its exact .text", a.symbol.0);
         }
-        let (Abi::Hsa { descriptor: da, metadata: ma }, Abi::Hsa { descriptor: db, metadata: mb }) = (&a.abi, &b.abi) else {
+        let (
+            Abi::Hsa {
+                descriptor: da,
+                metadata: ma,
+            },
+            Abi::Hsa {
+                descriptor: db,
+                metadata: mb,
+            },
+        ) = (&a.abi, &b.abi)
+        else {
             panic!("raw ABI")
         };
         assert_eq!(ma.parsed, mb.parsed);
@@ -102,7 +136,12 @@ fn strip_delay_in_a_middle_kernel_relays_out_the_module() {
     }
     // The kernels after the edited one are 256-aligned: the shrink moves them only when it
     // crosses a 256-byte boundary, never past their original address.
-    let (i, _) = base.kernels.iter().enumerate().find(|(_, k)| k.symbol == sym).unwrap();
+    let (i, _) = base
+        .kernels
+        .iter()
+        .enumerate()
+        .find(|(_, k)| k.symbol == sym)
+        .unwrap();
     for (a, b) in base.kernels[i + 1..].iter().zip(&back.kernels[i + 1..]) {
         assert!(entry(b) <= entry(a));
         assert_eq!(entry(b) % 256, 0);

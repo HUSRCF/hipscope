@@ -77,13 +77,13 @@ impl Mq6Res {
         let (label, pm, pk) = match &s.preset {
             Some(_) if emu => ("emu".to_owned(), Some(EMU.0), Some(EMU.1)),
             Some(p) => {
-                let (_, m, k) = PRESETS
-                    .iter()
-                    .find(|(n, _, _)| n == p)
-                    .ok_or_else(|| {
-                        let names: Vec<&str> = PRESETS.iter().map(|p| p.0).collect();
-                        format!("mq6_res: unknown shape preset `{p}` (have {}, emu)", names.join(", "))
-                    })?;
+                let (_, m, k) = PRESETS.iter().find(|(n, _, _)| n == p).ok_or_else(|| {
+                    let names: Vec<&str> = PRESETS.iter().map(|p| p.0).collect();
+                    format!(
+                        "mq6_res: unknown shape preset `{p}` (have {}, emu)",
+                        names.join(", ")
+                    )
+                })?;
                 (p.clone(), Some(*m), Some(*k))
             }
             None => ("custom".to_owned(), None, None),
@@ -104,13 +104,24 @@ impl Mq6Res {
         };
         s.no_leftover()?;
         if m == 0 || n == 0 || k == 0 || k % 256 != 0 {
-            return Err(format!("mq6_res: M={m} N={n} K={k}: need positive dims and K % 256 == 0"));
+            return Err(format!(
+                "mq6_res: M={m} N={n} K={k}: need positive dims and K % 256 == 0"
+            ));
         }
-        Ok(Self { label, m, k, n, waves, st: None })
+        Ok(Self {
+            label,
+            m,
+            k,
+            n,
+            waves,
+            st: None,
+        })
     }
 
     fn st(&self) -> Result<&State> {
-        self.st.as_ref().ok_or_else(|| "mq6_res: setup has not run".to_owned())
+        self.st
+            .as_ref()
+            .ok_or_else(|| "mq6_res: setup has not run".to_owned())
     }
 
     /// `m x (k/256)` MQ6G256V2 groups: finite small f16 scales, zero points
@@ -191,15 +202,26 @@ impl Node for Mq6Res {
         // Y is f32 [N][M]; the workgroup is (row tile, token tile).
         let (tm, tn) = header_tiles(hdr, 16, 16 * self.waves)?;
         let m = self.m;
-        Ok(Box::new(move |e| [(e % m / tm) as u32, (e / m / tn) as u32, 0]))
+        Ok(Box::new(move |e| {
+            [(e % m / tm) as u32, (e / m / tn) as u32, 0]
+        }))
     }
     fn emu_case(&self, seed: u64) -> Result<EmuCase> {
         let (w, x, y) = self.host_inputs(seed);
         Ok(EmuCase {
             bufs: vec![
-                EmuBuf { name: "a", bytes: w },
-                EmuBuf { name: "x", bytes: x },
-                EmuBuf { name: "y", bytes: y },
+                EmuBuf {
+                    name: "a",
+                    bytes: w,
+                },
+                EmuBuf {
+                    name: "x",
+                    bytes: x,
+                },
+                EmuBuf {
+                    name: "y",
+                    bytes: y,
+                },
             ],
             args: vec![
                 EmuArg::Buf(0),
@@ -280,13 +302,23 @@ mod tests {
             // The profiler's grid_size is workgroups x block on the x axis only
             // (rocprof reports y/z in work-items too, and block y/z are 1).
             assert_eq!(g.threads(), grid, "{name}");
-            assert_eq!(n.incumbent().unwrap().symbol, "gemm_mq6g256v2_residual_wmma_gfx11_mw8_lds");
+            assert_eq!(
+                n.incumbent().unwrap().symbol,
+                "gemm_mq6g256v2_residual_wmma_gfx11_mw8_lds"
+            );
         }
     }
 
     #[test]
     fn waves_follow_the_production_policy() {
-        assert_eq!(node("qkv,N=416").incumbent().unwrap().symbol.contains("mw4"), true);
+        assert_eq!(
+            node("qkv,N=416")
+                .incumbent()
+                .unwrap()
+                .symbol
+                .contains("mw4"),
+            true
+        );
         assert_eq!(node("qkv,N=463").waves, 4);
         assert_eq!(node("qkv,N=464").waves, 8);
         assert!(Mq6Res::new(&ShapeSpec::parse(Some("qkv,N=128")).unwrap()).is_err());
@@ -299,10 +331,17 @@ mod tests {
         let mut h = Header::parse("// hip_loop: tile_m=32 tile_n=128 block=256\n").unwrap();
         let g = n.geometry_with(&mut h).unwrap();
         assert_eq!(g.grid, [320, 6, 1]);
-        let mut h = Header::parse("// hip_loop: tile_m=16 tile_n=256 block=512 lds_dynamic=1024").unwrap();
+        let mut h =
+            Header::parse("// hip_loop: tile_m=16 tile_n=256 block=512 lds_dynamic=1024").unwrap();
         let g = n.geometry_with(&mut h).unwrap();
         assert_eq!((g.grid, g.block, g.lds), ([640, 3, 1], [512, 1, 1], 1024));
-        for bad in ["tile_m=0", "block=100", "bogus=1", "lds_dynamic=999999", "tile_n=abc"] {
+        for bad in [
+            "tile_m=0",
+            "block=100",
+            "bogus=1",
+            "lds_dynamic=999999",
+            "tile_n=abc",
+        ] {
             let mut h = Header::parse(&format!("// hip_loop: {bad}")).unwrap();
             assert!(n.geometry_with(&mut h).is_err(), "{bad}");
         }
@@ -318,7 +357,10 @@ mod tests {
             for h in 0..2 {
                 let s = half::f16::from_le_bytes([g[4 * h], g[4 * h + 1]]).to_f32();
                 let z = half::f16::from_le_bytes([g[4 * h + 2], g[4 * h + 3]]).to_f32();
-                assert!(s.is_finite() && s > 0.0 && s < 0.02 && z.is_finite(), "{s} {z}");
+                assert!(
+                    s.is_finite() && s > 0.0 && s < 0.02 && z.is_finite(),
+                    "{s} {z}"
+                );
             }
         }
     }
@@ -327,6 +369,9 @@ mod tests {
     fn work_counts_match_production_bytes() {
         let w = node("qkv").work();
         assert_eq!(w.flops, 2.0 * 10240.0 * 2560.0 * 768.0);
-        assert_eq!(w.bytes, (10240 * 10 * 200 + 768 * 2560 * 2 + 768 * 10240 * 8) as f64);
+        assert_eq!(
+            w.bytes,
+            (10240 * 10 * 200 + 768 * 2560 * 2 + 768 * 10240 * 8) as f64
+        );
     }
 }

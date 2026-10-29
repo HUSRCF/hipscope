@@ -240,7 +240,9 @@ fn parse_args(args: &[String]) -> Result<Opts> {
             "--identity" => {
                 let v = value("identity")?;
                 if !["full", "smoke", "skip"].contains(&v.as_str()) {
-                    return Err(format!("--identity {v}: expected `full`, `smoke` or `skip`"));
+                    return Err(format!(
+                        "--identity {v}: expected `full`, `smoke` or `skip`"
+                    ));
                 }
                 o.identity = Some(v);
             }
@@ -273,7 +275,10 @@ fn parse_args(args: &[String]) -> Result<Opts> {
         + usize::from(o.cand_object.is_some())
         + usize::from(o.null_control);
     if sources != 1 {
-        return Err("exactly one of --cand FILE.hip, --cand-object FILE.co, --null-control aa is required".into());
+        return Err(
+            "exactly one of --cand FILE.hip, --cand-object FILE.co, --null-control aa is required"
+                .into(),
+        );
     }
     if o.identity_only && (o.offline || o.emu) {
         return Err("--identity-only runs on the device (not with --offline/--emu)".into());
@@ -365,7 +370,12 @@ struct Prep {
 
 /// Resolve the candidate, its geometry, compile both arms, and fill the offline
 /// part of the record.
-fn prepare(o: &Opts, node: &dyn Node, workdir: &Path, rec: &mut Value) -> std::result::Result<Prep, (String, String)> {
+fn prepare(
+    o: &Opts,
+    node: &dyn Node,
+    workdir: &Path,
+    rec: &mut Value,
+) -> std::result::Result<Prep, (String, String)> {
     let stage = |s: &str| {
         let s = s.to_owned();
         move |e: String| (s.clone(), e)
@@ -425,7 +435,8 @@ fn prepare(o: &Opts, node: &dyn Node, workdir: &Path, rec: &mut Value) -> std::r
     let base = match &o.base_object {
         Some(p) => {
             let b = jit::from_object_for(arch, "baseline", p).map_err(stage("base_object"))?;
-            rec["base_object"] = verify_base_object_for(arch, p, &inc, &b, compiled_base.as_ref()).map_err(stage("base_object"))?;
+            rec["base_object"] = verify_base_object_for(arch, p, &inc, &b, compiled_base.as_ref())
+                .map_err(stage("base_object"))?;
             b
         }
         None => compiled_base.ok_or(("compile".to_owned(), "internal: no baseline".to_owned()))?,
@@ -435,7 +446,10 @@ fn prepare(o: &Opts, node: &dyn Node, workdir: &Path, rec: &mut Value) -> std::r
     } else if let Some(c) = compiled_cand {
         c
     } else {
-        let p = o.base_object.as_ref().expect("an A/A without a candidate build has --base-object");
+        let p = o
+            .base_object
+            .as_ref()
+            .expect("an A/A without a candidate build has --base-object");
         jit::from_object_for(arch, "candidate", p).map_err(stage("base_object"))?
     };
     if o.cand_object.is_some() {
@@ -449,7 +463,10 @@ fn prepare(o: &Opts, node: &dyn Node, workdir: &Path, rec: &mut Value) -> std::r
         }
         let lds = ck.lds_bytes + u64::from(cand_geo.lds);
         if lds > 64 * 1024 {
-            return Err(("abi".into(), format!("static + dynamic LDS is {lds} B, over the 64 KiB workgroup limit")));
+            return Err((
+                "abi".into(),
+                format!("static + dynamic LDS is {lds} B, over the 64 KiB workgroup limit"),
+            ));
         }
         rec["candidate_object"] = json!({
             "path": o.cand_object.as_ref().map(|p| p.display().to_string()),
@@ -460,18 +477,24 @@ fn prepare(o: &Opts, node: &dyn Node, workdir: &Path, rec: &mut Value) -> std::r
     }
     // The compiled objects, reusable on a card without recompiling: `--base-object
     // DIR/baseline.co`, `--cand-object DIR/candidate.co --cand-geometry <candidate_geometry_arg>`.
-    let publish = |name: &str, b: &jit::Built, source: &str, kv: &std::collections::BTreeMap<String, String>| {
+    let publish = |name: &str,
+                   b: &jit::Built,
+                   source: &str,
+                   kv: &std::collections::BTreeMap<String, String>| {
         let co = workdir.join(name);
         let side = jit::sidecar_json_for(arch, &o.node, &inc, b, source, kv);
-        jit::publish(&co, b, &side)
-            .map(|()| json!({"path": co.display().to_string(), "sha256": b.image_sha256,
-                "sidecar": jit::sidecar_path(&co).display().to_string()}))
+        jit::publish(&co, b, &side).map(|()| {
+            json!({"path": co.display().to_string(), "sha256": b.image_sha256,
+                "sidecar": jit::sidecar_path(&co).display().to_string()})
+        })
     };
     if o.base_object.is_none() {
-        rec["baseline_co"] = publish("baseline.co", &base, &inc.source, &Default::default()).map_err(stage("write"))?;
+        rec["baseline_co"] = publish("baseline.co", &base, &inc.source, &Default::default())
+            .map_err(stage("write"))?;
     }
     if let (true, Some(src)) = (want_cand && o.cand_object.is_none(), &cand_source) {
-        rec["candidate_co"] = publish("candidate.co", &cand, src, &header_kv).map_err(stage("write"))?;
+        rec["candidate_co"] =
+            publish("candidate.co", &cand, src, &header_kv).map_err(stage("write"))?;
         let arg: Vec<String> = header_kv.iter().map(|(k, v)| format!("{k}={v}")).collect();
         rec["candidate_geometry_arg"] = json!(arg.join(" "));
     }
@@ -479,7 +502,11 @@ fn prepare(o: &Opts, node: &dyn Node, workdir: &Path, rec: &mut Value) -> std::r
     if o.base_object.is_some() {
         rec["baseline"]["kind"] = json!("object");
     }
-    let cand_stage = if o.cand_object.is_some() { "object" } else { "compile" };
+    let cand_stage = if o.cand_object.is_some() {
+        "object"
+    } else {
+        "compile"
+    };
     let ck = arm_json(&cand, &inc.symbol, &cand_geo).map_err(stage(cand_stage))?;
     rec["candidate"] = ck;
     if o.cand_object.is_some() {
@@ -502,7 +529,14 @@ fn prepare(o: &Opts, node: &dyn Node, workdir: &Path, rec: &mut Value) -> std::r
             },
         });
     }
-    Ok(Prep { inc, base, cand, base_geo, cand_geo, cand_header: Header { kv: header_kv } })
+    Ok(Prep {
+        inc,
+        base,
+        cand,
+        base_geo,
+        cand_geo,
+        cand_header: Header { kv: header_kv },
+    })
 }
 
 /// `--base-object FILE.co` as the incumbent: its sidecar `FILE.co.json` (written by an
@@ -536,12 +570,18 @@ fn verify_base_object_for(
     })?;
     let sc: Value = serde_json::from_str(&text).map_err(|e| format!("{}: {e}", side.display()))?;
     if sc["tool"] != "hip_loop" || sc["schema"] != SCHEMA {
-        return Err(format!("{}: not a hip_loop schema {SCHEMA} sidecar", side.display()));
+        return Err(format!(
+            "{}: not a hip_loop schema {SCHEMA} sidecar",
+            side.display()
+        ));
     }
     if sc["module"] != inc.module.as_str() || sc["arch"] != arch {
         return Err(format!(
             "{}: sidecar is for module {} on {}, the incumbent is {} on {arch}",
-            side.display(), sc["module"], sc["arch"], inc.module
+            side.display(),
+            sc["module"],
+            sc["arch"],
+            inc.module
         ));
     }
     let src_sha = elf::sha256_hex(inc.source.as_bytes());
@@ -552,15 +592,28 @@ fn verify_base_object_for(
         ));
     }
     if sc["object_sha256"] != b.image_sha256.as_str() {
-        return Err(format!("{}: the object changed after its sidecar was written", path.display()));
+        return Err(format!(
+            "{}: the object changed after its sidecar was written",
+            path.display()
+        ));
     }
     let k = b.kernel(&inc.symbol)?;
     let sk = &sc["kernels"][&inc.symbol];
     if sk.is_null() || sk["code_sha256"] != k.code_sha256.as_str() {
-        return Err(format!("{}: `{}` .text sha256 {} does not match the sidecar's {}", path.display(), inc.symbol, k.code_sha256, sk["code_sha256"]));
+        return Err(format!(
+            "{}: `{}` .text sha256 {} does not match the sidecar's {}",
+            path.display(),
+            inc.symbol,
+            k.code_sha256,
+            sk["code_sha256"]
+        ));
     }
     if sk["explicit_args"] != k.json()["explicit_args"] {
-        return Err(format!("{}: `{}` explicit kernel arguments differ from the sidecar's", path.display(), inc.symbol));
+        return Err(format!(
+            "{}: `{}` explicit kernel arguments differ from the sidecar's",
+            path.display(),
+            inc.symbol
+        ));
     }
     if let Some(r) = recompiled {
         let fresh = &r.kernel(&inc.symbol)?.code_sha256;
@@ -593,7 +646,11 @@ fn run(o: &Opts) -> (Value, Outcome) {
     let mut shape = o.shape.clone().or_else(|| o.emu.then(|| "emu".to_owned()));
     if o.flush {
         if !o.node.starts_with("lane_") {
-            return fail(rec, "args", "--flush is supported by the lane_proj / lane_wo nodes only");
+            return fail(
+                rec,
+                "args",
+                "--flush is supported by the lane_proj / lane_wo nodes only",
+            );
         }
         shape = Some(match shape {
             Some(s) => format!("{s},flush=1"),
@@ -660,7 +717,10 @@ fn emu_stage(o: &Opts, node: &dyn Node, prep: &Prep, mut rec: Value) -> (Value, 
     let mut pass = small_pass;
     let mut why: Vec<String> = Vec::new();
     if !small_pass {
-        why.push(format!("small shape: {}", receipt["reason"].as_str().unwrap_or("?")));
+        why.push(format!(
+            "small shape: {}",
+            receipt["reason"].as_str().unwrap_or("?")
+        ));
     }
     if o.no_extent {
         receipt["extent_cases"] = json!([]);
@@ -679,11 +739,17 @@ fn emu_stage(o: &Opts, node: &dyn Node, prep: &Prep, mut rec: Value) -> (Value, 
         let results: Vec<(bool, Value)> = if node.extent_full_default() {
             lane_common::par_map(shapes.len(), |i| extent_case(o, name, prep, &shapes[i]))
         } else {
-            shapes.iter().map(|s| extent_case(o, name, prep, s)).collect()
+            shapes
+                .iter()
+                .map(|s| extent_case(o, name, prep, s))
+                .collect()
         };
         for (shape, (ok, r)) in shapes.iter().zip(results) {
             if !ok {
-                why.push(format!("extent {shape}: {}", r["reason"].as_str().unwrap_or("?")));
+                why.push(format!(
+                    "extent {shape}: {}",
+                    r["reason"].as_str().unwrap_or("?")
+                ));
             }
             pass &= ok;
             cases.push(r);
@@ -697,7 +763,11 @@ fn emu_stage(o: &Opts, node: &dyn Node, prep: &Prep, mut rec: Value) -> (Value, 
         // is launched through `_n{lanes}` at every lane count.
         let mut symbols = vec![prep.inc.symbol.clone()];
         for s in node.extent_shapes() {
-            if let Some(sym) = build_node(node.name(), Some(&s)).ok().and_then(|n| n.incumbent().ok()).map(|i| i.symbol) {
+            if let Some(sym) = build_node(node.name(), Some(&s))
+                .ok()
+                .and_then(|n| n.incumbent().ok())
+                .map(|i| i.symbol)
+            {
                 if !symbols.contains(&sym) {
                     symbols.push(sym);
                 }
@@ -711,7 +781,10 @@ fn emu_stage(o: &Opts, node: &dyn Node, prep: &Prep, mut rec: Value) -> (Value, 
             if !hc_ok {
                 bad_symbols.push(format!("{sym}: {}", hc["reason"].as_str().unwrap_or("?")));
             }
-            by_symbol.insert(sym.clone(), json!({"pass": hc_ok, "candidate": hc, "baseline": hb}));
+            by_symbol.insert(
+                sym.clone(),
+                json!({"pass": hc_ok, "candidate": hc, "baseline": hb}),
+            );
         }
         receipt["hazards"] = json!({
             "pass": bad_symbols.is_empty(),
@@ -725,12 +798,19 @@ fn emu_stage(o: &Opts, node: &dyn Node, prep: &Prep, mut rec: Value) -> (Value, 
         }
     }
     receipt["pass"] = json!(pass);
-    receipt["reason"] = if pass { Value::Null } else { json!(why.join(" | ")) };
+    receipt["reason"] = if pass {
+        Value::Null
+    } else {
+        json!(why.join(" | "))
+    };
     rec["emu_gate"] = receipt;
     if pass {
         (rec, Outcome::Ok)
     } else {
-        eprintln!("hip_loop: emu_gate FAIL: {}", rec["emu_gate"]["reason"].as_str().unwrap_or("?"));
+        eprintln!(
+            "hip_loop: emu_gate FAIL: {}",
+            rec["emu_gate"]["reason"].as_str().unwrap_or("?")
+        );
         (rec, Outcome::IdentityFailed)
     }
 }
@@ -738,7 +818,12 @@ fn emu_stage(o: &Opts, node: &dyn Node, prep: &Prep, mut rec: Value) -> (Value, 
 /// One production-extent case of `emu_stage` at `shape`.
 fn extent_case(o: &Opts, name: &str, prep: &Prep, shape: &str) -> (bool, Value) {
     let t = std::time::Instant::now();
-    let bad = |why: String| (false, json!({"label": shape, "shape": shape, "pass": false, "reason": why}));
+    let bad = |why: String| {
+        (
+            false,
+            json!({"label": shape, "shape": shape, "pass": false, "reason": why}),
+        )
+    };
     let n = match build_node(name, Some(shape)) {
         Ok(n) => n,
         Err(e) => return bad(format!("extent shape: {e}")),
@@ -781,7 +866,10 @@ fn extent_case(o: &Opts, name: &str, prep: &Prep, shape: &str) -> (bool, Value) 
         r["total_ms"] = json!(t.elapsed().as_millis() as u64);
         return (ok, r);
     }
-    let (ob, oc) = match (n.out_owner(&Header::default()), n.out_owner(&prep.cand_header)) {
+    let (ob, oc) = match (
+        n.out_owner(&Header::default()),
+        n.out_owner(&prep.cand_header),
+    ) {
         (Ok(b), Ok(c)) => (b, c),
         (Err(e), _) | (_, Err(e)) => return bad(format!("output owner map: {e}")),
     };
@@ -817,12 +905,23 @@ struct Arm {
     karg: Vec<u8>,
 }
 
-fn load(gpu: &rdna_compute::Gpu, b: &jit::Built, symbol: &str, geo: Geometry, karg: Vec<u8>) -> Result<Arm> {
+fn load(
+    gpu: &rdna_compute::Gpu,
+    b: &jit::Built,
+    symbol: &str,
+    geo: Geometry,
+    karg: Vec<u8>,
+) -> Result<Arm> {
     // A fresh module per arm: no name-keyed function cache sits between the two
     // arms, which share the kernel symbol.
     let module = gpu.hip.module_load_data(&b.image).map_err(err)?;
     let func = gpu.hip.module_get_function(&module, symbol).map_err(err)?;
-    Ok(Arm { _module: module, func, geo, karg })
+    Ok(Arm {
+        _module: module,
+        func,
+        geo,
+        karg,
+    })
 }
 
 fn sync(gpu: &rdna_compute::Gpu) -> Result<()> {
@@ -847,7 +946,11 @@ fn diff(a: &[u8], b: &[u8]) -> Option<(usize, usize)> {
 }
 
 fn clock_note(gpu: &rdna_compute::Gpu) -> Value {
-    let bus = gpu.hip.device_pci_bus_id(gpu.device_id).ok().map(|s| s.to_lowercase());
+    let bus = gpu
+        .hip
+        .device_pci_bus_id(gpu.device_id)
+        .ok()
+        .map(|s| s.to_lowercase());
     let read = |name: &str| -> Option<String> {
         let bus = bus.as_ref()?;
         std::fs::read_to_string(format!("/sys/bus/pci/devices/{bus}/{name}"))
@@ -957,7 +1060,10 @@ fn sample(
     // the way the other kernels of a decode step do; always outside the timed interval.
     let evict = |gpu: &rdna_compute::Gpu| -> Result<()> {
         match flush {
-            Some((a, f)) => gpu.hip.memcpy_dtod(&f.buf, &a.buf, lane_common::FLUSH_BYTES).map_err(err),
+            Some((a, f)) => gpu
+                .hip
+                .memcpy_dtod(&f.buf, &a.buf, lane_common::FLUSH_BYTES)
+                .map_err(err),
             None => Ok(()),
         }
     };
@@ -1001,7 +1107,11 @@ fn gpu_stage(o: &Opts, node: &mut dyn Node, prep: &Prep, mut rec: Value) -> (Val
         "fabric_job": std::env::var("FABRIC_JOB").ok(),
     });
     if arch != node.arch() {
-        return fail(rec, "device", format!("device is {arch}, hip_loop requires {}", node.arch()));
+        return fail(
+            rec,
+            "device",
+            format!("device is {arch}, hip_loop requires {}", node.arch()),
+        );
     }
     if o.identity_only {
         // No timing and no pool: the node's adversarial matrix over every shape it names.
@@ -1020,7 +1130,13 @@ fn gpu_stage(o: &Opts, node: &mut dyn Node, prep: &Prep, mut rec: Value) -> (Val
 
 /// `--identity-only`: the adversarial identity matrix of the node over ALL its identity shapes (lane_proj: every
 /// group; the node's own lane set per group), both arms, no timing. Exit 0 = every matrix passed.
-fn identity_only(o: &Opts, node: &mut dyn Node, prep: &Prep, gpu: &rdna_compute::Gpu, mut rec: Value) -> (Value, Outcome) {
+fn identity_only(
+    o: &Opts,
+    node: &mut dyn Node,
+    prep: &Prep,
+    gpu: &rdna_compute::Gpu,
+    mut rec: Value,
+) -> (Value, Outcome) {
     let empty = Header::default();
     let mut shapes = node.identity_shapes();
     if shapes.is_empty() {
@@ -1036,7 +1152,13 @@ fn identity_only(o: &Opts, node: &mut dyn Node, prep: &Prep, gpu: &rdna_compute:
         } else {
             match build_node(node.name(), Some(&shape)) {
                 Ok(n) => Some(n),
-                Err(e) => return fail(rec, "identity_matrix", format!("identity shape {shape}: {e}")),
+                Err(e) => {
+                    return fail(
+                        rec,
+                        "identity_matrix",
+                        format!("identity shape {shape}: {e}"),
+                    )
+                }
             }
         };
         let target: &mut dyn Node = match other.as_mut() {
@@ -1046,8 +1168,16 @@ fn identity_only(o: &Opts, node: &mut dyn Node, prep: &Prep, gpu: &rdna_compute:
         let label = target.shape_label();
         let m = target.adversarial(
             gpu,
-            &node::ArmImage { tag: "baseline", image: &prep.base.image, header: &empty },
-            &node::ArmImage { tag: "candidate", image: &prep.cand.image, header: &prep.cand_header },
+            &node::ArmImage {
+                tag: "baseline",
+                image: &prep.base.image,
+                header: &empty,
+            },
+            &node::ArmImage {
+                tag: "candidate",
+                image: &prep.cand.image,
+                header: &prep.cand_header,
+            },
             o.seed,
         );
         match m {
@@ -1068,7 +1198,11 @@ fn identity_only(o: &Opts, node: &mut dyn Node, prep: &Prep, gpu: &rdna_compute:
         }
     }
     if results.is_empty() {
-        return fail(rec, "identity", format!("node {} has no adversarial identity matrix", node.name()));
+        return fail(
+            rec,
+            "identity",
+            format!("node {} has no adversarial identity matrix", node.name()),
+        );
     }
     rec["identity_mode"] = json!("only");
     rec["identity_matrix"] = json!({
@@ -1097,7 +1231,8 @@ fn gpu_run(
     };
     let karg = node.kernarg().map_err(stage("setup"))?;
     let sym = &prep.inc.symbol;
-    let mut base = load(gpu, &prep.base, sym, prep.base_geo, karg.clone()).map_err(stage("load"))?;
+    let mut base =
+        load(gpu, &prep.base, sym, prep.base_geo, karg.clone()).map_err(stage("load"))?;
     let mut cand = load(gpu, &prep.cand, sym, prep.cand_geo, karg).map_err(stage("load"))?;
 
     // `--identity full|smoke|skip` (default full). `smoke`: only the basic dispatch identity below (the
@@ -1132,10 +1267,17 @@ fn gpu_run(
             "differing_bytes": d.map(|x| x.1),
         });
         if !changed {
-            return Err(("identity".into(), "the baseline dispatch did not change the output: the launch is not exercised".into()));
+            return Err((
+                "identity".into(),
+                "the baseline dispatch did not change the output: the launch is not exercised"
+                    .into(),
+            ));
         }
         if !base_repeat {
-            return Err(("identity".into(), "the baseline output is not repeatable from a pristine state".into()));
+            return Err((
+                "identity".into(),
+                "the baseline output is not repeatable from a pristine state".into(),
+            ));
         }
         if !identical || !cand_repeat {
             return Ok(Outcome::IdentityFailed);
@@ -1148,8 +1290,16 @@ fn gpu_run(
             let matrix = node
                 .adversarial(
                     gpu,
-                    &node::ArmImage { tag: "baseline", image: &prep.base.image, header: &empty },
-                    &node::ArmImage { tag: "candidate", image: &prep.cand.image, header: &prep.cand_header },
+                    &node::ArmImage {
+                        tag: "baseline",
+                        image: &prep.base.image,
+                        header: &empty,
+                    },
+                    &node::ArmImage {
+                        tag: "candidate",
+                        image: &prep.cand.image,
+                        header: &prep.cand_header,
+                    },
                     o.seed,
                 )
                 .map_err(stage("identity_matrix"))?;
@@ -1173,7 +1323,15 @@ fn gpu_run(
         None
     };
     let before = clock_note(gpu);
-    let sampled = sample(gpu, node, &mut base, &mut cand, o.time, o.rounds, flush.as_ref());
+    let sampled = sample(
+        gpu,
+        node,
+        &mut base,
+        &mut cand,
+        o.time,
+        o.rounds,
+        flush.as_ref(),
+    );
     if let Some((a, b)) = flush {
         a.free(gpu);
         b.free(gpu);
@@ -1217,7 +1375,10 @@ fn main() {
         }
     };
     let (rec, outcome) = run(&o);
-    println!("{}", serde_json::to_string_pretty(&rec).expect("record is JSON"));
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&rec).expect("record is JSON")
+    );
     if let Some(e) = rec["error"].as_object() {
         eprintln!("hip_loop: {}: {}", e["stage"], e["message"]);
     }
@@ -1244,7 +1405,10 @@ mod tests {
 
     #[test]
     fn cli_parses_and_refuses() {
-        let o = parse_args(&args("--node mq6_res --shape qkv --cand a.hip --offline --time 5 --rounds 3 --seed 9")).unwrap();
+        let o = parse_args(&args(
+            "--node mq6_res --shape qkv --cand a.hip --offline --time 5 --rounds 3 --seed 9",
+        ))
+        .unwrap();
         assert!(o.offline && !o.null_control);
         assert_eq!((o.time, o.rounds, o.seed), (5, 3, 9));
         assert_eq!(o.shape.as_deref(), Some("qkv"));
@@ -1278,7 +1442,10 @@ mod tests {
         let n = 2;
         let base: Vec<f64> = vec![100.0; 2 * n * 3 * 1];
         let cand: Vec<f64> = vec![90.0; 2 * n * 3];
-        let w = node::Work { flops: 1e6, bytes: 1e6 };
+        let w = node::Work {
+            flops: 1e6,
+            bytes: 1e6,
+        };
         let t = timing_record(&base, &cand, n, w).unwrap();
         assert_eq!(t["rounds"].as_array().unwrap().len(), 3);
         assert!((t["ratio_median"].as_f64().unwrap() - 0.9).abs() < 1e-12);
@@ -1317,7 +1484,13 @@ mod tests {
         let dir = tmp(tag);
         let cand = dir.join("cand.hip");
         let n = build_node(node, Some(shape)).unwrap();
-        std::fs::write(&cand, source.map(str::to_owned).unwrap_or(n.incumbent().unwrap().source)).unwrap();
+        std::fs::write(
+            &cand,
+            source
+                .map(str::to_owned)
+                .unwrap_or(n.incumbent().unwrap().source),
+        )
+        .unwrap();
         let o = Opts {
             node: node.into(),
             shape: Some(shape.into()),
@@ -1357,7 +1530,10 @@ mod tests {
             assert_eq!(rec["symbol"], "gemm_mq6g256v2_residual_wmma_gfx11_mw8_lds");
             assert!(rec["error"].is_null());
             assert_eq!(rec["identical_code"], true);
-            assert_eq!(rec["baseline"]["code_sha256"], rec["candidate"]["code_sha256"]);
+            assert_eq!(
+                rec["baseline"]["code_sha256"],
+                rec["candidate"]["code_sha256"]
+            );
             for arm in ["baseline", "candidate"] {
                 let a = &rec[arm];
                 assert_eq!(a["code_sha256"].as_str().unwrap().len(), 64);
@@ -1391,7 +1567,10 @@ mod tests {
         let a = offline("mq6_res", "qkv", None, "stab-a");
         let b = offline("mq6_res", "qkv", None, "stab-b");
         assert_eq!(a["baseline"]["code_sha256"], b["baseline"]["code_sha256"]);
-        assert_eq!(a["baseline"]["object_sha256"], b["baseline"]["object_sha256"]);
+        assert_eq!(
+            a["baseline"]["object_sha256"],
+            b["baseline"]["object_sha256"]
+        );
         // Perturb the source: the unrolled loops become rolled.
         let perturbed = src.replace("#pragma unroll\n", "#pragma unroll 1\n");
         assert_ne!(perturbed, src);
@@ -1408,10 +1587,19 @@ mod tests {
             return;
         }
         let n = build_node("mq6_res", Some("qkv")).unwrap();
-        let src = format!("// hip_loop: tile_m=32 tile_n=128 block=256\n{}", n.incumbent().unwrap().source);
+        let src = format!(
+            "// hip_loop: tile_m=32 tile_n=128 block=256\n{}",
+            n.incumbent().unwrap().source
+        );
         let r = offline("mq6_res", "qkv", Some(&src), "hdr");
-        assert_eq!(r["candidate"]["geometry"]["grid_workgroups"], json!([320, 6, 1]));
-        assert_eq!(r["baseline"]["geometry"]["grid_workgroups"], json!([640, 6, 1]));
+        assert_eq!(
+            r["candidate"]["geometry"]["grid_workgroups"],
+            json!([320, 6, 1])
+        );
+        assert_eq!(
+            r["baseline"]["geometry"]["grid_workgroups"],
+            json!([640, 6, 1])
+        );
         assert_eq!(r["same_geometry"], false);
         assert_eq!(r["candidate_header"]["tile_m"], "32");
     }
@@ -1424,7 +1612,11 @@ mod tests {
         }
         let dir = tmp("loud");
         let cand = dir.join("c.hip");
-        std::fs::write(&cand, "#include <hip/hip_runtime.h>\nextern \"C\" __global__ void other(){}\n").unwrap();
+        std::fs::write(
+            &cand,
+            "#include <hip/hip_runtime.h>\nextern \"C\" __global__ void other(){}\n",
+        )
+        .unwrap();
         let mut o = Opts {
             node: "mq6_res".into(),
             shape: Some("ba".into()),
@@ -1448,7 +1640,13 @@ mod tests {
         let (rec, outcome) = run(&o);
         assert_eq!(outcome, Outcome::Unusable);
         assert_eq!(rec["error"]["stage"], "compile");
-        assert!(rec["error"]["message"].as_str().unwrap().contains("does not define kernel"), "{rec}");
+        assert!(
+            rec["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("does not define kernel"),
+            "{rec}"
+        );
         std::fs::write(&cand, "// hip_loop: tile_m=0\n").unwrap();
         o.out = Some(dir.join("out2"));
         let (rec, outcome) = run(&o);
@@ -1487,7 +1685,10 @@ mod tests {
         assert_eq!(outcome, Outcome::Ok, "{}", rec["error"]);
         assert_eq!(rec["null_control"]["kind"], "aa");
         assert_eq!(rec["null_control"]["identical_objects"], true);
-        assert_ne!(rec["baseline"]["source_path"], rec["candidate"]["source_path"]);
+        assert_ne!(
+            rec["baseline"]["source_path"],
+            rec["candidate"]["source_path"]
+        );
     }
 
     #[test]
@@ -1499,7 +1700,10 @@ mod tests {
         let rec = &offline("hc_mix", "mix", None, "hc");
         assert_eq!(rec["symbol"], "gemm_wmma_lds_64_64_32_64_k64_p");
         assert_eq!(rec["identical_code"], true);
-        assert_eq!(rec["baseline"]["geometry"]["grid_work_items"], json!([320, 12, 1]));
+        assert_eq!(
+            rec["baseline"]["geometry"]["grid_work_items"],
+            json!([320, 12, 1])
+        );
         assert_eq!(rec["baseline"]["max_flat_workgroup_size"], 64);
         assert_eq!(rec["baseline"]["spill"], 0);
         assert_eq!(rec["baseline"]["code_sha256"].as_str().unwrap().len(), 64);
@@ -1543,7 +1747,8 @@ mod object_tests {
     #[test]
     fn cli_takes_exactly_one_candidate_source() {
         let a = |s: &str| parse_args(&s.split_whitespace().map(str::to_owned).collect::<Vec<_>>());
-        let o = a("--node mq6_res --cand-object x.co --cand-geometry tile_m=32,tile_n=256").unwrap();
+        let o =
+            a("--node mq6_res --cand-object x.co --cand-geometry tile_m=32,tile_n=256").unwrap();
         assert_eq!(o.cand_geometry.as_deref(), Some("tile_m=32,tile_n=256"));
         for bad in [
             "--node mq6_res --cand-object x.co --cand y.hip",
@@ -1574,11 +1779,20 @@ mod object_tests {
         assert_eq!(outcome, Outcome::Ok, "{}", rec["error"]);
         assert_eq!(rec["candidate"]["kind"], "object");
         assert_eq!(rec["identical_code"], true);
-        assert_eq!(rec["candidate"]["geometry"]["grid_workgroups"], json!([2, 6, 1]));
+        assert_eq!(
+            rec["candidate"]["geometry"]["grid_workgroups"],
+            json!([2, 6, 1])
+        );
         assert_eq!(rec["candidate"]["lds_bytes"], 8192);
         assert_eq!(rec["candidate_object"]["sha256"], json!(built.image_sha256));
-        assert_eq!(rec["candidate_object"]["kernarg_size_matches_incumbent"], true);
-        assert!(rec["candidate"]["hipcc_argv"].as_array().unwrap().is_empty());
+        assert_eq!(
+            rec["candidate_object"]["kernarg_size_matches_incumbent"],
+            true
+        );
+        assert!(rec["candidate"]["hipcc_argv"]
+            .as_array()
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
@@ -1607,7 +1821,13 @@ mod object_tests {
         let (rec, outcome) = run(&o);
         assert_eq!(outcome, Outcome::Unusable);
         assert_eq!(rec["error"]["stage"], "object");
-        assert!(rec["error"]["message"].as_str().unwrap().contains("does not define kernel"), "{rec}");
+        assert!(
+            rec["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("does not define kernel"),
+            "{rec}"
+        );
         // A geometry outside the header grammar is refused before any compile.
         let built = jit::compile(&dir, "ok", &good, &good.source).unwrap();
         let mut o = opts(&dir, built.image_path.clone(), Some("block=100"));
@@ -1623,7 +1843,8 @@ mod base_object_tests {
     use super::*;
 
     fn tmp(tag: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("hip_loop-basetest-{}-{tag}", std::process::id()));
+        let d =
+            std::env::temp_dir().join(format!("hip_loop-basetest-{}-{tag}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
@@ -1653,7 +1874,10 @@ mod base_object_tests {
     }
 
     fn inc() -> Incumbent {
-        build_node("mq6_res", Some("ba")).unwrap().incumbent().unwrap()
+        build_node("mq6_res", Some("ba"))
+            .unwrap()
+            .incumbent()
+            .unwrap()
     }
 
     #[test]
@@ -1674,18 +1898,34 @@ mod base_object_tests {
         }
         let dir = tmp("rt");
         let cand = dir.join("cand.hip");
-        std::fs::write(&cand, format!("// hip_loop: tile_m=32 tile_n=128\n{}", inc().source)).unwrap();
+        std::fs::write(
+            &cand,
+            format!("// hip_loop: tile_m=32 tile_n=128\n{}", inc().source),
+        )
+        .unwrap();
         let (rec, outcome) = run(&opts(dir.join("o1"), Some(cand.clone()), None, false));
         assert_eq!(outcome, Outcome::Ok, "{}", rec["error"]);
-        for (key, name) in [("baseline_co", "baseline.co"), ("candidate_co", "candidate.co")] {
+        for (key, name) in [
+            ("baseline_co", "baseline.co"),
+            ("candidate_co", "candidate.co"),
+        ] {
             let p = dir.join("o1").join(name);
             assert_eq!(rec[key]["path"], json!(p.display().to_string()));
             let bytes = std::fs::read(&p).unwrap();
             assert_eq!(rec[key]["sha256"], json!(elf::sha256_hex(&bytes)));
-            let side: Value = serde_json::from_str(&std::fs::read_to_string(jit::sidecar_path(&p)).unwrap()).unwrap();
+            let side: Value =
+                serde_json::from_str(&std::fs::read_to_string(jit::sidecar_path(&p)).unwrap())
+                    .unwrap();
             assert_eq!(side["object_sha256"], rec[key]["sha256"]);
-            let src = if key == "baseline_co" { inc().source } else { std::fs::read_to_string(&cand).unwrap() };
-            assert_eq!(side["source_sha256"], json!(elf::sha256_hex(src.as_bytes())));
+            let src = if key == "baseline_co" {
+                inc().source
+            } else {
+                std::fs::read_to_string(&cand).unwrap()
+            };
+            assert_eq!(
+                side["source_sha256"],
+                json!(elf::sha256_hex(src.as_bytes()))
+            );
             assert_eq!(
                 side["kernels"][&inc().symbol]["code_sha256"],
                 rec["baseline"]["code_sha256"]
@@ -1698,8 +1938,14 @@ mod base_object_tests {
         let (rec2, outcome) = run(&opts(dir.join("o2"), Some(cand), Some(base.clone()), false));
         assert_eq!(outcome, Outcome::Ok, "{}", rec2["error"]);
         assert_eq!(rec2["baseline"]["kind"], "object");
-        assert_eq!(rec2["base_object"]["verified"], "sidecar + recompiled production source");
-        assert_eq!(rec2["baseline"]["code_sha256"], rec["baseline"]["code_sha256"]);
+        assert_eq!(
+            rec2["base_object"]["verified"],
+            "sidecar + recompiled production source"
+        );
+        assert_eq!(
+            rec2["baseline"]["code_sha256"],
+            rec["baseline"]["code_sha256"]
+        );
         assert!(rec2.get("baseline_co").is_none());
 
         // A/A with --base-object offline recompiles the candidate; both arms identical.
@@ -1710,7 +1956,10 @@ mod base_object_tests {
         // Device-mode verification (no recompile) trusts the sidecar and checks everything else.
         let b = jit::from_object("baseline", &base).unwrap();
         let v = verify_base_object(&base, &inc(), &b, None).unwrap();
-        assert_eq!(v["verified"].as_str().unwrap().starts_with("sidecar ("), true);
+        assert_eq!(
+            v["verified"].as_str().unwrap().starts_with("sidecar ("),
+            true
+        );
     }
 
     #[test]
@@ -1726,7 +1975,8 @@ mod base_object_tests {
         assert_eq!(outcome, Outcome::Ok, "{}", rec["error"]);
         let good = dir.join("o1").join("baseline.co");
         let side = jit::sidecar_path(&good);
-        let sidecar: Value = serde_json::from_str(&std::fs::read_to_string(&side).unwrap()).unwrap();
+        let sidecar: Value =
+            serde_json::from_str(&std::fs::read_to_string(&side).unwrap()).unwrap();
         let load = |p: &Path| jit::from_object("baseline", p).unwrap();
         let sym = inc().symbol;
 
@@ -1745,27 +1995,54 @@ mod base_object_tests {
             p
         };
         // Wrong kernel .text sha, stale source, wrong module, object sha.
-        let p = tampered("sha.co", &|s| s["kernels"][&sym]["code_sha256"] = json!("00"));
-        assert!(verify_base_object(&p, &inc(), &load(&p), None).unwrap_err().contains(".text sha256"));
+        let p = tampered("sha.co", &|s| {
+            s["kernels"][&sym]["code_sha256"] = json!("00")
+        });
+        assert!(verify_base_object(&p, &inc(), &load(&p), None)
+            .unwrap_err()
+            .contains(".text sha256"));
         let p = tampered("src.co", &|s| s["source_sha256"] = json!("11"));
-        assert!(verify_base_object(&p, &inc(), &load(&p), None).unwrap_err().contains("stale"));
+        assert!(verify_base_object(&p, &inc(), &load(&p), None)
+            .unwrap_err()
+            .contains("stale"));
         let p = tampered("mod.co", &|s| s["module"] = json!("other_module"));
-        assert!(verify_base_object(&p, &inc(), &load(&p), None).unwrap_err().contains("other_module"));
+        assert!(verify_base_object(&p, &inc(), &load(&p), None)
+            .unwrap_err()
+            .contains("other_module"));
         let p = tampered("obj.co", &|s| s["object_sha256"] = json!("22"));
-        assert!(verify_base_object(&p, &inc(), &load(&p), None).unwrap_err().contains("changed"));
-        let p = tampered("abi.co", &|s| s["kernels"][&sym]["explicit_args"] = json!([]));
-        assert!(verify_base_object(&p, &inc(), &load(&p), None).unwrap_err().contains("kernel arguments"));
+        assert!(verify_base_object(&p, &inc(), &load(&p), None)
+            .unwrap_err()
+            .contains("changed"));
+        let p = tampered("abi.co", &|s| {
+            s["kernels"][&sym]["explicit_args"] = json!([])
+        });
+        assert!(verify_base_object(&p, &inc(), &load(&p), None)
+            .unwrap_err()
+            .contains("kernel arguments"));
 
         // Offline recompile disagreement: the sidecar and object agree with each other
         // but not with the production compile.
         let other = dir.join("other.co");
         let mut other_inc = inc();
-        other_inc.source = inc().source.replace("#pragma unroll\n", "#pragma unroll 1\n");
-        let built = jit::compile(&dir.join("o1"), "perturbed", &other_inc, &other_inc.source).unwrap();
+        other_inc.source = inc()
+            .source
+            .replace("#pragma unroll\n", "#pragma unroll 1\n");
+        let built =
+            jit::compile(&dir.join("o1"), "perturbed", &other_inc, &other_inc.source).unwrap();
         std::fs::copy(&built.image_path, &other).unwrap();
-        let mut s = jit::sidecar_json("mq6_res", &inc(), &built, &inc().source, &Default::default());
+        let mut s = jit::sidecar_json(
+            "mq6_res",
+            &inc(),
+            &built,
+            &inc().source,
+            &Default::default(),
+        );
         s["source_sha256"] = json!(elf::sha256_hex(inc().source.as_bytes()));
-        std::fs::write(jit::sidecar_path(&other), serde_json::to_string(&s).unwrap()).unwrap();
+        std::fs::write(
+            jit::sidecar_path(&other),
+            serde_json::to_string(&s).unwrap(),
+        )
+        .unwrap();
         let fresh = jit::compile(&dir.join("o1"), "fresh", &inc(), &inc().source).unwrap();
         let e = verify_base_object(&other, &inc(), &load(&other), Some(&fresh)).unwrap_err();
         assert!(e.contains("fresh compile"), "{e}");
@@ -1799,7 +2076,10 @@ mod emu_tests {
         assert_eq!(c.bufs[1].bytes.len(), 40 * 512 * 2);
         assert_eq!(c.bufs[2].bytes.len(), 40 * 144 * 4);
         assert_eq!(c.out, 2);
-        for (g, grid) in [("tile_m=128 tile_n=256 block=256", [2, 1, 1]), ("tile_m=64 tile_n=128 block=128", [3, 1, 1])] {
+        for (g, grid) in [
+            ("tile_m=128 tile_n=256 block=256", [2, 1, 1]),
+            ("tile_m=64 tile_n=128 block=128", [3, 1, 1]),
+        ] {
             let mut h = Header::parse_list(g).unwrap();
             assert_eq!(n.geometry_with(&mut h).unwrap().grid, grid, "{g}");
         }
@@ -1821,8 +2101,19 @@ mod emu_tests {
         let c = n.emu_case(1).unwrap();
         assert_eq!(c.args.len(), 14);
         assert_eq!(c.bufs[1].bytes.len(), 105 * 544);
-        let sel: Vec<i32> = c.bufs[3].bytes.chunks_exact(4).map(|b| i32::from_le_bytes(b.try_into().unwrap())).collect();
-        let live: Vec<usize> = (0..3).map(|r| sel[r * 2051..(r + 1) * 2051].iter().filter(|&&t| t >= 0).count()).collect();
+        let sel: Vec<i32> = c.bufs[3]
+            .bytes
+            .chunks_exact(4)
+            .map(|b| i32::from_le_bytes(b.try_into().unwrap()))
+            .collect();
+        let live: Vec<usize> = (0..3)
+            .map(|r| {
+                sel[r * 2051..(r + 1) * 2051]
+                    .iter()
+                    .filter(|&&t| t >= 0)
+                    .count()
+            })
+            .collect();
         assert_eq!(live, [103, 104, 105]);
         assert!(c.bufs[4].bytes.iter().all(|&b| b == 0xff));
     }
@@ -1873,7 +2164,12 @@ mod emu_tests {
         for s in &q {
             build_node("qsa_hg4", Some(s)).unwrap();
         }
-        assert_eq!(build_node("qsa_hg4", Some("pos=late,cap=262144")).unwrap().shape_json()["full_capacity"], 262144);
+        assert_eq!(
+            build_node("qsa_hg4", Some("pos=late,cap=262144"))
+                .unwrap()
+                .shape_json()["full_capacity"],
+            262144
+        );
         assert!(build_node("qsa_hg4", Some("pos=late,cap=100")).is_err());
     }
 
@@ -1893,29 +2189,73 @@ mod emu_tests {
         let geo = node.geometry();
         let own = node.out_owner(&Header::default()).unwrap();
         let mut case = node.emu_case(1).unwrap();
-        let (pass, rec) = emu::extent_gate("ba", &inc.symbol, &mut case, (&built.image, &geo, &*own), (&built.image, &geo, &*own), node.shape_json(), 1);
+        let (pass, rec) = emu::extent_gate(
+            "ba",
+            &inc.symbol,
+            &mut case,
+            (&built.image, &geo, &*own),
+            (&built.image, &geo, &*own),
+            node.shape_json(),
+            1,
+        );
         assert!(pass, "{rec}");
         assert_eq!(rec["identical_to_baseline"], true);
-        assert_eq!(rec["output_sha256"]["baseline"], rec["output_sha256"]["candidate"]);
+        assert_eq!(
+            rec["output_sha256"]["baseline"],
+            rec["output_sha256"]["candidate"]
+        );
         assert!(rec["elements_compared"].as_u64().unwrap() > 1000);
         // The same case object serves the next gate: buffers were moved back, output pristine.
-        let (pass, _) = emu::extent_gate("ba", &inc.symbol, &mut case, (&built.image, &geo, &*own), (&built.image, &geo, &*own), node.shape_json(), 1);
+        let (pass, _) = emu::extent_gate(
+            "ba",
+            &inc.symbol,
+            &mut case,
+            (&built.image, &geo, &*own),
+            (&built.image, &geo, &*own),
+            node.shape_json(),
+            1,
+        );
         assert!(pass);
         // A short input: the kernel's reads past the end land in the unmapped guard.
         let mut short = case.clone();
         let x = short.bufs.iter_mut().find(|b| b.name == "x").unwrap();
         x.bytes.truncate(x.bytes.len() - 4);
-        let (pass, rec) = emu::extent_gate("ba", &inc.symbol, &mut short, (&built.image, &geo, &*own), (&built.image, &geo, &*own), node.shape_json(), 1);
+        let (pass, rec) = emu::extent_gate(
+            "ba",
+            &inc.symbol,
+            &mut short,
+            (&built.image, &geo, &*own),
+            (&built.image, &geo, &*own),
+            node.shape_json(),
+            1,
+        );
         assert!(!pass);
-        assert!(rec["reason"].as_str().unwrap().contains("unmapped memory access"), "{rec}");
+        assert!(
+            rec["reason"]
+                .as_str()
+                .unwrap()
+                .contains("unmapped memory access"),
+            "{rec}"
+        );
         // Candidate geometry (32-row tiles) launched on the 16-row object: half the rows are never written.
         let h = Header::parse_list("tile_m=32 tile_n=128 block=256").unwrap();
         let mut hh = h.clone();
         let cgeo = node.geometry_with(&mut hh).unwrap();
         let cown = node.out_owner(&h).unwrap();
-        let (pass, rec) = emu::extent_gate("ba", &inc.symbol, &mut case, (&built.image, &geo, &*own), (&built.image, &cgeo, &*cown), node.shape_json(), 1);
+        let (pass, rec) = emu::extent_gate(
+            "ba",
+            &inc.symbol,
+            &mut case,
+            (&built.image, &geo, &*own),
+            (&built.image, &cgeo, &*cown),
+            node.shape_json(),
+            1,
+        );
         assert!(!pass, "{rec}");
-        assert!(rec["reason"].as_str().unwrap().contains("did not write"), "{rec}");
+        assert!(
+            rec["reason"].as_str().unwrap().contains("did not write"),
+            "{rec}"
+        );
     }
 
     /// The gate passes an incumbent against itself and fails closed on an out-of-buffer access and on
@@ -1935,12 +2275,22 @@ mod emu_tests {
             let geo = node.geometry();
             let case = node.emu_case(1).unwrap();
             let run = |case: &node::EmuCase, cand_geo: &Geometry| {
-                emu::gate(&inc.symbol, &mut case.clone(), (&built.image, &geo), (&built.image, cand_geo), node.shape_json(), 1)
+                emu::gate(
+                    &inc.symbol,
+                    &mut case.clone(),
+                    (&built.image, &geo),
+                    (&built.image, cand_geo),
+                    node.shape_json(),
+                    1,
+                )
             };
             let (pass, rec) = run(&case, &geo);
             assert!(pass, "{node_name}: {rec}");
             assert_eq!(rec["identical_to_baseline"], true);
-            assert_eq!(rec["output_sha256"]["baseline"], rec["output_sha256"]["candidate"]);
+            assert_eq!(
+                rec["output_sha256"]["baseline"],
+                rec["output_sha256"]["candidate"]
+            );
             let wgs = u64::from(geo.grid[0]) * u64::from(geo.grid[1]) * u64::from(geo.grid[2]);
             assert_eq!(rec["workgroups"]["baseline"], wgs);
             assert!(rec["instructions"]["baseline"].as_u64().unwrap() > 1000);
@@ -1951,7 +2301,13 @@ mod emu_tests {
             x.bytes.truncate(x.bytes.len() - 4);
             let (pass, rec) = run(&short, &geo);
             assert!(!pass, "{node_name}: a short input buffer must fail");
-            assert!(rec["reason"].as_str().unwrap().contains("unmapped memory access"), "{rec}");
+            assert!(
+                rec["reason"]
+                    .as_str()
+                    .unwrap()
+                    .contains("unmapped memory access"),
+                "{rec}"
+            );
             // A candidate launched on a grid that skips a workgroup: output differs from the incumbent's.
             let mut small = geo;
             small.grid[0] -= 1;
@@ -1980,17 +2336,34 @@ mod race_gate_tests {
         let mut h = Header::parse_list("tile_m=64 tile_n=128 block=128").unwrap();
         let geo = n.geometry_with(&mut h).unwrap();
         let mut case = n.emu_case(1).unwrap();
-        emu::run_arm_model("cand", IMAGE, SYMBOL, &geo, &mut case, &emu::WgSel::All, model)
+        emu::run_arm_model(
+            "cand",
+            IMAGE,
+            SYMBOL,
+            &geo,
+            &mut case,
+            &emu::WgSel::All,
+            model,
+        )
     }
 
     #[test]
-    fn r3mq6wp_02_passes_the_old_and_the_gate_model_and_only_the_strict_store_reading_names_the_stub() {
-        arm(emu::Model::Legacy).unwrap_or_else(|e| panic!("the pre-0.4.3 gate passes it: {}", e.reason));
-        let rep = arm(emu::Model::Gate).unwrap_or_else(|e| panic!("the gate model finds no defect in it: {}", e.reason));
+    fn r3mq6wp_02_passes_the_old_and_the_gate_model_and_only_the_strict_store_reading_names_the_stub(
+    ) {
+        arm(emu::Model::Legacy)
+            .unwrap_or_else(|e| panic!("the pre-0.4.3 gate passes it: {}", e.reason));
+        let rep = arm(emu::Model::Gate)
+            .unwrap_or_else(|e| panic!("the gate model finds no defect in it: {}", e.reason));
         let sched = rep.json["schedules"].as_array().unwrap();
         assert!(sched.len() >= 7, "{sched:?}");
-        let e = arm(emu::Model::StrictStoreSources).err().expect("the strict reading names the stub WAR");
-        assert!(e.reason.contains("[in-flight]") && e.reason.contains("ds_store_b128"), "{}", e.reason);
+        let e = arm(emu::Model::StrictStoreSources)
+            .err()
+            .expect("the strict reading names the stub WAR");
+        assert!(
+            e.reason.contains("[in-flight]") && e.reason.contains("ds_store_b128"),
+            "{}",
+            e.reason
+        );
     }
 }
 
@@ -2004,10 +2377,14 @@ mod lane_tests {
     /// --no-offload-compress -fuse-cuid=none -mcode-object-version=6 -DIU4_A4_CANDIDATES=2` + the
     /// source's `HIPFIRE_COMPILER_FLAGS`): `KernelCompiler` reproduces them byte for byte, the whole file, not
     /// only the kernel `.text`.
-    const LANE_PROJ_OBJECT_SHA: &str = "68db168d722305c1be594f2d16a8b76558a447353f04a15c19ddf53b29028d7b";
-    const RES_LANES_OBJECT_SHA: &str = "16f5f16d35083682c6d12b0d5a813c6056006785d0a2d8188fdf8845873ad31c";
-    const LANE_PROJ_SOURCE_SHA: &str = "32bec4741cd72e4e279ea09403c3e63f0e5ff8e401287e809be3f879594079d9";
-    const RES_LANES_SOURCE_SHA: &str = "036fdd2cf77014d8ac70deaeee37d73a08fc3313318c5717fa122b65e6d70b71";
+    const LANE_PROJ_OBJECT_SHA: &str =
+        "68db168d722305c1be594f2d16a8b76558a447353f04a15c19ddf53b29028d7b";
+    const RES_LANES_OBJECT_SHA: &str =
+        "16f5f16d35083682c6d12b0d5a813c6056006785d0a2d8188fdf8845873ad31c";
+    const LANE_PROJ_SOURCE_SHA: &str =
+        "32bec4741cd72e4e279ea09403c3e63f0e5ff8e401287e809be3f879594079d9";
+    const RES_LANES_SOURCE_SHA: &str =
+        "036fdd2cf77014d8ac70deaeee37d73a08fc3313318c5717fa122b65e6d70b71";
 
     fn tmp(tag: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("hip_loop-lane-{}-{tag}", std::process::id()));
@@ -2039,9 +2416,16 @@ mod lane_tests {
         let w = build_node("lane_wo", None).unwrap().incumbent().unwrap();
         assert_eq!(elf::sha256_hex(p.source.as_bytes()), LANE_PROJ_SOURCE_SHA);
         assert_eq!(elf::sha256_hex(w.source.as_bytes()), RES_LANES_SOURCE_SHA);
-        assert!(p.source.starts_with("// HIPFIRE_COMPILER_FLAGS: -mwavefrontsize64\n"));
-        assert!(w.source.starts_with("#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n"));
-        assert_eq!((p.extra_flags.as_str(), w.extra_flags.as_str()), ("-DIU4_A4_CANDIDATES=2", "-DIU4_A4_CANDIDATES=2"));
+        assert!(p
+            .source
+            .starts_with("// HIPFIRE_COMPILER_FLAGS: -mwavefrontsize64\n"));
+        assert!(w
+            .source
+            .starts_with("#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n"));
+        assert_eq!(
+            (p.extra_flags.as_str(), w.extra_flags.as_str()),
+            ("-DIU4_A4_CANDIDATES=2", "-DIU4_A4_CANDIDATES=2")
+        );
         for n in ["lane_proj", "lane_wo"] {
             assert_eq!(build_node(n, None).unwrap().arch(), "gfx1201");
         }
@@ -2057,7 +2441,10 @@ mod lane_tests {
             return;
         }
         let dir = tmp("objects");
-        for (node, want, wave) in [("lane_proj", LANE_PROJ_OBJECT_SHA, 64), ("lane_wo", RES_LANES_OBJECT_SHA, 32)] {
+        for (node, want, wave) in [
+            ("lane_proj", LANE_PROJ_OBJECT_SHA, 64),
+            ("lane_wo", RES_LANES_OBJECT_SHA, 32),
+        ] {
             let n = build_node(node, None).unwrap();
             let inc = n.incumbent().unwrap();
             let b = jit::compile_for(n.arch(), &dir, node, &inc, &inc.source).unwrap();
@@ -2072,15 +2459,29 @@ mod lane_tests {
             eprintln!("skip: no hipcc");
             return;
         }
-        let p = build_node("lane_proj", None).unwrap().incumbent().unwrap().source;
-        let w = build_node("lane_wo", None).unwrap().incumbent().unwrap().source;
+        let p = build_node("lane_proj", None)
+            .unwrap()
+            .incumbent()
+            .unwrap()
+            .source;
+        let w = build_node("lane_wo", None)
+            .unwrap()
+            .incumbent()
+            .unwrap()
+            .source;
         let r = offline("lane_proj", "group=dn,lanes=8", &p, "p-copy");
         assert_eq!(r["identical_code"], true, "{r}");
         assert_eq!(r["candidate"]["code_sha256"], r["baseline"]["code_sha256"]);
         assert_eq!(r["candidate_co"]["sha256"], LANE_PROJ_OBJECT_SHA);
         assert_eq!(r["arch"], "gfx1201");
-        assert_eq!(r["baseline"]["geometry"]["grid_workgroups"], json!([96, 1, 1]));
-        let mutated = p.replace("#define HIPFIRE_LANE_PROJ_COLGROUP 2", "#define HIPFIRE_LANE_PROJ_COLGROUP 4");
+        assert_eq!(
+            r["baseline"]["geometry"]["grid_workgroups"],
+            json!([96, 1, 1])
+        );
+        let mutated = p.replace(
+            "#define HIPFIRE_LANE_PROJ_COLGROUP 2",
+            "#define HIPFIRE_LANE_PROJ_COLGROUP 4",
+        );
         assert_ne!(mutated, p);
         let r = offline("lane_proj", "group=dn,lanes=8", &mutated, "p-mut");
         assert_eq!(r["identical_code"], false);
@@ -2088,7 +2489,10 @@ mod lane_tests {
         let r = offline("lane_wo", "lanes=8,m=2048", &w, "w-copy");
         assert_eq!(r["identical_code"], true, "{r}");
         assert_eq!(r["candidate_co"]["sha256"], RES_LANES_OBJECT_SHA);
-        assert_eq!(r["baseline"]["geometry"]["grid_workgroups"], json!([256, 1, 1]));
+        assert_eq!(
+            r["baseline"]["geometry"]["grid_workgroups"],
+            json!([256, 1, 1])
+        );
         let mutated = w.replace("row_base + r < M) y[", "row_base + r <= M) y[");
         assert_ne!(mutated, w);
         let r = offline("lane_wo", "lanes=8,m=2048", &mutated, "w-mut");
@@ -2101,9 +2505,21 @@ mod lane_tests {
             eprintln!("skip: no hipcc");
             return;
         }
-        let w = build_node("lane_wo", None).unwrap().incumbent().unwrap().source;
-        let r = offline("lane_wo", "lanes=4,m=2048", &format!("// hip_loop: rows_per_wg=16 block=256\n{w}"), "w-hdr");
-        assert_eq!(r["candidate"]["geometry"]["grid_workgroups"], json!([128, 1, 1]));
+        let w = build_node("lane_wo", None)
+            .unwrap()
+            .incumbent()
+            .unwrap()
+            .source;
+        let r = offline(
+            "lane_wo",
+            "lanes=4,m=2048",
+            &format!("// hip_loop: rows_per_wg=16 block=256\n{w}"),
+            "w-hdr",
+        );
+        assert_eq!(
+            r["candidate"]["geometry"]["grid_workgroups"],
+            json!([128, 1, 1])
+        );
         assert_eq!(r["candidate"]["geometry"]["block"], json!([256, 1, 1]));
         assert_eq!(r["same_geometry"], false);
         let dir = tmp("aa");
@@ -2123,10 +2539,33 @@ mod lane_tests {
 
     #[test]
     fn cli_takes_flush_and_emu_extent_and_refuses_them_elsewhere() {
-        let o = parse_args(&["--node", "lane_proj", "--cand", "x.hip", "--flush", "--emu-extent", "sampled"].map(String::from)).unwrap();
+        let o = parse_args(
+            &[
+                "--node",
+                "lane_proj",
+                "--cand",
+                "x.hip",
+                "--flush",
+                "--emu-extent",
+                "sampled",
+            ]
+            .map(String::from),
+        )
+        .unwrap();
         assert!(o.flush);
         assert_eq!(o.emu_extent.as_deref(), Some("sampled"));
-        assert!(parse_args(&["--node", "lane_wo", "--cand", "x.hip", "--emu-extent", "some"].map(String::from)).is_err());
+        assert!(parse_args(
+            &[
+                "--node",
+                "lane_wo",
+                "--cand",
+                "x.hip",
+                "--emu-extent",
+                "some"
+            ]
+            .map(String::from)
+        )
+        .is_err());
         let (rec, outcome) = run(&Opts {
             node: "mq6_res".into(),
             flush: true,
@@ -2145,23 +2584,59 @@ mod lane_tests {
     #[test]
     fn cli_takes_identity_depth_and_identity_only() {
         let p = |a: &[&str]| parse_args(&a.iter().map(|s| s.to_string()).collect::<Vec<_>>());
-        assert_eq!(p(&["--node", "lane_wo", "--cand", "x.hip"]).unwrap().identity, None);
+        assert_eq!(
+            p(&["--node", "lane_wo", "--cand", "x.hip"])
+                .unwrap()
+                .identity,
+            None
+        );
         for m in ["full", "smoke", "skip"] {
             let o = p(&["--node", "lane_wo", "--cand", "x.hip", "--identity", m]).unwrap();
             assert_eq!(o.identity.as_deref(), Some(m));
         }
         assert!(p(&["--node", "lane_wo", "--cand", "x.hip", "--identity", "some"]).is_err());
-        let o = p(&["--node", "lane_proj", "--cand-object", "x.co", "--identity-only", "--seed", "3"]).unwrap();
+        let o = p(&[
+            "--node",
+            "lane_proj",
+            "--cand-object",
+            "x.co",
+            "--identity-only",
+            "--seed",
+            "3",
+        ])
+        .unwrap();
         assert!(o.identity_only);
         // The matrix needs the device and the full depth.
-        assert!(p(&["--node", "lane_proj", "--cand", "x.hip", "--identity-only", "--offline"]).is_err());
-        assert!(p(&["--node", "lane_proj", "--cand", "x.hip", "--identity-only", "--identity", "skip"]).is_err());
+        assert!(p(&[
+            "--node",
+            "lane_proj",
+            "--cand",
+            "x.hip",
+            "--identity-only",
+            "--offline"
+        ])
+        .is_err());
+        assert!(p(&[
+            "--node",
+            "lane_proj",
+            "--cand",
+            "x.hip",
+            "--identity-only",
+            "--identity",
+            "skip"
+        ])
+        .is_err());
         // lane_proj's matrix runs over every group, lane_wo's over its own shape.
         assert_eq!(
-            build_node("lane_proj", Some("lanes=8")).unwrap().identity_shapes(),
+            build_node("lane_proj", Some("lanes=8"))
+                .unwrap()
+                .identity_shapes(),
             ["group=dn,lanes=8", "group=fa,lanes=8", "group=moe,lanes=8"]
         );
-        assert!(build_node("lane_wo", None).unwrap().identity_shapes().is_empty());
+        assert!(build_node("lane_wo", None)
+            .unwrap()
+            .identity_shapes()
+            .is_empty());
     }
 
     /// The wave32 `wo` kernel through the pre-card gate at its small shape: the incumbent passes, a
@@ -2177,17 +2652,37 @@ mod lane_tests {
         let n = build_node("lane_wo", Some("emu")).unwrap();
         let inc = n.incumbent().unwrap();
         let good = jit::compile_for(n.arch(), &dir, "good", &inc, &inc.source).unwrap();
-        let bad_src = inc.source.replace("row_base + r < M) y[", "row_base + r <= M) y[");
+        let bad_src = inc
+            .source
+            .replace("row_base + r < M) y[", "row_base + r <= M) y[");
         assert_ne!(bad_src, inc.source);
         let bad = jit::compile_for(n.arch(), &dir, "bad", &inc, &bad_src).unwrap();
         let geo = n.geometry();
         let mut case = n.emu_case(1).unwrap();
-        let (pass, rec) = emu::gate(&inc.symbol, &mut case, (&good.image, &geo), (&good.image, &geo), n.shape_json(), 1);
+        let (pass, rec) = emu::gate(
+            &inc.symbol,
+            &mut case,
+            (&good.image, &geo),
+            (&good.image, &geo),
+            n.shape_json(),
+            1,
+        );
         assert!(pass, "{}", rec["reason"]);
         assert_eq!(rec["arms"]["baseline"]["arch"], "Gfx1201");
-        let (pass, rec) = emu::gate(&inc.symbol, &mut case, (&good.image, &geo), (&bad.image, &geo), n.shape_json(), 1);
+        let (pass, rec) = emu::gate(
+            &inc.symbol,
+            &mut case,
+            (&good.image, &geo),
+            (&bad.image, &geo),
+            n.shape_json(),
+            1,
+        );
         assert!(!pass);
-        assert!(rec["reason"].as_str().unwrap().contains("unmapped"), "{}", rec["reason"]);
+        assert!(
+            rec["reason"].as_str().unwrap().contains("unmapped"),
+            "{}",
+            rec["reason"]
+        );
         let (ok, hz) = emu::hazards(&good.image, &inc.symbol);
         assert!(ok, "{hz}");
         assert_eq!(hz["wave"], 32);
@@ -2215,15 +2710,35 @@ mod lane_tests {
             let bad = jit::compile_for(n.arch(), &dir, "bad", &inc, &bad_src).unwrap();
             let geo = n.geometry();
             let mut case = n.emu_case(1).unwrap();
-            let (pass, rec) = emu::gate(&inc.symbol, &mut case, (&good.image, &geo), (&good.image, &geo), n.shape_json(), 1);
+            let (pass, rec) = emu::gate(
+                &inc.symbol,
+                &mut case,
+                (&good.image, &geo),
+                (&good.image, &geo),
+                n.shape_json(),
+                1,
+            );
             assert!(pass, "{shape}: {}", rec["reason"]);
             assert_eq!(rec["arms"]["baseline"]["wave"], 64);
-            let (pass, rec) = emu::gate(&inc.symbol, &mut case, (&good.image, &geo), (&bad.image, &geo), n.shape_json(), 1);
-            assert!(!pass, "{shape}: a store past the segment must fail the gate");
+            let (pass, rec) = emu::gate(
+                &inc.symbol,
+                &mut case,
+                (&good.image, &geo),
+                (&bad.image, &geo),
+                n.shape_json(),
+                1,
+            );
+            assert!(
+                !pass,
+                "{shape}: a store past the segment must fail the gate"
+            );
             // Either the output differs from the incumbent's, or two waves now store the same word and the
             // schedules diverge (the gate model's own finding): both are failures of the store past the segment.
             let why = rec["reason"].as_str().unwrap();
-            assert!(why.contains("differs") || why.contains("[schedule]"), "{why}");
+            assert!(
+                why.contains("differs") || why.contains("[schedule]"),
+                "{why}"
+            );
             let (ok, hz) = emu::hazards(&good.image, &inc.symbol);
             assert!(ok, "{hz}");
             assert_eq!(hz["wave"], 64);

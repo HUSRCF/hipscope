@@ -77,7 +77,11 @@ impl WKind {
 fn f16_normal(r: &mut Xs64, lo: u32, hi: u32, signed: bool) -> u16 {
     let exp = lo + (r.next_u64() >> 33) as u32 % (hi - lo + 1);
     let mant = (r.next_u64() >> 40) as u32 & 0x3FF;
-    let sign = if signed { (r.next_u64() >> 41) as u32 & 1 } else { 0 };
+    let sign = if signed {
+        (r.next_u64() >> 41) as u32 & 1
+    } else {
+        0
+    };
     ((sign << 15) | (exp << 10) | mant) as u16
 }
 
@@ -89,12 +93,22 @@ pub fn synth_weights(rows: usize, groups: usize, seed: u64, kind: WKind) -> Vec<
         let off = g * GROUP_BYTES;
         for half in 0..2 {
             let (sc, zp) = match kind {
-                WKind::Small => (f16_normal(&mut r, 6, 8, false), f16_normal(&mut r, 5, 8, true)),
-                WKind::Large => (f16_normal(&mut r, 13, 16, false), f16_normal(&mut r, 12, 16, true)),
-                WKind::Normal | WKind::AllZero | WKind::AllFifteen => {
-                    (f16_normal(&mut r, 8, 13, false), f16_normal(&mut r, 7, 13, true))
-                }
-                WKind::Wide => (f16_normal(&mut r, 1, 26, false), f16_normal(&mut r, 1, 26, true)),
+                WKind::Small => (
+                    f16_normal(&mut r, 6, 8, false),
+                    f16_normal(&mut r, 5, 8, true),
+                ),
+                WKind::Large => (
+                    f16_normal(&mut r, 13, 16, false),
+                    f16_normal(&mut r, 12, 16, true),
+                ),
+                WKind::Normal | WKind::AllZero | WKind::AllFifteen => (
+                    f16_normal(&mut r, 8, 13, false),
+                    f16_normal(&mut r, 7, 13, true),
+                ),
+                WKind::Wide => (
+                    f16_normal(&mut r, 1, 26, false),
+                    f16_normal(&mut r, 1, 26, true),
+                ),
                 WKind::Wild => ((r.next_u64() >> 32) as u16, (r.next_u64() >> 32) as u16),
             };
             out[off + 4 * half..off + 4 * half + 2].copy_from_slice(&sc.to_le_bytes());
@@ -126,7 +140,9 @@ pub fn word_bytes(v: &[u32]) -> Vec<u8> {
 }
 
 pub fn words(b: &[u8]) -> Vec<u32> {
-    b.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
+    b.chunks_exact(4)
+        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect()
 }
 
 pub fn poison_words(n: usize) -> Vec<u32> {
@@ -164,7 +180,10 @@ impl Cmp {
 /// included); otherwise non-NaN words must be bit-equal and a NaN must meet a NaN, payload and
 /// sign differences between two NaNs being tallied only (the `lane_proj` product gate).
 pub fn compare(got: &[u32], want: &[u32], strict: bool) -> Cmp {
-    let mut c = Cmp { words: got.len().max(want.len()), ..Default::default() };
+    let mut c = Cmp {
+        words: got.len().max(want.len()),
+        ..Default::default()
+    };
     if got.len() != want.len() {
         c.mismatches = got.len().abs_diff(want.len());
         c.first = Some(got.len().min(want.len()));
@@ -189,7 +208,10 @@ pub fn compare(got: &[u32], want: &[u32], strict: bool) -> Cmp {
 /// Run `f(0..n)` on worker threads (at most 16) and collect the results in order.
 pub fn par_map<T: Send>(n: usize, f: impl Fn(usize) -> T + Sync) -> Vec<T> {
     let next = std::sync::atomic::AtomicUsize::new(0);
-    let threads = std::thread::available_parallelism().map_or(4, |p| p.get()).clamp(1, 16).min(n.max(1));
+    let threads = std::thread::available_parallelism()
+        .map_or(4, |p| p.get())
+        .clamp(1, 16)
+        .min(n.max(1));
     let mut parts: Vec<Vec<(usize, T)>> = Vec::new();
     std::thread::scope(|s| {
         let hs: Vec<_> = (0..threads)
@@ -226,11 +248,15 @@ pub struct LoadedArm {
 impl LoadedArm {
     pub fn load(gpu: &Gpu, image: &[u8]) -> Result<Self> {
         // A fresh module per arm, as the driver's own timing loads them.
-        Ok(Self { module: gpu.hip.module_load_data(image).map_err(err)? })
+        Ok(Self {
+            module: gpu.hip.module_load_data(image).map_err(err)?,
+        })
     }
 
     pub fn function(&self, gpu: &Gpu, symbol: &str) -> Result<Function> {
-        gpu.hip.module_get_function(&self.module, symbol).map_err(err)
+        gpu.hip
+            .module_get_function(&self.module, symbol)
+            .map_err(err)
     }
 }
 
@@ -238,7 +264,11 @@ impl LoadedArm {
 pub fn launch_sync(gpu: &Gpu, f: &Function, g: &Geometry, karg: &mut [u8]) -> Result<()> {
     // SAFETY: `karg` packs the kernel's explicit arguments per the production launcher and every
     // pointer in it addresses a live allocation owned by the caller for the whole call.
-    unsafe { gpu.hip.launch_kernel_blob(f, g.grid, g.block, g.lds, None, karg) }.map_err(err)?;
+    unsafe {
+        gpu.hip
+            .launch_kernel_blob(f, g.grid, g.block, g.lds, None, karg)
+    }
+    .map_err(err)?;
     gpu.hip.device_synchronize().map_err(err)
 }
 

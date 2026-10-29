@@ -40,10 +40,13 @@ fn main() {
                 order.push(sym.clone());
                 continue;
             }
-            let Some((asm, comment)) = line.strip_prefix('\t').and_then(|l| l.split_once("//")) else {
+            let Some((asm, comment)) = line.strip_prefix('\t').and_then(|l| l.split_once("//"))
+            else {
                 continue;
             };
-            let Some((_, words)) = comment.split_once(": ") else { continue };
+            let Some((_, words)) = comment.split_once(": ") else {
+                continue;
+            };
             let words: Vec<u32> = words
                 .split_whitespace()
                 .filter_map(|w| u32::from_str_radix(w, 16).ok())
@@ -64,7 +67,9 @@ fn main() {
             if let Some(why) = bad {
                 e.1 += 1;
                 let key = name.clone();
-                let slot = e.2.entry(key).or_insert((0, format!("{asm} [{words:08x?}] {why}")));
+                let slot =
+                    e.2.entry(key)
+                        .or_insert((0, format!("{asm} [{words:08x?}] {why}")));
                 slot.0 += 1;
                 *global.entry(name).or_default() += 1;
             }

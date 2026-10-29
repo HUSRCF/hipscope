@@ -16,7 +16,10 @@ use std::collections::BTreeMap;
 type Result<T, E = String> = std::result::Result<T, E>;
 
 pub fn sha256_hex(b: &[u8]) -> String {
-    Sha256::digest(b).iter().map(|x| format!("{x:02x}")).collect()
+    Sha256::digest(b)
+        .iter()
+        .map(|x| format!("{x:02x}"))
+        .collect()
 }
 
 fn u16le(b: &[u8], o: usize) -> Result<u16> {
@@ -235,7 +238,10 @@ fn mp_value(b: &[u8], o: &mut usize) -> Result<Value> {
             let mut m = serde_json::Map::new();
             for _ in 0..n {
                 let k = mp_value(b, o)?;
-                let k = k.as_str().ok_or("msgpack map key is not a string")?.to_owned();
+                let k = k
+                    .as_str()
+                    .ok_or("msgpack map key is not a string")?
+                    .to_owned();
                 m.insert(k, mp_value(b, o)?);
             }
             Value::Object(m)
@@ -322,7 +328,11 @@ impl KernelInfo {
     /// lower it further.
     pub fn occupancy_waves_per_simd(&self) -> u64 {
         let alloc = self.vgprs.max(1).div_ceil(8) * 8;
-        let per_wave = if self.wavefront_size == 64 { alloc * 2 } else { alloc };
+        let per_wave = if self.wavefront_size == 64 {
+            alloc * 2
+        } else {
+            alloc
+        };
         (1536 / per_wave).min(16)
     }
 
@@ -408,7 +418,11 @@ pub fn kernels(image: &[u8], arch: &str) -> Result<BTreeMap<String, KernelInfo>>
                         }
                         // global_buffer / dynamic_shared_pointer / by_value are all one
                         // launch-ABI slot; only offset, size and pointer-ness matter.
-                        let class = if kind == "by_value" { "value" } else { "pointer" };
+                        let class = if kind == "by_value" {
+                            "value"
+                        } else {
+                            "pointer"
+                        };
                         Some((
                             a[".offset"].as_u64()?,
                             a[".size"].as_u64()?,
@@ -444,7 +458,10 @@ mod tests {
     fn bundle_selects_the_arch_entry() {
         let mut img = BUNDLE_MAGIC.to_vec();
         img.extend_from_slice(&2u64.to_le_bytes());
-        let ids = ["host-x86_64-unknown-linux-gnu-", "hipv4-amdgcn-amd-amdhsa--gfx1100"];
+        let ids = [
+            "host-x86_64-unknown-linux-gnu-",
+            "hipv4-amdgcn-amd-amdhsa--gfx1100",
+        ];
         let payloads: [&[u8]; 2] = [b"", b"\x7fELFxx"];
         let table: usize = 32 + ids.iter().map(|i| 24 + i.len()).sum::<usize>();
         let mut off = table;

@@ -206,8 +206,8 @@ use peacemaker_isa::Arch;
 use rayon::prelude::*;
 use rdna_compute::Gpu;
 use serde_json::{json, Value};
-use std::sync::OnceLock;
 use sha2::{Digest, Sha256};
+use std::sync::OnceLock;
 
 /// Contract-crate twin of `arch`; every arch of this adapter has a `qwen4_moe_sym` contract.
 fn abi_arch(arch: Arch) -> Result<AbiArch> {
@@ -2307,7 +2307,8 @@ impl Moe {
                 let mut y = Vec::with_capacity(tiles.len() * tile_bytes);
                 for t in tiles {
                     let (lo, hi) = (t * tile_bytes, (t + 1) * tile_bytes);
-                    let live = p.tiles[t] >= 0 && p.sorted[16 * t..16 * t + 16].iter().any(|&x| x >= 0);
+                    let live =
+                        p.tiles[t] >= 0 && p.sorted[16 * t..16 * t + 16].iter().any(|&x| x >= 0);
                     if live && !(lo..hi).any(|i| region.written.contains(i)) {
                         return Err(format!("sampled live tile {t} wrote no output"));
                     }
@@ -2413,7 +2414,11 @@ impl Moe {
                         ));
                     }
                     // Extent runs have no CPU reference (it needs every row); the tiny/prod cases carry it.
-                    let reference = if extent { Vec::new() } else { p.reference(Sample::Full) };
+                    let reference = if extent {
+                        Vec::new()
+                    } else {
+                        p.reference(Sample::Full)
+                    };
                     let report = |y: &[u8]| match p.compare(y, &reference, Sample::Full) {
                         Ok(r) => (
                             r.pass,
@@ -2427,12 +2432,20 @@ impl Moe {
                     } else {
                         report(&c.y)
                     };
-                    let (base_ok, base_ref) = if extent { (true, json!(null)) } else { report(&b.y) };
+                    let (base_ok, base_ref) = if extent {
+                        (true, json!(null))
+                    } else {
+                        report(&b.y)
+                    };
                     if !cand_ok {
-                        reasons.push(format!("candidate output fails the CPU reference: {cand_ref}"));
+                        reasons.push(format!(
+                            "candidate output fails the CPU reference: {cand_ref}"
+                        ));
                     }
                     if !base_ok {
-                        reasons.push(format!("emulated incumbent fails the CPU reference: {base_ref}"));
+                        reasons.push(format!(
+                            "emulated incumbent fails the CPU reference: {base_ref}"
+                        ));
                     }
                     cand_hash.update(&c.y);
                     base_hash.update(&b.y);
@@ -3536,12 +3549,7 @@ mod tests {
     #[test]
     fn emu_gate_passes_the_in_tree_gfx1100_entries() {
         for epi in ["gate_up", "down"] {
-            let w = on(
-                "E=2,TOP=2,T=20,H=512,I=128",
-                &[("epi", epi)],
-                Arch::Gfx1100,
-            )
-            .unwrap();
+            let w = on("E=2,TOP=2,T=20,H=512,I=128", &[("epi", epi)], Arch::Gfx1100).unwrap();
             let g = w
                 .emu_gate(&w.candidate().unwrap(), &w.baseline().unwrap())
                 .unwrap();
@@ -3721,7 +3729,13 @@ mod tests {
             p
         };
         let build = |epi: &str, path: &std::path::Path, arch: Arch| {
-            new_with_cand_object("fn,T=64", &mut knobs(&[("epi", epi)]), None, arch, Some(path))
+            new_with_cand_object(
+                "fn,T=64",
+                &mut knobs(&[("epi", epi)]),
+                None,
+                arch,
+                Some(path),
+            )
         };
         for epi in ["gate_up", "down"] {
             let e = Entry::parse(epi, Arch::Gfx1100).unwrap();
@@ -3731,19 +3745,36 @@ mod tests {
             assert_eq!(c.bytes, emitted.bytes, "{epi}");
             assert_eq!(c.launch_symbol, emitted.launch_symbol, "{epi}");
             assert_eq!(c.exports, emitted.exports, "{epi}");
-            assert_eq!(c.desc["cand_object"]["identical_to_generator"], true, "{epi}");
+            assert_eq!(
+                c.desc["cand_object"]["identical_to_generator"], true,
+                "{epi}"
+            );
             // The other kind's object does not expose this entry's symbol.
             let other = if epi == "down" { "gate_up" } else { "down" };
             let o = emit_object(Entry::parse(other, Arch::Gfx1100).unwrap(), json!({})).unwrap();
             let po = write(&format!("{epi}_wrong.co"), &o.bytes);
-            let e = build(epi, &po, Arch::Gfx1100).unwrap().candidate().unwrap_err();
-            assert!(e.contains("--cand-object") && e.contains(&emitted.launch_symbol), "{e}");
+            let e = build(epi, &po, Arch::Gfx1100)
+                .unwrap()
+                .candidate()
+                .unwrap_err();
+            assert!(
+                e.contains("--cand-object") && e.contains(&emitted.launch_symbol),
+                "{e}"
+            );
         }
         let junk = write("junk.co", b"not an elf");
-        let e = build("gate_up", &junk, Arch::Gfx1100).unwrap().candidate().unwrap_err();
+        let e = build("gate_up", &junk, Arch::Gfx1100)
+            .unwrap()
+            .candidate()
+            .unwrap_err();
         assert!(e.contains("--cand-object"), "{e}");
-        let e = build("gate_up", &dir.join("missing.co"), Arch::Gfx1100).err().unwrap();
-        assert!(e.contains("--cand-object") && e.contains("missing.co"), "{e}");
+        let e = build("gate_up", &dir.join("missing.co"), Arch::Gfx1100)
+            .err()
+            .unwrap();
+        assert!(
+            e.contains("--cand-object") && e.contains("missing.co"),
+            "{e}"
+        );
         let e = build("gate_up", &junk, Arch::Gfx1151).err().unwrap();
         assert!(e.contains("gfx1100 only"), "{e}");
         let _ = std::fs::remove_dir_all(&dir);
