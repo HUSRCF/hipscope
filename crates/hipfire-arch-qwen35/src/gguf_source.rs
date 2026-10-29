@@ -225,11 +225,18 @@ impl<'a> GgufSource<'a> {
     /// `(nk, r)` when the exporter re-ordered the value heads.
     fn tiling(&self) -> Option<(usize, usize)> {
         let c = self.config;
-        (c.linear_num_key_heads != c.linear_num_value_heads)
-            .then(|| (c.linear_num_key_heads, c.linear_num_value_heads / c.linear_num_key_heads))
+        (c.linear_num_key_heads != c.linear_num_value_heads).then(|| {
+            (
+                c.linear_num_key_heads,
+                c.linear_num_value_heads / c.linear_num_key_heads,
+            )
+        })
     }
 
-    fn row_perm_params(&self, order: VHeadOrder) -> HipResult<Option<(usize, usize, usize, usize)>> {
+    fn row_perm_params(
+        &self,
+        order: VHeadOrder,
+    ) -> HipResult<Option<(usize, usize, usize, usize)>> {
         // (skip_rows, block_rows, nk, r)
         let c = self.config;
         let Some((nk, r)) = self.tiling() else {
@@ -244,12 +251,18 @@ impl<'a> GgufSource<'a> {
             VHeadOrder::Native | VHeadOrder::TiledCols { .. } => None,
             VHeadOrder::TiledRows { head_dim } => Some((0, head_dim, nk, r)),
             VHeadOrder::TiledVector => Some((0, 1, nk, r)),
-            VHeadOrder::TiledQkvValueRows { head_dim } => {
-                Some((2 * c.linear_num_key_heads * c.linear_key_head_dim, head_dim, nk, r))
-            }
-            VHeadOrder::TiledConvValueChannels { head_dim } => {
-                Some((2 * c.linear_num_key_heads * c.linear_key_head_dim, head_dim, nk, r))
-            }
+            VHeadOrder::TiledQkvValueRows { head_dim } => Some((
+                2 * c.linear_num_key_heads * c.linear_key_head_dim,
+                head_dim,
+                nk,
+                r,
+            )),
+            VHeadOrder::TiledConvValueChannels { head_dim } => Some((
+                2 * c.linear_num_key_heads * c.linear_key_head_dim,
+                head_dim,
+                nk,
+                r,
+            )),
         })
     }
 
@@ -532,7 +545,10 @@ impl WeightSource for GgufSource<'_> {
                 .is_some()
         }) {
             eprintln!("  loading output (separate lm_head)...");
-            return Ok((self.upload_matrix(gpu, "lm_head.weight", c.vocab_size, c.dim)?, false));
+            return Ok((
+                self.upload_matrix(gpu, "lm_head.weight", c.vocab_size, c.dim)?,
+                false,
+            ));
         }
         if !can_alias {
             return Err(err(
@@ -541,7 +557,12 @@ impl WeightSource for GgufSource<'_> {
         }
         eprintln!("  loading output (tied embeddings, aliased)...");
         Ok((
-            hipfire_runtime::weight_backend::tied_lm_head_alias(embd, embd_fmt, c.vocab_size, c.dim),
+            hipfire_runtime::weight_backend::tied_lm_head_alias(
+                embd,
+                embd_fmt,
+                c.vocab_size,
+                c.dim,
+            ),
             true,
         ))
     }
@@ -567,7 +588,9 @@ impl WeightSource for GgufSource<'_> {
             layer: layer_idx,
         };
         crate::layer_driver::load_layer(&mut backend, self.config, layer_idx, |_, _, _| {
-            Err(err("load refused: GGUF-native serving covers the dense export only"))
+            Err(err(
+                "load refused: GGUF-native serving covers the dense export only",
+            ))
         })
     }
 
@@ -608,7 +631,11 @@ mod tests {
         for (h, g) in [(0usize, 0usize), (1, 2), (2, 1), (3, 3)] {
             let o = (skip + h * rows) * row_len;
             let s = (skip + g * rows) * row_len;
-            assert_eq!(&out[o..o + rows * row_len], &data[s..s + rows * row_len], "h={h}");
+            assert_eq!(
+                &out[o..o + rows * row_len],
+                &data[s..s + rows * row_len],
+                "h={h}"
+            );
         }
     }
 

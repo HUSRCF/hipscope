@@ -796,7 +796,8 @@ fn v_pk_mul_f16_multiplies_both_halves_with_one_rounding() {
 
 /// The gfx1201 instruction and its table name, decoded from machine words (gfx12 codec).
 fn dec12(words: &[u32]) -> (Inst, &'static str) {
-    let (inst, n) = crate::codec::gfx12::decode_for(Arch::Gfx1201, words).unwrap_or_else(|e| panic!("decode {words:08x?}: {e}"));
+    let (inst, n) = crate::codec::gfx12::decode_for(Arch::Gfx1201, words)
+        .unwrap_or_else(|e| panic!("decode {words:08x?}: {e}"));
     assert_eq!(n, words.len(), "{words:08x?} decoded to {n} words");
     let name = crate::isa::lookup(Arch::Gfx1201, inst.op, inst.form)
         .unwrap_or_else(|| panic!("{words:08x?} has no gfx1201 row"))

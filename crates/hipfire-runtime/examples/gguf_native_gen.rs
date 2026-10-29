@@ -97,10 +97,16 @@ fn main() {
     let tokenizer = hipfire_runtime::tokenizer::Tokenizer::from_gguf(model.gguf())
         .unwrap_or_else(|e| panic!("tokenizer: {e}"));
     let mut gpu = rdna_compute::Gpu::init().expect("gpu init");
-    eprintln!("gguf_native_gen: arch={} model={}", gpu.arch, model_path.display());
+    eprintln!(
+        "gguf_native_gen: arch={} model={}",
+        gpu.arch,
+        model_path.display()
+    );
     let mut config = model.hparams.config.clone();
     let t_load = Instant::now();
-    let mut weights = model.load_qwen35_weights(&mut gpu).expect("load GGUF weights");
+    let mut weights = model
+        .load_qwen35_weights(&mut gpu)
+        .expect("load GGUF weights");
     eprintln!("weights loaded in {:.2}s", t_load.elapsed().as_secs_f64());
     if let Some(l) = layers_keep {
         // Debug truncation: the first `l` layers only (logits are not meaningful,
@@ -122,7 +128,6 @@ fn main() {
     let mut dn_state = DeltaNetState::new(&mut gpu, &config).unwrap();
     let scratch = Qwen35Scratch::new(&mut gpu, &config, 128).unwrap();
 
-
     if dequant_check {
         // Device self-test of the prefill dequantisation: for a weight W,
         // `y1 = mmvq(W, x)` (the decode route, A8 activations) against
@@ -134,12 +139,27 @@ fn main() {
         for li in [0usize, 3] {
             match &weights.layers[li] {
                 LayerWeights::DeltaNet(l) => {
-                    for (n, w) in [("wqkv", &l.wqkv), ("wz", &l.wz), ("wo", &l.wo), ("gate", &l.w_gate), ("up", &l.w_up), ("down", &l.w_down)] {
+                    for (n, w) in [
+                        ("wqkv", &l.wqkv),
+                        ("wz", &l.wz),
+                        ("wo", &l.wo),
+                        ("gate", &l.w_gate),
+                        ("up", &l.w_up),
+                        ("down", &l.w_down),
+                    ] {
                         items.push((format!("L{li}.{n}"), w));
                     }
                 }
                 LayerWeights::FullAttn(l) => {
-                    for (n, w) in [("wq", &l.wq), ("wk", &l.wk), ("wv", &l.wv), ("wo", &l.wo), ("gate", &l.w_gate), ("up", &l.w_up), ("down", &l.w_down)] {
+                    for (n, w) in [
+                        ("wq", &l.wq),
+                        ("wk", &l.wk),
+                        ("wv", &l.wv),
+                        ("wo", &l.wo),
+                        ("gate", &l.w_gate),
+                        ("up", &l.w_up),
+                        ("down", &l.w_down),
+                    ] {
                         items.push((format!("L{li}.{n}"), w));
                     }
                 }
@@ -163,10 +183,14 @@ fn main() {
                 .collect();
             let xg = gpu.upload_f32(&x, &[k]).unwrap();
             let yg = gpu.alloc_tensor(&[m], rdna_compute::DType::F32).unwrap();
-            gpu.ggml_gemv(w.gpu_dtype, &w.buf, m, k, &xg, &yg, false).unwrap();
+            gpu.ggml_gemv(w.gpu_dtype, &w.buf, m, k, &xg, &yg, false)
+                .unwrap();
             let y1 = gpu.download_f32(&yg).unwrap();
-            let wf = gpu.alloc_tensor(&[m * k], rdna_compute::DType::F32).unwrap();
-            gpu.ggml_dequant_weight(w.gpu_dtype, &w.buf, m, k, &wf, Some(false)).unwrap();
+            let wf = gpu
+                .alloc_tensor(&[m * k], rdna_compute::DType::F32)
+                .unwrap();
+            gpu.ggml_dequant_weight(w.gpu_dtype, &w.buf, m, k, &wf, Some(false))
+                .unwrap();
             let wh = gpu.download_f32(&wf).unwrap();
             let (mut dot, mut na, mut nb, mut maxd) = (0f64, 0f64, 0f64, 0f64);
             for r in 0..m {
@@ -189,11 +213,17 @@ fn main() {
                 let nb_rows = 3usize;
                 let mut x3 = Vec::with_capacity(nb_rows * k);
                 for t in 0..nb_rows {
-                    x3.extend(x.iter().map(|v| v * (1.0 + t as f32 * 0.37) - t as f32 * 0.05));
+                    x3.extend(
+                        x.iter()
+                            .map(|v| v * (1.0 + t as f32 * 0.37) - t as f32 * 0.05),
+                    );
                 }
                 let x3g = gpu.upload_f32(&x3, &[nb_rows * k]).unwrap();
-                let y3g = gpu.alloc_tensor(&[nb_rows * m], rdna_compute::DType::F32).unwrap();
-                gpu.ggml_prefill_gemm(w.gpu_dtype, &w.buf, m, k, &x3g, &y3g, nb_rows).unwrap();
+                let y3g = gpu
+                    .alloc_tensor(&[nb_rows * m], rdna_compute::DType::F32)
+                    .unwrap();
+                gpu.ggml_prefill_gemm(w.gpu_dtype, &w.buf, m, k, &x3g, &y3g, nb_rows)
+                    .unwrap();
                 let y3 = gpu.download_f32(&y3g).unwrap();
                 let (mut dot3, mut na3, mut nb3, mut maxd3) = (0f64, 0f64, 0f64, 0f64);
                 for t in 0..nb_rows {
@@ -223,20 +253,32 @@ fn main() {
             for (name, w) in [("L0.w_beta", &l.w_beta), ("L0.w_alpha", &l.w_alpha)] {
                 let (m, k) = (w.m, w.k);
                 let nb_rows = 3usize;
-                let x3: Vec<f32> = (0..nb_rows * k).map(|i| ((i * 2654435761usize) % 1000) as f32 / 500.0 - 1.0).collect();
+                let x3: Vec<f32> = (0..nb_rows * k)
+                    .map(|i| ((i * 2654435761usize) % 1000) as f32 / 500.0 - 1.0)
+                    .collect();
                 let x3g = gpu.upload_f32(&x3, &[nb_rows * k]).unwrap();
-                let y3g = gpu.alloc_tensor(&[nb_rows * m], rdna_compute::DType::F32).unwrap();
-                gpu.gemm_f32_register_tiled(&w.buf, &x3g, &y3g, m, k, nb_rows).unwrap();
+                let y3g = gpu
+                    .alloc_tensor(&[nb_rows * m], rdna_compute::DType::F32)
+                    .unwrap();
+                gpu.gemm_f32_register_tiled(&w.buf, &x3g, &y3g, m, k, nb_rows)
+                    .unwrap();
                 let y3 = gpu.download_f32(&y3g).unwrap();
                 let wh = gpu.download_f32(&w.buf).unwrap();
                 let mut maxd = 0f64;
                 for t in 0..nb_rows {
                     for r in 0..m {
-                        let y2: f64 = wh[r * k..(r + 1) * k].iter().zip(&x3[t * k..(t + 1) * k]).map(|(a, b)| *a as f64 * *b as f64).sum();
+                        let y2: f64 = wh[r * k..(r + 1) * k]
+                            .iter()
+                            .zip(&x3[t * k..(t + 1) * k])
+                            .map(|(a, b)| *a as f64 * *b as f64)
+                            .sum();
                         maxd = maxd.max((y3[t * m + r] as f64 - y2).abs());
                     }
                 }
-                println!("F32_GEMM {name} {:?} m={m} k={k} max_abs_diff={maxd:.6}", w.gpu_dtype);
+                println!(
+                    "F32_GEMM {name} {:?} m={m} k={k} max_abs_diff={maxd:.6}",
+                    w.gpu_dtype
+                );
             }
         }
         return;
@@ -259,26 +301,55 @@ fn main() {
             dn_state.reset(&mut gpu).expect("reset state");
             kv_cache.clear_gpu(&mut gpu).expect("clear kv");
             qwen35::forward_prefill_batch(
-                &mut gpu, &weights, &config, toks, 0, &mut kv_cache, &mut dn_state, &scratch,
-                None, None, None, None,
+                &mut gpu,
+                &weights,
+                &config,
+                toks,
+                0,
+                &mut kv_cache,
+                &mut dn_state,
+                &scratch,
+                None,
+                None,
+                None,
+                None,
             )
             .expect("prefill forward failed");
             let la = gpu.download_f32(&scratch.logits).unwrap();
             let conv_a = gpu.download_f32(&dn_state.conv_states[0]).unwrap();
-            let sc_a = if dn_state.s_scales.is_empty() { Vec::new() } else { gpu.download_f32(&dn_state.s_scales[0]).unwrap() };
+            let sc_a = if dn_state.s_scales.is_empty() {
+                Vec::new()
+            } else {
+                gpu.download_f32(&dn_state.s_scales[0]).unwrap()
+            };
             dn_state.reset(&mut gpu).expect("reset state");
             kv_cache.clear_gpu(&mut gpu).expect("clear kv");
             for (p, &t) in toks.iter().enumerate() {
                 qwen35::forward_scratch(
-                    &mut gpu, &weights, &config, t, p, &mut kv_cache, &mut dn_state, &scratch,
+                    &mut gpu,
+                    &weights,
+                    &config,
+                    t,
+                    p,
+                    &mut kv_cache,
+                    &mut dn_state,
+                    &scratch,
                 )
                 .expect("decode forward failed");
             }
             let lb = gpu.download_f32(&scratch.logits).unwrap();
             let conv_b = gpu.download_f32(&dn_state.conv_states[0]).unwrap();
-            let sc_b = if dn_state.s_scales.is_empty() { Vec::new() } else { gpu.download_f32(&dn_state.s_scales[0]).unwrap() };
+            let sc_b = if dn_state.s_scales.is_empty() {
+                Vec::new()
+            } else {
+                gpu.download_f32(&dn_state.s_scales[0]).unwrap()
+            };
             let rel = |a: &[f32], b: &[f32]| -> (f32, f32) {
-                let md = a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max);
+                let md = a
+                    .iter()
+                    .zip(b)
+                    .map(|(x, y)| (x - y).abs())
+                    .fold(0f32, f32::max);
                 let mb = b.iter().map(|y| y.abs()).fold(0f32, f32::max);
                 (md, md / mb.max(1e-30))
             };
@@ -286,7 +357,10 @@ fn main() {
             let (sd, sr) = rel(&sc_a, &sc_b);
             println!("STATE0 n={n} conv_max_abs={cd:.5} conv_rel={cr:.5} s_scales_max_abs={sd:.6} s_scales_rel={sr:.5}");
             if let Some(pbs) = scratch.prefill_batch.as_ref() {
-                let last = |gpu: &mut rdna_compute::Gpu, t: &rdna_compute::GpuTensor, w: usize| -> Vec<f32> {
+                let last = |gpu: &mut rdna_compute::Gpu,
+                            t: &rdna_compute::GpuTensor,
+                            w: usize|
+                 -> Vec<f32> {
                     let all = gpu.download_f32(t).unwrap();
                     all[(n - 1) * w..n * w].to_vec()
                 };
@@ -295,15 +369,51 @@ fn main() {
                 let kd = config.linear_num_key_heads * config.linear_key_head_dim;
                 let qkvd = 2 * kd + vd;
                 let pairs: Vec<(&str, Vec<f32>, Vec<f32>)> = vec![
-                    ("beta", last(&mut gpu, &pbs.dn_beta_batch, nvh), gpu.download_f32(&scratch.dn_beta).unwrap()),
-                    ("alpha", last(&mut gpu, &pbs.dn_alpha_batch, nvh), gpu.download_f32(&scratch.dn_alpha).unwrap()),
-                    ("qkv_pre_conv", last(&mut gpu, &pbs.dn_qkv_batch, qkvd), gpu.download_f32(&scratch.dn_qkv).unwrap()),
-                    ("z", last(&mut gpu, &pbs.dn_z_batch, vd), gpu.download_f32(&scratch.dn_z).unwrap()),
-                    ("q", last(&mut gpu, &pbs.dn_q_batch, vd), gpu.download_f32(&scratch.dn_q).unwrap()),
-                    ("k", last(&mut gpu, &pbs.dn_k_batch, vd), gpu.download_f32(&scratch.dn_k).unwrap()),
-                    ("v", last(&mut gpu, &pbs.dn_v_batch, vd), gpu.download_f32(&scratch.dn_v).unwrap()),
-                    ("attn_out", last(&mut gpu, &pbs.dn_attn_out_batch, vd), gpu.download_f32(&scratch.dn_attn_out).unwrap()),
-                    ("normed", last(&mut gpu, &pbs.dn_normed_batch, vd), gpu.download_f32(&scratch.dn_normed).unwrap()),
+                    (
+                        "beta",
+                        last(&mut gpu, &pbs.dn_beta_batch, nvh),
+                        gpu.download_f32(&scratch.dn_beta).unwrap(),
+                    ),
+                    (
+                        "alpha",
+                        last(&mut gpu, &pbs.dn_alpha_batch, nvh),
+                        gpu.download_f32(&scratch.dn_alpha).unwrap(),
+                    ),
+                    (
+                        "qkv_pre_conv",
+                        last(&mut gpu, &pbs.dn_qkv_batch, qkvd),
+                        gpu.download_f32(&scratch.dn_qkv).unwrap(),
+                    ),
+                    (
+                        "z",
+                        last(&mut gpu, &pbs.dn_z_batch, vd),
+                        gpu.download_f32(&scratch.dn_z).unwrap(),
+                    ),
+                    (
+                        "q",
+                        last(&mut gpu, &pbs.dn_q_batch, vd),
+                        gpu.download_f32(&scratch.dn_q).unwrap(),
+                    ),
+                    (
+                        "k",
+                        last(&mut gpu, &pbs.dn_k_batch, vd),
+                        gpu.download_f32(&scratch.dn_k).unwrap(),
+                    ),
+                    (
+                        "v",
+                        last(&mut gpu, &pbs.dn_v_batch, vd),
+                        gpu.download_f32(&scratch.dn_v).unwrap(),
+                    ),
+                    (
+                        "attn_out",
+                        last(&mut gpu, &pbs.dn_attn_out_batch, vd),
+                        gpu.download_f32(&scratch.dn_attn_out).unwrap(),
+                    ),
+                    (
+                        "normed",
+                        last(&mut gpu, &pbs.dn_normed_batch, vd),
+                        gpu.download_f32(&scratch.dn_normed).unwrap(),
+                    ),
                 ];
                 for (name, a, b) in pairs {
                     let len = a.len().min(b.len());

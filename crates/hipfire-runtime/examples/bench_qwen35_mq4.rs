@@ -84,11 +84,12 @@ fn main() {
     let (config, weights, model_bytes) = if model_path_buf.extension().is_some_and(|e| e == "gguf")
     {
         // GGUF-native (`HIPFIRE_GGUF_NATIVE=1`): ggml block bytes served as-is.
-        let m = hipfire_loader::gguf_native::GgufNativeModel::open(model_path_buf)
-            .unwrap_or_else(|e| {
+        let m = hipfire_loader::gguf_native::GgufNativeModel::open(model_path_buf).unwrap_or_else(
+            |e| {
                 eprintln!("{e}");
                 std::process::exit(1)
-            });
+            },
+        );
         let config = m.hparams.config.clone();
         eprintln!(
             "Config: dim={} layers={} heads={} kv_heads={} vocab={}",
@@ -100,9 +101,7 @@ fn main() {
             bytes as f64 / (1024.0 * 1024.0 * 1024.0),
             bytes
         );
-        let weights = m
-            .load_qwen35_weights(&mut gpu)
-            .expect("load GGUF weights");
+        let weights = m.load_qwen35_weights(&mut gpu).expect("load GGUF weights");
         (config, weights, bytes)
     } else if model_path_buf.is_dir() {
         use hipfire_runtime::safetensors_source::SafetensorsSource;

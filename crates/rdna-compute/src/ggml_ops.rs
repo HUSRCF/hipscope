@@ -89,7 +89,12 @@ pub fn ggml_kmap_bytes(k: usize) -> usize {
 }
 
 /// Total buffer bytes of a weight with a K-chunk map.
-pub fn ggml_weight_buffer_bytes(dtype: DType, m: usize, k: usize, with_kmap: bool) -> Option<usize> {
+pub fn ggml_weight_buffer_bytes(
+    dtype: DType,
+    m: usize,
+    k: usize,
+    with_kmap: bool,
+) -> Option<usize> {
     if with_kmap {
         ggml_kmap_offset(dtype, m, k)?.checked_add(ggml_kmap_bytes(k))
     } else {
@@ -256,10 +261,20 @@ impl Gpu {
                     let _ = self.hip.free(old.buf);
                 }
                 let buf = self.hip.malloc(bytes)?;
-                self.scratch.ggml.a8 = Some(GpuTensor { buf, shape: vec![n * k], dtype: DType::F32 });
+                self.scratch.ggml.a8 = Some(GpuTensor {
+                    buf,
+                    shape: vec![n * k],
+                    dtype: DType::F32,
+                });
                 self.scratch.ggml.a8_bytes = bytes;
             }
-            let tmp = self.scratch.ggml.a8.as_ref().expect("allocated").shallow_clone();
+            let tmp = self
+                .scratch
+                .ggml
+                .a8
+                .as_ref()
+                .expect("allocated")
+                .shallow_clone();
             self.copy_d2d(x, &tmp, bytes)?;
             self.ggml_q81_roundtrip(&tmp, n, k)?;
             tmp
@@ -269,8 +284,16 @@ impl Gpu {
         if mode.codec_only {
             // Weights: dequantise to BF16-rounded F32, then copy into F16 (a
             // BF16-rounded value is exact in F16 over the weights' range).
-            let wf = GpuTensor { buf: mat.buf.byte_view(0, m * k * 4), shape: vec![m * k], dtype: DType::F32 };
-            let wh = GpuTensor { buf: mat.buf.byte_view(m * k * 4, m * k * 2), shape: vec![m, k], dtype: DType::F16 };
+            let wf = GpuTensor {
+                buf: mat.buf.byte_view(0, m * k * 4),
+                shape: vec![m * k],
+                dtype: DType::F32,
+            };
+            let wh = GpuTensor {
+                buf: mat.buf.byte_view(m * k * 4, m * k * 2),
+                shape: vec![m, k],
+                dtype: DType::F16,
+            };
             self.ggml_dequant_weight(dtype, w, m, k, &wf, Some(true))?;
             self.cast_f32_to_f16(&wf, &wh)?;
             // Activations: x = hi + lo, hi = bf16(x), lo = x - hi (exact in
@@ -285,13 +308,35 @@ impl Gpu {
                     let _ = self.hip.free(old.buf);
                 }
                 let buf = self.hip.malloc(bytes)?;
-                self.scratch.ggml.split = Some(GpuTensor { buf, shape: vec![bytes / 4], dtype: DType::F32 });
+                self.scratch.ggml.split = Some(GpuTensor {
+                    buf,
+                    shape: vec![bytes / 4],
+                    dtype: DType::F32,
+                });
                 self.scratch.ggml.split_bytes = bytes;
             }
-            let sp = self.scratch.ggml.split.as_ref().expect("allocated").shallow_clone();
-            let hi = GpuTensor { buf: sp.buf.byte_view(0, nk * 4), shape: vec![nk], dtype: DType::F32 };
-            let lo = GpuTensor { buf: sp.buf.byte_view(nk * 4, nk * 4), shape: vec![nk], dtype: DType::F32 };
-            let y2 = GpuTensor { buf: sp.buf.byte_view(2 * nk * 4, nm * 4), shape: vec![nm], dtype: DType::F32 };
+            let sp = self
+                .scratch
+                .ggml
+                .split
+                .as_ref()
+                .expect("allocated")
+                .shallow_clone();
+            let hi = GpuTensor {
+                buf: sp.buf.byte_view(0, nk * 4),
+                shape: vec![nk],
+                dtype: DType::F32,
+            };
+            let lo = GpuTensor {
+                buf: sp.buf.byte_view(nk * 4, nk * 4),
+                shape: vec![nk],
+                dtype: DType::F32,
+            };
+            let y2 = GpuTensor {
+                buf: sp.buf.byte_view(2 * nk * 4, nm * 4),
+                shape: vec![nm],
+                dtype: DType::F32,
+            };
             self.copy_d2d(&input, &hi, nk * 4)?;
             self.bf16_round_trip_f32(&hi)?;
             self.copy_d2d(&hi, &lo, nk * 4)?;
@@ -301,7 +346,11 @@ impl Gpu {
             self.gemm_f16_wmma_mb8(&wh, &lo, &y2, m, k, n)?;
             self.add_inplace_f32_raw(y.buf.as_ptr(), y2.buf.as_ptr(), nm)
         } else {
-            let wv = GpuTensor { buf: mat.buf.byte_view(0, need), shape: vec![m, k], dtype: DType::F16 };
+            let wv = GpuTensor {
+                buf: mat.buf.byte_view(0, need),
+                shape: vec![m, k],
+                dtype: DType::F16,
+            };
             self.ggml_dequant_weight(dtype, w, m, k, &wv, None)?;
             self.gemm_f16_wmma_mb8(&wv, &input, y, m, k, n)
         }
@@ -315,8 +364,8 @@ impl Gpu {
             self.scratch.ggml.a8.take(),
             self.scratch.ggml.split.take(),
         ]
-            .into_iter()
-            .flatten()
+        .into_iter()
+        .flatten()
         {
             let _ = self.hip.device_synchronize();
             let _ = self.hip.free(t.buf);
@@ -328,12 +377,9 @@ impl Gpu {
 
     /// Non-owning view of the q8_1 scratch.
     fn ggml_q81_view(&self, bytes: usize) -> HipResult<GpuTensor> {
-        let q = self
-            .scratch
-            .ggml
-            .q81
-            .as_ref()
-            .ok_or_else(|| err("ggml route: q8_1 scratch was not allocated (ggml_ensure_scratch)"))?;
+        let q = self.scratch.ggml.q81.as_ref().ok_or_else(|| {
+            err("ggml route: q8_1 scratch was not allocated (ggml_ensure_scratch)")
+        })?;
         if bytes > q.buf.size() {
             return Err(err(format!(
                 "ggml route: activation row needs {bytes} q8_1 bytes, scratch holds {}",
@@ -365,7 +411,9 @@ impl Gpu {
         kmap: Option<&GpuTensor>,
     ) -> HipResult<GpuTensor> {
         if k % 32 != 0 || k == 0 {
-            return Err(err(format!("ggml route: activation length {k} is not a multiple of 32")));
+            return Err(err(format!(
+                "ggml route: activation length {k} is not a multiple of 32"
+            )));
         }
         if x.buf.size() < k * 4 {
             return Err(err(format!(

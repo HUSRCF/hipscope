@@ -688,8 +688,7 @@ impl GgufNativeModel {
         gpu: &mut rdna_compute::Gpu,
     ) -> Result<hipfire_arch_qwen35::qwen35::Qwen35Weights, String> {
         use hipfire_arch_qwen35::qwen35::{load_weights, Layout};
-        let mut src =
-            hipfire_arch_qwen35::gguf_source::GgufSource::new(&self.gguf, &self.hparams);
+        let mut src = hipfire_arch_qwen35::gguf_source::GgufSource::new(&self.gguf, &self.hparams);
         let layout = Layout::single(self.hparams.config.n_layers);
         load_weights(&mut src, std::slice::from_mut(gpu), &layout)
             .map_err(|e| format!("load_weights: {e:?}"))
@@ -864,7 +863,8 @@ pub fn inspect_report(path: &Path, native_enabled: bool) -> Result<String, Strin
             let _ = writeln!(out, "  ... and {} more", ordered.len() - 20);
         }
     }
-    let _ = writeln!(
+    let _ =
+        writeln!(
         out,
         "native load:   {} ({GGUF_NATIVE_ENV}=1 {}; admitted files serve AR on gfx1201: decode \
          GEMV on q8_1 activations, prefill by dequantisation to F16)",

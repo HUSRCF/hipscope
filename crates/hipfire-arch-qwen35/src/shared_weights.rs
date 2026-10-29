@@ -200,11 +200,9 @@ fn embd_tag(f: EmbeddingFormat) -> SwResult<u8> {
         EmbeddingFormat::HFQ4G256 => 3,
         EmbeddingFormat::HFQ4G128 => 4,
         EmbeddingFormat::Q8_0 => 5,
-        EmbeddingFormat::Ggml(_) => {
-            return Err(SharedWeightError::unsupported(
-                "GGUF-native embedding tables are served by the dense qwen35 decode/prefill route only",
-            ))
-        }
+        EmbeddingFormat::Ggml(_) => return Err(SharedWeightError::unsupported(
+            "GGUF-native embedding tables are served by the dense qwen35 decode/prefill route only",
+        )),
     })
 }
 

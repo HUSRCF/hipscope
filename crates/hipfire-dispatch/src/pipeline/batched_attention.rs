@@ -501,7 +501,8 @@ pub fn batch_chunk_full_attn_input_projection(
     // GGUF-native weights (`DType::Ggml*`): unfused plain GEMMs, one per
     // weight at that weight's own type (mixed types per tensor are normal in
     // a GGUF; `run_plain_gemm_key` dequantises each).
-    let qkv_all_ggml = layer.wq.dtype.is_ggml() && layer.wk.dtype.is_ggml() && layer.wv.dtype.is_ggml();
+    let qkv_all_ggml =
+        layer.wq.dtype.is_ggml() && layer.wk.dtype.is_ggml() && layer.wv.dtype.is_ggml();
     // qt=52 re-arm anchor: q/k/v all Lloyd → FP8-LUT launcher.
     let qkv_is_mq4v2_lloyd = all_mq4v2_lloyd(&[layer.wq.dtype, layer.wk.dtype, layer.wv.dtype]);
     // Fused QKV kernels require all three weights to share a
