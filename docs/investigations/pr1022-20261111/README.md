@@ -74,10 +74,14 @@ backend fields remain UNOBSERVED.
 
 hosted-ci.json binds the actual current merge-checkout tree to fe6.
 Sixteen of nineteen jobs succeed. Windows clock_gettime linkage and
-int-rest missing ROCm llvm-mc match clean beta; the downstream failed job
+int-rest required-oracle/no-ROCm-policy failures match clean beta; the downstream failed job
 only aggregates shard status. Required hosted CI is not green.
 The prior mixed-residency CI failure did not recur; its cause is unproven.
 
 No new-beta speedup, peak-VRAM, live Q8Ef, native MTP, sampled-native MTP,
 adaptive policy, or broader-device claim is made. Maintainer review and
 required CI remain merge gates.
+
+CI discovery precision: the explicit no-ROCm policy returns no oracle while
+the test helper requires one. This does not establish physical tool absence;
+see ci-policy-clarification.json. Required CI remains red.

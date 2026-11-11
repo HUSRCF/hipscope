@@ -1,0 +1,14 @@
+{
+  "schema": "hipfire-ci-rocm-policy-precision-v1",
+  "scope": "Clarifies the identical frozen beta/fe6/P5 CI policy and source inputs; does not change tested products.",
+  "observed_failure": "required ROCm CPU oracle is unavailable under HIPFIRE_TEST_REQUIRE_ROCM=0 while need_tools panics instead of skipping",
+  "physical_llvm_mc_absence_proven": false,
+  "same_failure_as_clean_base": true,
+  "source_identity_proof": {
+    "path": "/home/husrcf/Code/hipfireQC/tmpOutput/pr1022-pr1023-review-20261111/CI-p5/source-identity.json",
+    "bytes": 6618,
+    "sha256": "7090640145e2327d75ba32a26fa3867bdea10f800687b50ce1b5010aebc0ff6d"
+  },
+  "raw_CI_P5_scope_sha256": "3521eb27d7a1f87d0b56f1030245c2450363612c9e654b653c1223197e391ea6",
+  "hosted_CI_is_green": false
+}
