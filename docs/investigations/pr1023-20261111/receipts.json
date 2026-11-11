@@ -1,0 +1,306 @@
+{
+  "schema": "hipfire-pr1023-diagnosis-checkpoint-v1",
+  "status": "FAILURES_RETAINED_DIAGNOSIS_ONLY",
+  "source_head": "f2d25a0ba30a697d08ad196916fc8b902f2211a9",
+  "source_tree": "2a161933d3af2969b12542c9f6be21d05909a521",
+  "parent_head": "818ea1104620fecc5f8c452b1ff48ce6dae8c5ee",
+  "artifact_root_label": "pr1022-pr1023-review-20261111",
+  "artifact_paths": "All artifact fields are relative to the original external QC root; raw files and binaries are retained there, not included in Git.",
+  "first_failure": {
+    "source_head": "818ea1104620fecc5f8c452b1ff48ce6dae8c5ee",
+    "cache_enabled": false,
+    "error": "Qwen4 bundle forward: Qwen4 spec hidden capacity is too small",
+    "complete": false,
+    "cache_on_started": false,
+    "correction": {
+      "commit": "f2d25a0ba30a697d08ad196916fc8b902f2211a9",
+      "path": "crates/hipfire-arch-qwen4/examples/fn_mtp_lru/model.rs",
+      "parent_blob": "c288beffa0e4c2534d86040ad60532f3b5559889",
+      "corrected_blob": "8cb3ae5fda70a3e9cd3bbd62711253a181fba2bb",
+      "change": "Delete only early new_spec_scratch(8) and free calls. Production native prefill sizes its own hidden capture; existing R8 admission assertion remains."
+    }
+  },
+  "second_failure": {
+    "source_head": "f2d25a0ba30a697d08ad196916fc8b902f2211a9",
+    "cache_enabled": false,
+    "error": "accepted-prefix target state differs from AR",
+    "complete": false,
+    "cache_on_started": false
+  },
+  "diagnostic": {
+    "diagnostic_not_PR_qualification": true,
+    "overlay_changes": "Diagnostic logging and full mismatch serialization; assertions and numerical policy retained. Overlay was restored to clean f2 after its CPU build.",
+    "profile": {
+      "hot_budget_mib": 18000,
+      "max_seq": 16384,
+      "native_k": 3,
+      "head_reserve_k": 7,
+      "cache_enabled": false
+    },
+    "first_mismatch": {
+      "rows": 2,
+      "accept": 0,
+      "keep": 1,
+      "path": "generic_commit_prefix",
+      "current_position": 85,
+      "expected_position": 85,
+      "block_ids": [
+        248068,
+        271
+      ]
+    },
+    "prompt_tokens": 84,
+    "semantic_rows": 220,
+    "different_rows": 48,
+    "gdn_conv_differences": 36,
+    "qsa_selection_differences": 12,
+    "native_first_prompt": {
+      "fixture": "baseline-tools/code_parser_rust.txt",
+      "generated_tokens": 512,
+      "native_windows": 135,
+      "actual_acceptance_cells": {
+        "zero": true,
+        "interior": true,
+        "full": true
+      },
+      "terminal_repair_internal_check_completed": true
+    },
+    "prior_internal_checks": [
+      {
+        "rows": 1,
+        "full_vocabulary_bitwise": true,
+        "full_target_semantic_state_exact": true
+      },
+      {
+        "rows": 2,
+        "full_vocabulary_bitwise": true,
+        "full_target_semantic_state_exact": true
+      }
+    ],
+    "qualification": "NONE; first prompt native stage completed internally, then target-prefix stage failed. No complete model case, cache-on arm, paired comparison, service gate, or performance result."
+  },
+  "cpu_source_contract": {
+    "status": "PASS",
+    "meaning": "CPU source-contract counterexample: copying raw F32 capture cannot reproduce the kernel BF16-rounded convolution ring.",
+    "cases": [
+      {
+        "start": 84,
+        "rows": 2,
+        "keep": 1,
+        "channels": 4,
+        "history_slots": 3,
+        "raw_copy_differing_elements": [
+          0,
+          1,
+          2,
+          3
+        ],
+        "roundtrip_matches_kernel_prefix": true,
+        "ring_slot_indexing_matches_kernel": true
+      },
+      {
+        "start": 85,
+        "rows": 2,
+        "keep": 1,
+        "channels": 4,
+        "history_slots": 3,
+        "raw_copy_differing_elements": [
+          4,
+          5,
+          6,
+          7
+        ],
+        "roundtrip_matches_kernel_prefix": true,
+        "ring_slot_indexing_matches_kernel": true
+      },
+      {
+        "start": 86,
+        "rows": 2,
+        "keep": 1,
+        "channels": 4,
+        "history_slots": 3,
+        "raw_copy_differing_elements": [
+          8,
+          9,
+          10,
+          11
+        ],
+        "roundtrip_matches_kernel_prefix": true,
+        "ring_slot_indexing_matches_kernel": true
+      },
+      {
+        "start": 84,
+        "rows": 8,
+        "keep": 7,
+        "channels": 4,
+        "history_slots": 3,
+        "raw_copy_differing_elements": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11
+        ],
+        "roundtrip_matches_kernel_prefix": true,
+        "ring_slot_indexing_matches_kernel": true
+      }
+    ],
+    "limits": [
+      "The actual GPU diagnostic saved state hashes, not convolution element bytes. CPU reproduction proves the source storage-contract mismatch; it does not assert the exact actual differing elements.",
+      "No convolution field is excluded. QSA selection is a separate mismatch still requiring an explicit contract.",
+      "No production source or oracle assertion changed; no GPU rerun or base GPU reproduction."
+    ],
+    "hardware_fix_proven": false,
+    "qsa_mismatch_resolved": false
+  },
+  "qualification_scope": {
+    "strict_all_workspace_pass": false,
+    "original_parent_full_cpu_status": "FAIL_RETAINED",
+    "original_parent_workspace_exit_code": 101,
+    "f2_scoped_followup": "Six CPU checks passed at f2; full-workspace/no-GPU CI evidence belongs to parent 818. No diagnostic or numerical model qualification follows from CPU admission."
+  },
+  "source_files": [
+    {
+      "path": "crates/hipfire-arch-qwen4/examples/fn_mtp_lru/model.rs",
+      "git_blob": "8cb3ae5fda70a3e9cd3bbd62711253a181fba2bb",
+      "bytes": 52621,
+      "sha256": "19b81e177402793fe695742e6c6d76f9e10959e18d8c0f72743afc6e06cab906"
+    },
+    {
+      "path": "crates/hipfire-arch-qwen4/src/state.rs",
+      "git_blob": "f1b32817b1453d24d0dee6661e6a082fca482f9f",
+      "bytes": 340204,
+      "sha256": "03a3bdc454bfe0e4c54b71190893da6978d7e4e9b361ee4cef515e13f65a8887"
+    },
+    {
+      "path": "crates/hipfire-dispatch/src/pipeline/layer_ops.rs",
+      "git_blob": "2ef56d5e984aac1cd72b3e78d630ff465987d8fd",
+      "bytes": 327445,
+      "sha256": "059a47fded9f1042cf36868ee9203a9ba87fa43ceaea14970032bdcaec5f56b9"
+    },
+    {
+      "path": "kernels/src/tensor_ops.hip",
+      "git_blob": "acee44169c7204f8943415e82f34130d255921ee",
+      "bytes": 285135,
+      "sha256": "509ce3f4e2102274daf18a7daea4ddd380a16b8d26e13bf21b8cf3884f16c484"
+    }
+  ],
+  "diagnostic_prepared_model": {
+    "artifact": "oracle-prefix-diagnostic-overlay-01/prepared-model.rs",
+    "bytes": 54915,
+    "sha256": "c355254869b088b339b282eba8da8bcca0e2eddb2468c2bf0d14d82935d8433e"
+  },
+  "artifacts": [
+    {
+      "artifact": "P5-NATIVE-FIRST-FAILURE-CLEANUP.json",
+      "bytes": 6416,
+      "sha256": "3c5d515dc34c1803b9551c224b73d0eb55e9913149e7582793aa4479f4f43a30"
+    },
+    {
+      "artifact": "pr1023-native-gates-01/off/oracle.json",
+      "bytes": 366,
+      "sha256": "e04fbb2036fab10d269d36c437d0430109e821b3417f96a468b3d272c24e7a6f"
+    },
+    {
+      "artifact": "P5-ORACLE-FOLLOWUP-SOURCE.json",
+      "bytes": 1360,
+      "sha256": "9cdb5a115c080394ff2d3eb0e01546943087fd15807c42a014574fb7a7d41718"
+    },
+    {
+      "artifact": "cpu-pr1023-oracle-followup-01/RUN.json",
+      "bytes": 17529,
+      "sha256": "4902dfa666fe0af5c829625a7d0b6d3088176e364f32d67bf2d9cd7326f7d824"
+    },
+    {
+      "artifact": "P5-NATIVE-SECOND-FAILURE-CLEANUP.json",
+      "bytes": 6862,
+      "sha256": "26a37d048b9dd131f339d015531844f5d3a0dfd7222408faca7b1013b0a29690"
+    },
+    {
+      "artifact": "pr1023-native-gates-02/off/oracle.json",
+      "bytes": 349,
+      "sha256": "c401cd7d192f7b0ac04f0941ccd5901aad07820f8fbcc4e533ce4e53b08074c4"
+    },
+    {
+      "artifact": "P5-PREFIX-FIRST-MISMATCH.json",
+      "bytes": 102656,
+      "sha256": "883b528165da628c0baa5d46cc653bf8337bd4b30bd2335d7a27c1d33f1cd546"
+    },
+    {
+      "artifact": "pr1023-prefix-diagnostic-off-01/RUN.json",
+      "bytes": 40097,
+      "sha256": "8a57012accb58ec22ce1e91697eae181dd69e1cc232109dbfe4c4c2e89dd0adb"
+    },
+    {
+      "artifact": "pr1023-prefix-diagnostic-off-01/off/RUN.json",
+      "bytes": 2331,
+      "sha256": "0fda25086769e6863cade1a76f24cce4df0a517e01a00aa73221fe10c392bcbf"
+    },
+    {
+      "artifact": "pr1023-prefix-diagnostic-off-01/off/oracle.json",
+      "bytes": 67074,
+      "sha256": "6826e6e9d70424cdbbde7a31523ab02f87414ab9f028e03fcb0b9f39f9121167"
+    },
+    {
+      "artifact": "oracle-prefix-diagnostic-overlay-01/BUILD.json",
+      "bytes": 13157,
+      "sha256": "e996e7059db4d998e0f3b98e87c0db8d0759359a099bdb7864c467a27ccf8a34"
+    },
+    {
+      "artifact": "oracle-prefix-diagnostic-overlay-01/diagnostic-only.patch",
+      "bytes": 5135,
+      "sha256": "7ac711a5a2c0e8cfc720b5e75c447037822833453235d1a22307480efd00cb19"
+    },
+    {
+      "artifact": "oracle-prefix-diagnostic-overlay-01/cpu-diag-01/fn_mtp_lru_oracle-diagnostic",
+      "bytes": 67989720,
+      "sha256": "05bd9b96169d8676bc9cbd787eeb2ece5b7db4b66256e829fb141db6fc645f4f"
+    },
+    {
+      "artifact": "P5-conv-rollback-diagnosis/cpu-proof.json",
+      "bytes": 7838,
+      "sha256": "c7254aed4cc2845596800124ca66780a96ba569ba200ffe63f8c6dce91ef90a5"
+    },
+    {
+      "artifact": "P5-conv-rollback-diagnosis/reproduce-conv-rounding.py",
+      "bytes": 4625,
+      "sha256": "cc24d657862fc412a30ac73c7b09985a9660825f23bdcbdd95392de71490bf35"
+    },
+    {
+      "artifact": "P5-ORACLE-FOLLOWUP-QUALIFICATION.json",
+      "bytes": 3276,
+      "sha256": "4154132f75be90710d07f3770f5ad69ac7d97a0b3b3e6d7a3a77f0da1b035d9c"
+    },
+    {
+      "artifact": "P5-ORACLE-FOLLOWUP-ISSUANCE.json",
+      "bytes": 11324,
+      "sha256": "ba43a3e79cfadd2fcd81405900f522239587856f1a71ea0d925989ae3f69b97f"
+    },
+    {
+      "artifact": "cpu-pr1023-final-01/RUN.json",
+      "bytes": 23809,
+      "sha256": "50f9477dfb052b6d9e01e98d85f10aeb252982df05f0aafdb688122c51320b1c"
+    },
+    {
+      "artifact": "baseline-tools/code_parser_rust.txt",
+      "bytes": 415,
+      "sha256": "edef11656459b65564d55ebb35db0ed78b9b0dd62199d1bcbbfc2e7e7b48781a"
+    }
+  ],
+  "not_claimed": [
+    "Exact differing convolution element values on GPU",
+    "QSA selection storage contract resolved",
+    "Native target-prefix correctness",
+    "Cache-on LRU/native equivalence",
+    "Complete oracle or service qualification",
+    "Asynchronous overlap or performance improvement",
+    "Hardware fix proven"
+  ]
+}

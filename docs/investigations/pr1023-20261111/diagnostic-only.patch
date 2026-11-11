@@ -1,0 +1,64 @@
+--- a/crates/hipfire-arch-qwen4/examples/fn_mtp_lru/model.rs
++++ b/crates/hipfire-arch-qwen4/examples/fn_mtp_lru/model.rs
+@@ -270,6 +270,10 @@
+         check_state(bundle, gpu, &ar.states[&0], "captured independent S0")?;
+         let mut cells = Vec::new();
+         for rows in [1, 2, 4, 8] {
++            eprintln!(
++                "{}",
++                json!({"schema":"hipfire-fn-mtp-lru-diagnostic-v1", "milestone":"target_width_begin", "rows":rows, "prompt_tokens":prompt.len(), "current_position":bundle.state.position})
++            );
+             verified_complete = false;
+             s0.restore(bundle, gpu)?;
+             verified_complete = true;
+@@ -298,6 +302,10 @@
+                 )?;
+             }
+             check_state(bundle, gpu, &ar.states[&rows], "verify full state")?;
++            eprintln!(
++                "{}",
++                json!({"schema":"hipfire-fn-mtp-lru-diagnostic-v1", "milestone":"target_width_full_verify_passed", "rows":rows, "current_position":bundle.state.position, "full_vocabulary_bitwise":true, "full_target_semantic_state_exact":true})
++            );
+             verified_complete = false;
+             oracle::dev_rollback_verify(bundle, gpu, scratch.as_mut())?;
+             let restored = digest(bundle, gpu, SessionRoute::Ar)?;
+@@ -324,6 +332,10 @@
+                     verified_complete = true;
+                     scratch.clear();
+                     check_state(bundle, gpu, &ar.states[&0], "accepted-prefix S0 restore")?;
++                    eprintln!(
++                        "{}",
++                        json!({"schema":"hipfire-fn-mtp-lru-diagnostic-v1", "milestone":"prefix_before", "rows":rows, "accept":accept, "keep":accept+1, "path":if native {"native_retain"} else {"generic_commit_prefix"}, "current_position":bundle.state.position, "expected_position":prompt.len()+accept+1, "block_ids":block})
++                    );
+                     verified_complete = false;
+                     let _ = oracle::dev_verify_logits(bundle, gpu, block, scratch.as_mut())?;
+                     verified_complete = false;
+@@ -348,9 +360,16 @@
+                     let keep = accept + 1;
+                     let now = digest(bundle, gpu, SessionRoute::Ar)?;
+                     verified_complete = true;
++                    eprintln!(
++                        "{}",
++                        json!({"schema":"hipfire-fn-mtp-lru-diagnostic-v1", "milestone":"prefix_after", "rows":rows, "accept":accept, "keep":keep, "path":if native {"native_retain"} else {"generic_commit_prefix"}, "current_position":bundle.state.position, "expected_position":prompt.len()+keep, "semantic_state_exact":now.same_semantic(&ar.states[&keep])})
++                    );
+                     ensure(
+                         now.same_semantic(&ar.states[&keep]),
+-                        "accepted-prefix target state differs from AR",
++                        format!(
++                            "accepted-prefix target state differs from AR: {}",
++                            json!({"schema":"hipfire-fn-mtp-lru-diagnostic-v1", "milestone":"prefix_state_mismatch", "rows":rows, "accept":accept, "keep":keep, "path":if native {"native_retain"} else {"generic_commit_prefix"}, "current_position":bundle.state.position, "expected_position":prompt.len()+keep, "block_ids":block, "actual":now, "want":ar.states[&keep]})
++                        ),
+                     )?;
+                     verified_complete = false;
+                     bundle
+@@ -1128,6 +1147,10 @@
+             let ar = ar_reference(&mut bundle, &mut gpu, &prompt, &logits, args.tokens.max(9))?;
+             // Native goes first so target-oracle batches cannot prime its guard witness.
+             let native = native_walk(&mut bundle, &mut gpu, &prompt, &logits, &ar, args.k, cache)?;
++            eprintln!(
++                "{}",
++                json!({"schema":"hipfire-fn-mtp-lru-diagnostic-v1", "milestone":"native_walk_done", "prompt":file, "prompt_tokens":prompt.len(), "generated_tokens":ar.ids.len(), "cache_enabled":cache, "actual_acceptance_cells":native["actual_acceptance_cells"], "native_windows":native["windows"].as_array().map(Vec::len), "terminal_repair_checked":native["terminal"]["retained_prefix_repaired"]})
++            );
+             let target = target_transactions(&mut bundle, &mut gpu, &prompt, &logits, &ar, args.k)?;
+             let prefix = prefix_restore(&mut bundle, &mut gpu, &prompt, args.k, loaded.max_seq)?;
+             cases.push(json!({"prompt":file,"prompt_sha256":format!("{:x}",Sha256::digest(&bytes)),"prompt_ids_sha256":format!("{:x}",Sha256::digest(prompt.iter().flat_map(|t|t.to_le_bytes()).collect::<Vec<_>>())),"prompt_tokens":prompt.len(),"ar_ids":ar.ids,"ar_final_state":ar.states[&ar.ids.len()],"ar_full_logits_sha256":ar.logits_bits.iter().map(|(step,row)|json!({"consumed":step,"vocab":row.len(),"bytes":row.len()*4,"sha256":format!("{:x}",Sha256::digest(row.iter().flat_map(|v|v.to_le_bytes()).collect::<Vec<_>>()))})).collect::<Vec<_>>(),"ar_instrumented_wall_ms":ar.wall_ms,"target_transactions":target,"native":native,"prefix_restore":prefix}));
