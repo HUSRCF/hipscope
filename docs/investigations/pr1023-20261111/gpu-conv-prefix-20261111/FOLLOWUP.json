@@ -1,0 +1,148 @@
+{
+  "schema": "hipfire-pr1023-conv-prefix-gpu-followup-v1",
+  "status": "BOUNDED_GPU_REGRESSION_FIXED_NOT_MODEL_QUALIFICATION",
+  "generated_utc": "2026-11-11T15:51:39.071392+00:00",
+  "original_checkpoint_unchanged": {
+    "README-initial.md": {
+      "bytes": 3977,
+      "sha256": "416eea4c3dc889140600e2d5b322b4978b29445eb0b2002ef06a1bd16a703120"
+    },
+    "receipts.json": {
+      "bytes": 10538,
+      "sha256": "3dbe9c57c368c69bb73432828392c432715322e36af5e0daf8dd650bde6481f5"
+    },
+    "MANIFEST-initial.json": {
+      "bytes": 640,
+      "sha256": "1f6aa65cc46047ad3c93e15e6b81991c619e9527fadc2147ef1b20412d2696b6"
+    }
+  },
+  "production_fix_commit": "acd7f994983fb9f0b75c475822d59e6b43d9e883",
+  "production_fix_parent": "f2d25a0ba30a697d08ad196916fc8b902f2211a9",
+  "test": "state::tests::row_capture_64_prefix_abort_and_continuation_match_singletons",
+  "unfixed": {
+    "status": "DIAGNOSTIC_RAW_FAILURE_RETAINED",
+    "exit": 101,
+    "binary": {
+      "path": "/home/husrcf/Code/hipfireQC/tmpOutput/pr1022-pr1023-review-20261111/conv-prefix-test-only-overlay-01/cpu-build-01/hipfire-arch-qwen4-conv-test-unfixed",
+      "sha256": "043d6eb6a25072381ce6d1ea2937661db95b0005e2338c1108693bbd2dca7368"
+    },
+    "actual_gpu_marker": true,
+    "first_failure": "F32 base=0 keep=1; only gdn[L0].conv differs; recurrent/position/history/feedback equal",
+    "test_report": "0 passed; 1 failed; 0 ignored; 2393 filtered; 0.61s"
+  },
+  "fixed": {
+    "status": "DIAGNOSTIC_GPU_REGRESSION_PASS",
+    "exit": 0,
+    "binary": {
+      "path": "/home/husrcf/Code/hipfireQC/tmpOutput/pr1022-pr1023-review-20261111/conv-prefix-fix-candidate-overlay-01/cpu-build-01/hipfire-arch-qwen4-conv-test-fixed",
+      "sha256": "9f46e70912e9022b53abaac5eddd5679a58dc5751a339ad60e9fb406993075c6"
+    },
+    "actual_gpu_marker": true,
+    "test_report": "1 passed; 0 failed; 0 ignored; 2393 filtered; 4.81s"
+  },
+  "source_comparison": {
+    "temporary_test_sources_identical_after_removing_exact_seven_line_production_insertion": true,
+    "unfixed_prepared": {
+      "bytes": 341536,
+      "sha256": "c0bfbde079a27eb83465dcd770cb98ff97a4ad46aa68caac7cd3a0c58e98acde"
+    },
+    "fixed_prepared": {
+      "bytes": 341907,
+      "sha256": "8cb97c35b7e3bf280d2362af29ed8573fc766b6579975d02ad72ef636a51a8a1"
+    },
+    "original_test_replaced_manual_raw_history_copy_with_actual_scalar_convolution": true,
+    "seed": "nonzero BF16-exact F32 0.25",
+    "formats": [
+      "F32",
+      "Q8"
+    ],
+    "capture_rows": 64,
+    "bases": [
+      0,
+      64
+    ],
+    "keep_inclusive": [
+      0,
+      64
+    ],
+    "qualified_test_scope": "Existing single-layer 64-row capture prefix, abort and continuation fixture; test body and assertions retained."
+  },
+  "production_effect": {
+    "boundary": "After partial captured-row history copy, BF16 roundtrip every live GDN convolution history in place",
+    "ordinary_AR_unchanged": true,
+    "full_accept_unchanged": true,
+    "new_allocations": false,
+    "extra_launches": "one existing bf16_round_trip_f32 launch per GDN layer on partial repair; no performance qualification"
+  },
+  "permanent_test_difference": "The permanent test returns to standard try_gpu() skip behavior and emits an actual-GPU marker after init. The temporary proof binaries required GPU init. Permanent variant was not the binary run in these two attempts.",
+  "copied_artifacts": [
+    {
+      "source": "conv-regression-unfixed-01/RUN.json",
+      "copy": "gpu-conv-prefix-20261111/unfixed/RUN.json",
+      "bytes": 22000,
+      "sha256": "0ba1f3af1b951713128e0c3d9484db94b929d05ed15b6693e2e5b845927edf2e"
+    },
+    {
+      "source": "conv-regression-unfixed-01/test/RUN.json",
+      "copy": "gpu-conv-prefix-20261111/unfixed/test/RUN.json",
+      "bytes": 1790,
+      "sha256": "6d8cda1c925f974cc76e211934853de5bc4f837ed1fceb7fcede6303e4e5056f"
+    },
+    {
+      "source": "conv-regression-unfixed-01/test/stdout.log",
+      "copy": "gpu-conv-prefix-20261111/unfixed/test/stdout.log",
+      "bytes": 313,
+      "sha256": "c201460caf86e43ec69ef24abe993deb6b86fdb8b4b660564e81c619c416a49d"
+    },
+    {
+      "source": "conv-regression-unfixed-01/test/stderr.log",
+      "copy": "gpu-conv-prefix-20261111/unfixed/test/stderr.log",
+      "bytes": 1386,
+      "sha256": "539e1b72fbd4818b1f27e8aa72d981cd4285ee4bc24dbfa222af9b6fc4008c3c"
+    },
+    {
+      "source": "conv-prefix-test-only-overlay-01/BUILD.json",
+      "copy": "gpu-conv-prefix-20261111/unfixed/BUILD.json",
+      "bytes": 6511,
+      "sha256": "fc668f1f5b544618f3144a165fd77ff714436fd6a57c62b33951bc5ffc273b3f"
+    },
+    {
+      "source": "conv-regression-fixed-01/RUN.json",
+      "copy": "gpu-conv-prefix-20261111/fixed/RUN.json",
+      "bytes": 21651,
+      "sha256": "d1e5364bf0f739c0a1e6b3ff5ab9a7710a0dfdb0eca1b117de9956474e7110b6"
+    },
+    {
+      "source": "conv-regression-fixed-01/test/RUN.json",
+      "copy": "gpu-conv-prefix-20261111/fixed/test/RUN.json",
+      "bytes": 1635,
+      "sha256": "43d5be80c147513722e7273868bd76e4a876611df7259ebc86d3c162c65e19fc"
+    },
+    {
+      "source": "conv-regression-fixed-01/test/stdout.log",
+      "copy": "gpu-conv-prefix-20261111/fixed/test/stdout.log",
+      "bytes": 203,
+      "sha256": "38a56692247cb4eb3a4bb3f23832b2be105e8f8a622709ca5a7da491bac5f707"
+    },
+    {
+      "source": "conv-regression-fixed-01/test/stderr.log",
+      "copy": "gpu-conv-prefix-20261111/fixed/test/stderr.log",
+      "bytes": 298,
+      "sha256": "934c62f76fcde215524e307155ace423caa9f52acdd92adf48666b0ffa82cacc"
+    },
+    {
+      "source": "conv-prefix-fix-candidate-overlay-01/BUILD.json",
+      "copy": "gpu-conv-prefix-20261111/fixed/BUILD.json",
+      "bytes": 6556,
+      "sha256": "07af2903fb57dc91ec453bf7e317697c785c940d4c19d3a5e1a18d1e426d8709"
+    }
+  ],
+  "not_claimed": [
+    "No complete native model/cache-off case, cache-on turnover or off/on pair pass",
+    "No QSA selection resolution by this convolution fix",
+    "No final new-source CPU qualification",
+    "No performance or asynchronous overlap result",
+    "No inference from unit PASS to full-model correctness"
+  ],
+  "original_full_workspace_status": "FAIL_RETAINED; original two classified failures unchanged"
+}

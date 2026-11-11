@@ -1,17 +1,98 @@
 {
-  "schema": "hipfire-pr1023-diagnosis-files-v1",
+  "schema": "hipfire-pr1023-diagnosis-files-v2",
   "base_head": "f2d25a0ba30a697d08ad196916fc8b902f2211a9",
-  "kind": "documentation-and-unapplied-diagnostic-patch-only",
+  "kind": "documentation-unapplied-patches-and-bounded-gpu-proof-only",
+  "original_manifest_preserved": "MANIFEST-initial.json",
   "files": [
     {
-      "path": "README.md",
+      "path": "MANIFEST-initial.json",
+      "bytes": 640,
+      "sha256": "1f6aa65cc46047ad3c93e15e6b81991c619e9527fadc2147ef1b20412d2696b6"
+    },
+    {
+      "path": "README-initial.md",
       "bytes": 3977,
       "sha256": "416eea4c3dc889140600e2d5b322b4978b29445eb0b2002ef06a1bd16a703120"
+    },
+    {
+      "path": "README.md",
+      "bytes": 3481,
+      "sha256": "e4ab846704e07f8de57a4a0191ceae9178012626bcefeb1c00f13427d83acddd"
     },
     {
       "path": "diagnostic-only.patch",
       "bytes": 5135,
       "sha256": "7ac711a5a2c0e8cfc720b5e75c447037822833453235d1a22307480efd00cb19"
+    },
+    {
+      "path": "gpu-conv-prefix-20261111/FOLLOWUP.json",
+      "bytes": 6219,
+      "sha256": "de0b31dd6c04a738eb5981a01428f2bd967821db0d083020341428b5bf8e2e6e"
+    },
+    {
+      "path": "gpu-conv-prefix-20261111/corrected-test-only.patch",
+      "bytes": 4560,
+      "sha256": "dea668508ff8de66e6fa940c7c47a02abf3b9284cd2d8f3ac2e4c242b690c8c0"
+    },
+    {
+      "path": "gpu-conv-prefix-20261111/fixed/BUILD.json",
+      "bytes": 6556,
+      "sha256": "07af2903fb57dc91ec453bf7e317697c785c940d4c19d3a5e1a18d1e426d8709"
+    },
+    {
+      "path": "gpu-conv-prefix-20261111/fixed/RUN.json",
+      "bytes": 21651,
+      "sha256": "d1e5364bf0f739c0a1e6b3ff5ab9a7710a0dfdb0eca1b117de9956474e7110b6"
+    },
+    {
+      "path": "gpu-conv-prefix-20261111/fixed/test/RUN.json",
+      "bytes": 1635,
+      "sha256": "43d5be80c147513722e7273868bd76e4a876611df7259ebc86d3c162c65e19fc"
+    },
+    {
+      "path": "gpu-conv-prefix-20261111/fixed/test/stderr.log",
+      "bytes": 298,
+      "sha256": "934c62f76fcde215524e307155ace423caa9f52acdd92adf48666b0ffa82cacc"
+    },
+    {
+      "path": "gpu-conv-prefix-20261111/fixed/test/stdout.log",
+      "bytes": 203,
+      "sha256": "38a56692247cb4eb3a4bb3f23832b2be105e8f8a622709ca5a7da491bac5f707"
+    },
+    {
+      "path": "gpu-conv-prefix-20261111/permanent-test-only.patch",
+      "bytes": 4442,
+      "sha256": "363d40c05ee0d919f1ef0870da2af168d3e28ee3bb7a930eb419af9cdbefd145"
+    },
+    {
+      "path": "gpu-conv-prefix-20261111/production-acd7f994.patch",
+      "bytes": 888,
+      "sha256": "925d306eab69006a5257bbeba3f926d3d22fd1b2795cfaa4f96fde907c6a33db"
+    },
+    {
+      "path": "gpu-conv-prefix-20261111/unfixed/BUILD.json",
+      "bytes": 6511,
+      "sha256": "fc668f1f5b544618f3144a165fd77ff714436fd6a57c62b33951bc5ffc273b3f"
+    },
+    {
+      "path": "gpu-conv-prefix-20261111/unfixed/RUN.json",
+      "bytes": 22000,
+      "sha256": "0ba1f3af1b951713128e0c3d9484db94b929d05ed15b6693e2e5b845927edf2e"
+    },
+    {
+      "path": "gpu-conv-prefix-20261111/unfixed/test/RUN.json",
+      "bytes": 1790,
+      "sha256": "6d8cda1c925f974cc76e211934853de5bc4f837ed1fceb7fcede6303e4e5056f"
+    },
+    {
+      "path": "gpu-conv-prefix-20261111/unfixed/test/stderr.log",
+      "bytes": 1386,
+      "sha256": "539e1b72fbd4818b1f27e8aa72d981cd4285ee4bc24dbfa222af9b6fc4008c3c"
+    },
+    {
+      "path": "gpu-conv-prefix-20261111/unfixed/test/stdout.log",
+      "bytes": 313,
+      "sha256": "c201460caf86e43ec69ef24abe993deb6b86fdb8b4b660564e81c619c416a49d"
     },
     {
       "path": "receipts.json",

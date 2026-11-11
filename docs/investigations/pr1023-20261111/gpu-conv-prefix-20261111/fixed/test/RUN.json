@@ -1,0 +1,40 @@
+{
+  "command": [
+    "/home/husrcf/Code/hipfireQC/tmpOutput/pr1022-pr1023-review-20261111/conv-prefix-fix-candidate-overlay-01/cpu-build-01/hipfire-arch-qwen4-conv-test-fixed",
+    "state::tests::row_capture_64_prefix_abort_and_continuation_match_singletons",
+    "--exact",
+    "--nocapture",
+    "--test-threads=1"
+  ],
+  "attempt": 1,
+  "status": "PASS",
+  "started_unix": 1794411405.9674008,
+  "live_executable": {
+    "path": "/home/husrcf/Code/hipfireQC/tmpOutput/pr1022-pr1023-review-20261111/conv-prefix-fix-candidate-overlay-01/cpu-build-01/hipfire-arch-qwen4-conv-test-fixed",
+    "requested_path": "/home/husrcf/Code/hipfireQC/tmpOutput/pr1022-pr1023-review-20261111/conv-prefix-fix-candidate-overlay-01/cpu-build-01/hipfire-arch-qwen4-conv-test-fixed",
+    "observed": true
+  },
+  "process": {
+    "pid": 1730288,
+    "state": "R",
+    "pgid": 1730288,
+    "sid": 1730288,
+    "start_ticks": 138038714,
+    "hipfire_home": "/home/husrcf/Code/hipfireQC/tmpOutput/pr1022-pr1023-review-20261111/conv-regression-fixed-01/test/home",
+    "owner_driver_pid": 1730197
+  },
+  "exit_code": 0,
+  "cleanup": {
+    "status": "ALREADY_EXITED",
+    "pid": 1730288,
+    "pgid": 1730288
+  },
+  "stop_request": null,
+  "completed_unix": 1794411410.987198,
+  "artifacts": {
+    "PROCESS.json": "d152641000d5db5f0ddb1127fe4a849ed15c553ff09e56f555251e437700669e",
+    "stderr.log": "934c62f76fcde215524e307155ace423caa9f52acdd92adf48666b0ffa82cacc",
+    "effective-environment.json": "fa896d1fba5fc48db2315b5b67e2f2c9604370436304a1cd6419e63eb58e4ea4",
+    "stdout.log": "38a56692247cb4eb3a4bb3f23832b2be105e8f8a622709ca5a7da491bac5f707"
+  }
+}

@@ -1,0 +1,444 @@
+{
+  "schema": "hipfire-conv-rollback-gpu-diagnostic-v1",
+  "status": "DIAGNOSTIC_GPU_REGRESSION_PASS",
+  "diagnostic_not_PR_qualification": true,
+  "production_fixed": true,
+  "build": {
+    "path": "/home/husrcf/Code/hipfireQC/tmpOutput/pr1022-pr1023-review-20261111/conv-prefix-fix-candidate-overlay-01/BUILD.json",
+    "sha256": "07af2903fb57dc91ec453bf7e317697c785c940d4c19d3a5e1a18d1e426d8709"
+  },
+  "binary": {
+    "path": "/home/husrcf/Code/hipfireQC/tmpOutput/pr1022-pr1023-review-20261111/conv-prefix-fix-candidate-overlay-01/cpu-build-01/hipfire-arch-qwen4-conv-test-fixed",
+    "sha256": "9f46e70912e9022b53abaac5eddd5679a58dc5751a339ad60e9fb406993075c6"
+  },
+  "started_unix": 1794411403.735556,
+  "identity": {
+    "source": {
+      "head": "f2d25a0ba30a697d08ad196916fc8b902f2211a9",
+      "tree": "2a161933d3af2969b12542c9f6be21d05909a521",
+      "status": ""
+    },
+    "cpu": {
+      "path": "/home/husrcf/Code/hipfireQC/tmpOutput/pr1022-pr1023-review-20261111/P5-ORACLE-FOLLOWUP-QUALIFICATION.json",
+      "sha256": "4154132f75be90710d07f3770f5ad69ac7d97a0b3b3e6d7a3a77f0da1b035d9c",
+      "status": "SCOPED_GATES_PASS_WITH_PROVEN_BASE_FAILURES",
+      "classification": "SCOPED_GATES_PASS_WITH_PROVEN_BASE_FAILURES",
+      "admission_scope": "EXACT_FROZEN_P5_HARDWARE_GATES_ONLY",
+      "source_head": "f2d25a0ba30a697d08ad196916fc8b902f2211a9",
+      "source_tree": "2a161933d3af2969b12542c9f6be21d05909a521",
+      "strict_all_workspace_pass": false,
+      "original_full_attempt": {
+        "path": "/home/husrcf/Code/hipfireQC/tmpOutput/pr1022-pr1023-review-20261111/cpu-pr1023-final-01/RUN.json",
+        "sha256": "50f9477dfb052b6d9e01e98d85f10aeb252982df05f0aafdb688122c51320b1c",
+        "source_head": "818ea1104620fecc5f8c452b1ff48ce6dae8c5ee",
+        "source_tree": "9d5c3ffe352eb42397497a07bc82e9017d6f08b8",
+        "status": "FAIL_RETAINED",
+        "workspace_exit_code": 101
+      },
+      "classified_failures": {
+        "kt48": {
+          "comparison": {
+            "path": "/home/husrcf/Code/hipfireQC/tmpOutput/pr1022-pr1023-review-20261111/P5-CPU-lift-comparison.json",
+            "sha256": "979c7ad2e6f7738cb7ea44ebd1221c488188239cc24f0cb5c36d787eed691e83"
+          }
+        },
+        "hfq": {
+          "proof_manifest": {
+            "path": "/home/husrcf/Code/hipfireQC/tmpOutput/pr1022-pr1023-review-20261111/P5-hfq-diagnosis/PROOF-MANIFEST.json",
+            "sha256": "8c6195f4d38baa0be907e4569398ac56c361b72f518be9af3d5eedaa3eb49d1e"
+          }
+        }
+      },
+      "parent_qualification": {
+        "capsule": {
+          "path": "/home/husrcf/Code/hipfireQC/tmpOutput/pr1022-pr1023-review-20261111/P5-CPU-SCOPED-QUALIFICATION-v2.json",
+          "sha256": "6492f12133fac0fe5825d781602a331359f8c33437cb237e4bd6a48af049551a"
+        },
+        "issuance": {
+          "path": "/home/husrcf/Code/hipfireQC/tmpOutput/pr1022-pr1023-review-20261111/P5-CAPSULE-ISSUANCE-02.json",
+          "sha256": "1bd692465c1652b58e790404e540a107c25f32f18205b3a8cd149822e76fd2e5"
+        },
+        "original_full_attempt": {
+          "path": "/home/husrcf/Code/hipfireQC/tmpOutput/pr1022-pr1023-review-20261111/cpu-pr1023-final-01/RUN.json",
+          "sha256": "50f9477dfb052b6d9e01e98d85f10aeb252982df05f0aafdb688122c51320b1c",
+          "source_head": "818ea1104620fecc5f8c452b1ff48ce6dae8c5ee",
+          "source_tree": "9d5c3ffe352eb42397497a07bc82e9017d6f08b8",
+          "status": "FAIL_RETAINED",
+          "workspace_exit_code": 101
+        },
+        "classified_failures": {
+          "kt48": {
+            "comparison": {
+              "path": "/home/husrcf/Code/hipfireQC/tmpOutput/pr1022-pr1023-review-20261111/P5-CPU-lift-comparison.json",
+              "sha256": "979c7ad2e6f7738cb7ea44ebd1221c488188239cc24f0cb5c36d787eed691e83"
+            }
+          },
+          "hfq": {
+            "proof_manifest": {
+              "path": "/home/husrcf/Code/hipfireQC/tmpOutput/pr1022-pr1023-review-20261111/P5-hfq-diagnosis/PROOF-MANIFEST.json",
+              "sha256": "8c6195f4d38baa0be907e4569398ac56c361b72f518be9af3d5eedaa3eb49d1e"
+            }
+          }
+        },
+        "limitations": [
+          "Original full workspace command remains FAILED/exit101; the original full RUN remains FAIL_RETAINED.",
+          "Only the two exact retained failures are classified for the exact frozen P5 hardware gates; strict_all_workspace_pass is false.",
+          "KT48 base reproduction is historical. HFQ proof uses an unchanged-source original candidate binary focused trace; no base HFQ binary was executed.",
+          "Original whole-workspace HFQ log has no per-tuning counters; the focused trace is a distinct observation.",
+          "CPU admission only; no model/GPU correctness, service quality, async-overlap or performance claim."
+        ],
+        "full_workspace_and_no_gpu_suite_source_head": "818ea1104620fecc5f8c452b1ff48ce6dae8c5ee",
+        "historical_qualification_not_reissued_for_child": true
+      },
+      "source_delta": {
+        "parent_head": "818ea1104620fecc5f8c452b1ff48ce6dae8c5ee",
+        "parent_tree": "9d5c3ffe352eb42397497a07bc82e9017d6f08b8",
+        "changed_path": "crates/hipfire-arch-qwen4/examples/fn_mtp_lru/model.rs",
+        "parent_blob": "c288beffa0e4c2534d86040ad60532f3b5559889",
+        "child_blob": "8cb3ae5fda70a3e9cd3bbd62711253a181fba2bb",
+        "all_other_Git_files_byte_identical": true
+      },
+      "followup_commands": [
+        {
+          "id": "01-precommit",
+          "command": [
+            "bash",
+            "scripts/pre-commit-ci.sh",
+            "818ea1104620fecc5f8c452b1ff48ce6dae8c5ee"
+          ],
+          "log": {
+            "path": "/home/husrcf/Code/hipfireQC/tmpOutput/pr1022-pr1023-review-20261111/cpu-pr1023-oracle-followup-01/01-precommit/raw.log",
+            "sha256": "7ab4bf8b07d5505225d59d98906319c21b75e0518cdd374efd2a870dcdab75bc"
+          },
+          "exit_code": 0
+        },
+        {
+          "id": "02-native-oracle-unit",
+          "command": [
+            "/home/husrcf/.cargo/bin/cargo",
+            "test",
+            "-p",
+            "hipfire-arch-qwen4",
+            "--release",
+            "--locked",
+            "--features",
+            "lab,reference-parity",
+            "--example",
+            "fn_mtp_lru_oracle",
+            "--message-format=json-render-diagnostics",
+            "--",
+            "--test-threads=1"
+          ],
+          "log": {
+            "path": "/home/husrcf/Code/hipfireQC/tmpOutput/pr1022-pr1023-review-20261111/cpu-pr1023-oracle-followup-01/02-native-oracle-unit/raw.log",
+            "sha256": "12d0820f53e5f3bcfe8fb1e79c19e07972f913deae6e3c39b83a950c05928eff"
+          },
+          "exit_code": 0
+        },
+        {
+          "id": "03-four-labs-build",
+          "command": [
+            "/home/husrcf/.cargo/bin/cargo",
+            "build",
+            "--release",
+            "--locked",
+            "-p",
+            "hipfire-arch-qwen4",
+            "-p",
+            "rdna-compute",
+            "--features",
+            "hipfire-arch-qwen4/lab,hipfire-arch-qwen4/reference-parity,rdna-compute/lab",
+            "--example",
+            "fn_expert_cache_ar_numerical",
+            "--example",
+            "fn_expert_cache_publication",
+            "--example",
+            "fn_expert_table_indirection",
+            "--example",
+            "fn_mtp_lru_oracle",
+            "--message-format=json-render-diagnostics"
+          ],
+          "log": {
+            "path": "/home/husrcf/Code/hipfireQC/tmpOutput/pr1022-pr1023-review-20261111/cpu-pr1023-oracle-followup-01/03-four-labs-build/raw.log",
+            "sha256": "21591aba4c62f465393507f436f4edee78e61b6c62ddad7ae0916b7651b3aa2e"
+          },
+          "exit_code": 0
+        },
+        {
+          "id": "04-oracle-cpu-controls",
+          "command": [
+            "/home/husrcf/Code/hipfireQC/tmpOutput/pr1022-pr1023-review-20261111/cpu-pr1023-oracle-followup-01/03-four-labs-build/fn_mtp_lru_oracle",
+            "--cpu-controls",
+            "--out",
+            "/home/husrcf/Code/hipfireQC/tmpOutput/pr1022-pr1023-review-20261111/cpu-pr1023-oracle-followup-01/04-oracle-cpu-controls/oracle.json"
+          ],
+          "log": {
+            "path": "/home/husrcf/Code/hipfireQC/tmpOutput/pr1022-pr1023-review-20261111/cpu-pr1023-oracle-followup-01/04-oracle-cpu-controls/raw.log",
+            "sha256": "c068199b79fa06acfcab743761aa762513e6eccc2c9f4dc13713681783db3260"
+          },
+          "exit_code": 0
+        },
+        {
+          "id": "05-posthoc-controls",
+          "command": [
+            "/usr/bin/python3",
+            "/home/husrcf/Code/hipfireQC/tmpOutput/pr1022-pr1023-review-20261111/oracle1033staging/test-verify-native-pair.py"
+          ],
+          "log": {
+            "path": "/home/husrcf/Code/hipfireQC/tmpOutput/pr1022-pr1023-review-20261111/cpu-pr1023-oracle-followup-01/05-posthoc-controls/raw.log",
+            "sha256": "cc404c300ec32daf35670ff33a176cc506a3572a9288679fa318934bdc9db50d"
+          },
+          "exit_code": 0
+        },
+        {
+          "id": "06-plain-default-product",
+          "command": [
+            "/home/husrcf/.cargo/bin/cargo",
+            "build",
+            "--release",
+            "--locked",
+            "-p",
+            "hipfire-cli",
+            "-p",
+            "hipfire-daemon",
+            "--message-format=json-render-diagnostics"
+          ],
+          "log": {
+            "path": "/home/husrcf/Code/hipfireQC/tmpOutput/pr1022-pr1023-review-20261111/cpu-pr1023-oracle-followup-01/06-plain-default-product/raw.log",
+            "sha256": "fa279b837aea91b79c388d8ca951e3959b80d9a6d73911696dc643eae0124cb9"
+          },
+          "exit_code": 0
+        }
+      ],
+      "lab_manifest": {
+        "path": "/home/husrcf/Code/hipfireQC/tmpOutput/pr1022-pr1023-review-20261111/cpu-pr1023-oracle-followup-01/03-four-labs-build/MANIFEST.json",
+        "sha256": "b72a8eaa3a1c364363a7a1bb3d86d9b5e64fbe39c782eb244efa725a02d72438"
+      },
+      "runtime_manifest": {
+        "path": "/home/husrcf/Code/hipfireQC/tmpOutput/pr1022-pr1023-review-20261111/cpu-pr1023-oracle-followup-01/06-plain-default-product/MANIFEST.json",
+        "sha256": "b52197fd2867161583e9f379400d8af39119b9b516be077c8c1b8019864848b5"
+      },
+      "default_features_observed": true,
+      "default_feature_vectors": {
+        "hipfire-arch-qwen4": [],
+        "rdna-compute": [
+          "deltanet"
+        ],
+        "hipfire-dispatch": [
+          "default",
+          "deltanet",
+          "from-hip-error"
+        ],
+        "hipfire-cli": [],
+        "hipfire-daemon": [
+          "default",
+          "deltanet",
+          "vcn-jpeg"
+        ]
+      },
+      "limitations": [
+        "Original full workspace command remains FAILED/exit101; the original full RUN remains FAIL_RETAINED.",
+        "Only the two exact retained failures are classified for the exact frozen P5 hardware gates; strict_all_workspace_pass is false.",
+        "KT48 base reproduction is historical. HFQ proof uses an unchanged-source original candidate binary focused trace; no base HFQ binary was executed.",
+        "Original whole-workspace HFQ log has no per-tuning counters; the focused trace is a distinct observation.",
+        "CPU admission only; no model/GPU correctness, service quality, async-overlap or performance claim.",
+        "Full workspace61 and canonical no-GPU CI were executed only at parent818, not repeated/re-labelled at childf2d25.",
+        "Child scope is exactly the two-line oracle fixture correction, precommit, native12+rebuilt executable CPU controls+posthoc12, current four lab and plain default product builds.",
+        "All non-fixture Git files including production/Cargo/workflows are byte-identical to parent; no native model/GPU result is inferred from CPU follow-up."
+      ],
+      "followup_run": {
+        "path": "/home/husrcf/Code/hipfireQC/tmpOutput/pr1022-pr1023-review-20261111/cpu-pr1023-oracle-followup-01/RUN.json",
+        "sha256": "4902dfa666fe0af5c829625a7d0b6d3088176e364f32d67bf2d9cd7326f7d824"
+      }
+    },
+    "lab": {
+      "path": "/home/husrcf/Code/hipfireQC/tmpOutput/pr1022-pr1023-review-20261111/cpu-pr1023-oracle-followup-01/03-four-labs-build/MANIFEST.json",
+      "sha256": "b72a8eaa3a1c364363a7a1bb3d86d9b5e64fbe39c782eb244efa725a02d72438",
+      "binaries": {
+        "fn_expert_cache_ar_numerical": {
+          "path": "/home/husrcf/Code/hipfireQC/tmpOutput/pr1022-pr1023-review-20261111/cpu-pr1023-oracle-followup-01/03-four-labs-build/fn_expert_cache_ar_numerical",
+          "bytes": 65308776,
+          "sha256": "d4eff602f657bc244479867c4254f8b69c61d54563abc9875c824c7b8e4f88f8",
+          "md5": "ad0de26b56d39698d137b1a6bae63094",
+          "cargo_executable": "/home/husrcf/wk/hipfire-psr/target/release/examples/fn_expert_cache_ar_numerical",
+          "cargo_identity": {
+            "path": "/home/husrcf/wk/hipfire-psr/target/release/examples/fn_expert_cache_ar_numerical",
+            "bytes": 65308776,
+            "sha256": "d4eff602f657bc244479867c4254f8b69c61d54563abc9875c824c7b8e4f88f8",
+            "md5": "ad0de26b56d39698d137b1a6bae63094"
+          },
+          "features": [
+            "lab",
+            "reference-parity"
+          ],
+          "package_id": "path+file:///home/husrcf/Code/hipfire-pr1023-20261111/crates/hipfire-arch-qwen4#0.4.5"
+        },
+        "fn_expert_cache_publication": {
+          "path": "/home/husrcf/Code/hipfireQC/tmpOutput/pr1022-pr1023-review-20261111/cpu-pr1023-oracle-followup-01/03-four-labs-build/fn_expert_cache_publication",
+          "bytes": 6761216,
+          "sha256": "89e90b933b46cd68dbab015c68b124cf89ddc34072344e0c228144596b3471ed",
+          "md5": "36929240ff7b9c076a37de73d9dd2ff4",
+          "cargo_executable": "/home/husrcf/wk/hipfire-psr/target/release/examples/fn_expert_cache_publication",
+          "cargo_identity": {
+            "path": "/home/husrcf/wk/hipfire-psr/target/release/examples/fn_expert_cache_publication",
+            "bytes": 6761216,
+            "sha256": "89e90b933b46cd68dbab015c68b124cf89ddc34072344e0c228144596b3471ed",
+            "md5": "36929240ff7b9c076a37de73d9dd2ff4"
+          },
+          "features": [
+            "lab",
+            "reference-parity"
+          ],
+          "package_id": "path+file:///home/husrcf/Code/hipfire-pr1023-20261111/crates/hipfire-arch-qwen4#0.4.5"
+        },
+        "fn_expert_table_indirection": {
+          "path": "/home/husrcf/Code/hipfireQC/tmpOutput/pr1022-pr1023-review-20261111/cpu-pr1023-oracle-followup-01/03-four-labs-build/fn_expert_table_indirection",
+          "bytes": 6547624,
+          "sha256": "92785aa48b80d9e9d176273f0c1bb084a0d4d42c05fd0cdcdeea05c342a7874c",
+          "md5": "51c519405421012017ed1e1c2017b5ac",
+          "cargo_executable": "/home/husrcf/wk/hipfire-psr/target/release/examples/fn_expert_table_indirection",
+          "cargo_identity": {
+            "path": "/home/husrcf/wk/hipfire-psr/target/release/examples/fn_expert_table_indirection",
+            "bytes": 6547624,
+            "sha256": "92785aa48b80d9e9d176273f0c1bb084a0d4d42c05fd0cdcdeea05c342a7874c",
+            "md5": "51c519405421012017ed1e1c2017b5ac"
+          },
+          "features": [
+            "deltanet",
+            "lab"
+          ],
+          "package_id": "path+file:///home/husrcf/Code/hipfire-pr1023-20261111/crates/rdna-compute#0.4.5"
+        },
+        "fn_mtp_lru_oracle": {
+          "path": "/home/husrcf/Code/hipfireQC/tmpOutput/pr1022-pr1023-review-20261111/cpu-pr1023-oracle-followup-01/03-four-labs-build/fn_mtp_lru_oracle",
+          "bytes": 67966272,
+          "sha256": "f0abc8e19157ba33ea3b3f90fefd8ac431ff095520735e7e63ec2e40bcf1b150",
+          "md5": "cedd16e04302a1742a6cd20d7b7f43e0",
+          "cargo_executable": "/home/husrcf/wk/hipfire-psr/target/release/examples/fn_mtp_lru_oracle",
+          "cargo_identity": {
+            "path": "/home/husrcf/wk/hipfire-psr/target/release/examples/fn_mtp_lru_oracle",
+            "bytes": 67966272,
+            "sha256": "f0abc8e19157ba33ea3b3f90fefd8ac431ff095520735e7e63ec2e40bcf1b150",
+            "md5": "cedd16e04302a1742a6cd20d7b7f43e0"
+          },
+          "features": [
+            "lab",
+            "reference-parity"
+          ],
+          "package_id": "path+file:///home/husrcf/Code/hipfire-pr1023-20261111/crates/hipfire-arch-qwen4#0.4.5"
+        }
+      },
+      "source_head": "f2d25a0ba30a697d08ad196916fc8b902f2211a9",
+      "source_tree": "2a161933d3af2969b12542c9f6be21d05909a521"
+    },
+    "runtime": {
+      "path": "/home/husrcf/Code/hipfireQC/tmpOutput/pr1022-pr1023-review-20261111/cpu-pr1023-oracle-followup-01/06-plain-default-product/MANIFEST.json",
+      "sha256": "b52197fd2867161583e9f379400d8af39119b9b516be077c8c1b8019864848b5",
+      "binaries": {
+        "hipfire": {
+          "path": "/home/husrcf/Code/hipfireQC/tmpOutput/pr1022-pr1023-review-20261111/cpu-pr1023-oracle-followup-01/06-plain-default-product/hipfire",
+          "bytes": 119034832,
+          "sha256": "1d3afd076e3d687ee863171147a8372a2194bf1e8b74df174edb60beedf47e47",
+          "md5": "d2f2ea3c0035ff3ed68d404ca694c5cd",
+          "cargo_executable": "/home/husrcf/wk/hipfire-psr/target/release/hipfire",
+          "cargo_identity": {
+            "path": "/home/husrcf/wk/hipfire-psr/target/release/hipfire",
+            "bytes": 119034832,
+            "sha256": "1d3afd076e3d687ee863171147a8372a2194bf1e8b74df174edb60beedf47e47",
+            "md5": "d2f2ea3c0035ff3ed68d404ca694c5cd"
+          }
+        },
+        "daemon": {
+          "path": "/home/husrcf/Code/hipfireQC/tmpOutput/pr1022-pr1023-review-20261111/cpu-pr1023-oracle-followup-01/06-plain-default-product/daemon",
+          "bytes": 130552136,
+          "sha256": "ba60c9b767be02f64b4a8e2e175d6137814f6e70c08083ad05ae50ed7710fd59",
+          "md5": "91ca4265959364426ec2927bdf816576",
+          "cargo_executable": "/home/husrcf/wk/hipfire-psr/target/release/daemon",
+          "cargo_identity": {
+            "path": "/home/husrcf/wk/hipfire-psr/target/release/daemon",
+            "bytes": 130552136,
+            "sha256": "ba60c9b767be02f64b4a8e2e175d6137814f6e70c08083ad05ae50ed7710fd59",
+            "md5": "91ca4265959364426ec2927bdf816576"
+          }
+        }
+      },
+      "source_head": "f2d25a0ba30a697d08ad196916fc8b902f2211a9",
+      "source_tree": "2a161933d3af2969b12542c9f6be21d05909a521"
+    },
+    "prompts": [
+      {
+        "case": "code",
+        "path": "/home/husrcf/Code/hipfireQC/tmpOutput/pr1022-pr1023-review-20261111/baseline-tools/code_parser_rust.txt",
+        "bytes": 415,
+        "sha256": "edef11656459b65564d55ebb35db0ed78b9b0dd62199d1bcbbfc2e7e7b48781a"
+      },
+      {
+        "case": "fiction",
+        "path": "/home/husrcf/Code/hipfireQC/tmpOutput/pr1022-pr1023-review-20261111/baseline-tools/fiction_lighthouse.txt",
+        "bytes": 134,
+        "sha256": "056c3f234b88b56ba1ad830d97718c2627cdb8df9a3729533f6ca79acd1f4413"
+      }
+    ],
+    "model": {
+      "path": "/home/husrcf/.hipfire/models/qwen3.8-flash-next.mq4-xts",
+      "bytes": 125288544792,
+      "mtime_ns": 1792424439201838153,
+      "payload_sha256": "NOT_REHASHED; supervisor frozen artifact seal remains required"
+    }
+  },
+  "initial_idle": {
+    "kfd_pids": [],
+    "fuser_stderr": "",
+    "vram_used_bytes": 59912192,
+    "checked_unix": 1794411405.9663048
+  },
+  "job": {
+    "command": [
+      "/home/husrcf/Code/hipfireQC/tmpOutput/pr1022-pr1023-review-20261111/conv-prefix-fix-candidate-overlay-01/cpu-build-01/hipfire-arch-qwen4-conv-test-fixed",
+      "state::tests::row_capture_64_prefix_abort_and_continuation_match_singletons",
+      "--exact",
+      "--nocapture",
+      "--test-threads=1"
+    ],
+    "attempt": 1,
+    "status": "PASS",
+    "started_unix": 1794411405.9674008,
+    "live_executable": {
+      "path": "/home/husrcf/Code/hipfireQC/tmpOutput/pr1022-pr1023-review-20261111/conv-prefix-fix-candidate-overlay-01/cpu-build-01/hipfire-arch-qwen4-conv-test-fixed",
+      "requested_path": "/home/husrcf/Code/hipfireQC/tmpOutput/pr1022-pr1023-review-20261111/conv-prefix-fix-candidate-overlay-01/cpu-build-01/hipfire-arch-qwen4-conv-test-fixed",
+      "observed": true
+    },
+    "process": {
+      "pid": 1730288,
+      "state": "R",
+      "pgid": 1730288,
+      "sid": 1730288,
+      "start_ticks": 138038714,
+      "hipfire_home": "/home/husrcf/Code/hipfireQC/tmpOutput/pr1022-pr1023-review-20261111/conv-regression-fixed-01/test/home",
+      "owner_driver_pid": 1730197
+    },
+    "exit_code": 0,
+    "cleanup": {
+      "status": "ALREADY_EXITED",
+      "pid": 1730288,
+      "pgid": 1730288
+    },
+    "stop_request": null,
+    "completed_unix": 1794411410.987198,
+    "artifacts": {
+      "PROCESS.json": "d152641000d5db5f0ddb1127fe4a849ed15c553ff09e56f555251e437700669e",
+      "stderr.log": "934c62f76fcde215524e307155ace423caa9f52acdd92adf48666b0ffa82cacc",
+      "effective-environment.json": "fa896d1fba5fc48db2315b5b67e2f2c9604370436304a1cd6419e63eb58e4ea4",
+      "stdout.log": "38a56692247cb4eb3a4bb3f23832b2be105e8f8a622709ca5a7da491bac5f707"
+    }
+  },
+  "completed_unix": 1794411410.987618,
+  "stop_request": null,
+  "artifacts": {
+    "test/PROCESS.json": "d152641000d5db5f0ddb1127fe4a849ed15c553ff09e56f555251e437700669e",
+    "test/stderr.log": "934c62f76fcde215524e307155ace423caa9f52acdd92adf48666b0ffa82cacc",
+    "test/effective-environment.json": "fa896d1fba5fc48db2315b5b67e2f2c9604370436304a1cd6419e63eb58e4ea4",
+    "test/stdout.log": "38a56692247cb4eb3a4bb3f23832b2be105e8f8a622709ca5a7da491bac5f707",
+    "test/home/config.toml": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  }
+}

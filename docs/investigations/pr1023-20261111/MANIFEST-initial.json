@@ -1,0 +1,22 @@
+{
+  "schema": "hipfire-pr1023-diagnosis-files-v1",
+  "base_head": "f2d25a0ba30a697d08ad196916fc8b902f2211a9",
+  "kind": "documentation-and-unapplied-diagnostic-patch-only",
+  "files": [
+    {
+      "path": "README.md",
+      "bytes": 3977,
+      "sha256": "416eea4c3dc889140600e2d5b322b4978b29445eb0b2002ef06a1bd16a703120"
+    },
+    {
+      "path": "diagnostic-only.patch",
+      "bytes": 5135,
+      "sha256": "7ac711a5a2c0e8cfc720b5e75c447037822833453235d1a22307480efd00cb19"
+    },
+    {
+      "path": "receipts.json",
+      "bytes": 10538,
+      "sha256": "3dbe9c57c368c69bb73432828392c432715322e36af5e0daf8dd650bde6481f5"
+    }
+  ]
+}

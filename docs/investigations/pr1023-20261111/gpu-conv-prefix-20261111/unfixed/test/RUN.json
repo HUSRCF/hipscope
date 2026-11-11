@@ -1,0 +1,42 @@
+{
+  "command": [
+    "/home/husrcf/Code/hipfireQC/tmpOutput/pr1022-pr1023-review-20261111/conv-prefix-test-only-overlay-01/cpu-build-01/hipfire-arch-qwen4-conv-test-unfixed",
+    "state::tests::row_capture_64_prefix_abort_and_continuation_match_singletons",
+    "--exact",
+    "--nocapture",
+    "--test-threads=1"
+  ],
+  "attempt": 1,
+  "status": "FAIL",
+  "started_unix": 1794411046.759731,
+  "live_executable": {
+    "path": "/home/husrcf/Code/hipfireQC/tmpOutput/pr1022-pr1023-review-20261111/conv-prefix-test-only-overlay-01/cpu-build-01/hipfire-arch-qwen4-conv-test-unfixed",
+    "requested_path": "/home/husrcf/Code/hipfireQC/tmpOutput/pr1022-pr1023-review-20261111/conv-prefix-test-only-overlay-01/cpu-build-01/hipfire-arch-qwen4-conv-test-unfixed",
+    "observed": true
+  },
+  "process": {
+    "pid": 1727811,
+    "state": "R",
+    "pgid": 1727811,
+    "sid": 1727811,
+    "start_ticks": 138002793,
+    "hipfire_home": "/home/husrcf/Code/hipfireQC/tmpOutput/pr1022-pr1023-review-20261111/conv-regression-unfixed-01/test/home",
+    "owner_driver_pid": 1727721
+  },
+  "exit_code": 101,
+  "primary_error": "RuntimeError('single attempt exited 101')",
+  "cleanup": {
+    "status": "ALREADY_EXITED",
+    "pid": 1727811,
+    "pgid": 1727811
+  },
+  "stop_request": null,
+  "completed_unix": 1794411047.5265312,
+  "artifacts": {
+    "PROCESS.json": "019df50bf77287ed6460d45d1f06fd358aa9c99a9d45344bef73ee5b38c670bd",
+    "primary-error.log": "5d432e89878cb40d9871127216ceec0d271372e5d65433445e4cdf91fc97136e",
+    "stderr.log": "539e1b72fbd4818b1f27e8aa72d981cd4285ee4bc24dbfa222af9b6fc4008c3c",
+    "effective-environment.json": "07563d635841147dfc97e325a1d6fa1511c149ebc05e11a0baea74d633d1d27f",
+    "stdout.log": "c201460caf86e43ec69ef24abe993deb6b86fdb8b4b660564e81c619c416a49d"
+  }
+}

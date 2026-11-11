@@ -1,23 +1,59 @@
 # PR #1023 native MTP diagnosis checkpoint — 2026-11-11
 
-This is an investigation checkpoint based on `f2d25a0ba30a697d08ad196916fc8b902f2211a9`, not a product fix or a qualification result. The diagnostic model oracle stopped in its **cache-off** arm. No cache-on model arm or off/on comparison passed. All original raw logs, state receipts and binaries remain in the external QC artifact root labelled `pr1022-pr1023-review-20261111`; [receipts.json](receipts.json) uses paths relative to that root and records their SHA-256 identities.
+This checkpoint retains the original failed model attempts and adds a narrowly
+scoped GPU regression diagnosis. It is **not a final model, cache-off/on pair,
+service or performance qualification**. The [initial checkpoint](README-initial.md)
+and its [original receipts](receipts.json) remain byte-for-byte available; their
+unresolved-hypothesis language describes that earlier evidence boundary.
 
-## Approaches and observed results
+## What the added GPU evidence establishes
 
-1. **Initial oracle fixture failed at hidden-capture capacity.** At parent `818ea1104620fecc5f8c452b1ff48ce6dae8c5ee`, the oracle allocated and freed an R8 scratch before native prefill. The retained hidden capture was too small for native prefill's 4096-row request. Commit `f2d25a0` deletes only those two early sizing calls; the R8 admission assertion remains. Six scoped CPU steps passed, and the next model attempt got beyond this error. Production source was unchanged by this fixture correction.
-2. **The next cache-off model attempt failed the accepted-prefix target-state check.** The original failure and cleanup receipts remain recorded. This failure predates any cache-on comparison; it cannot be attributed to LRU from these runs.
-3. **A diagnostic-only overlay retained the assertions and printed the first mismatch.** The attached [diagnostic-only.patch](diagnostic-only.patch) adds milestone logging and mismatch serialization only. Its independently sealed executable was used with the same off-arm profile: hot budget 18000 MiB, max sequence 16384, native K3 with head reserve K7. The temporary overlay was restored to clean f2 after its CPU build.
+The corrected existing test obtains convolution history from the actual scalar
+convolution producer rather than manually copying raw F32 captures. Its initial
+history is nonzero BF16-exact 0.25; the test retains its prefix, abort and
+continuation assertions. The two temporary test sources are identical except for
+the seven-line production fix.
 
-The first mismatch is **R2, accept=0, keep=1**, through `generic_commit_prefix`, after an 84-token prompt. Both expected and actual positions are 85; block IDs are `[248068, 271]`. Of 220 compared semantic state rows, 48 differ: **36 GDN convolution histories and 12 QSA selected-index tensors**. No convolution or QSA field was removed from the check.
+On actual gfx1201, the unfixed binary failed at **F32, base=0, keep=1**: only the
+convolution digest differed, while recurrence, position, token history and
+feedback matched. Exit 101 and the complete small stderr/stdout are retained.
+With the production fix, the same existing single-layer test passed for its F32
+and plain-Q8 matrix: 64 capture rows, bases 0 and 64, keep 0 through 64, with abort
+and continuation checks. The observed test report is one test passed, not a
+full-model result. Both attempts report an actual GPU initialization and an owned
+child exit; neither was replaced by a retry.
 
-Before that failure, the first code fixture's internal native stage generated 512 tokens through 135 actual native windows. It observed zero, interior and full acceptance and completed its internal terminal-repair check. R1/R2 full-verify logits and semantic target-state checks also completed before the failing partial-prefix operation. These are completed internal stages of a failed diagnostic run, not a complete model case or paired native/LRU qualification.
+[The follow-up receipt](gpu-conv-prefix-20261111/FOLLOWUP.json) binds the raw
+attempt/build records and externally retained executable hashes. The small raw
+records and logs are copied here; large native binaries stay in the original
+external QC root.
 
-## Current hypothesis and its limits
+## Production correction and remaining scope
 
-The CPU source-contract reproduction gives finite-value counterexamples to restoring convolution history by copying raw F32 projection captures: the kernel's convolution history uses a BF16 round trip, while the restored capture can retain unrounded F32 bits. Its four small cases cover start positions 84/85/86 and an R8/keep7 ring; the modeled BF16 round trip matches the modeled kernel-prefix history. Exact production source identities and the complete CPU receipt are sealed in `receipts.json`.
+[Commit acd7f994](gpu-conv-prefix-20261111/production-acd7f994.patch) adds the
+existing in-place BF16 round trip after partial captured-row history repair.
+Raw F32 capture bytes now obey the convolution producer's BF16-expanded F32
+storage boundary. Ordinary AR and full acceptance do not enter this repair.
+Each partial repair adds one small existing kernel per GDN layer; no performance
+claim follows. The diagnostic documentation worktree contains this patch as
+evidence only, not as applied product source.
 
-This establishes a source storage-contract hypothesis. The GPU diagnostic saved hashes, not convolution element values, so it does not prove which exact live elements differ or that a proposed hardware repair works. The QSA selection mismatch remains a separate unresolved contract question. No production fix or weakened assertion is included here.
+The permanent version of the corrected test restores the established try_gpu()
+skip behavior and emits an actual-GPU marker after successful initialization.
+The positive and negative proof binaries used required GPU initialization;
+their source/build identities are separately retained.
 
-## Evidence scope
+The original full-model failure included **36 convolution histories plus
+12 target QSA selected-index tensors**. This bounded GPU proof addresses the
+convolution storage defect; it does not prove that every original live mismatch
+is repaired. QSA partial-prefix repair restores complete pre-verify selection
+owners while updating active marks. That separate oracle contract must compare
+the complete twelve owners to S0, every other canonical row to AR, full acceptance
+to AR, and the next AR full-vocabulary logits and canonical state to AR. No owner
+may simply be ignored. The new model oracle and its posthoc verifier still need
+their own source-pinned CPU and hardware qualification.
 
-The parent full CPU attempt remains `FAIL_RETAINED`, exit 101, with the separately classified local HFQ/KT48 failures. The f2 fixture follow-up has scoped CPU receipts; it does not relabel the parent full suite as passing. The oracle's numerical snapshots synchronize HIP and can drain DMA, so this investigation supplies no asynchronous-overlap or speed claim. A hardware repair, complete native model proof, cache-on turnover proof, paired comparison and canonical service checks remain unqualified.
+The parent full CPU attempt remains FAIL_RETAINED with its separately
+classified HFQ/KT48 failures. No original failure, final source qualification,
+cache-on pair, service gate, async-overlap gate or speed result is relabelled by
+this update.

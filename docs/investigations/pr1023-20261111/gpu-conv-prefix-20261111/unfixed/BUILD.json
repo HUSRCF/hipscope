@@ -1,0 +1,158 @@
+{
+  "schema": "hipfire-conv-prefix-test-overlay-build-v1",
+  "status": "COMPILE_PASS",
+  "diagnostic_not_PR_qualification": true,
+  "production_rollback_modified": false,
+  "GPU_touched": false,
+  "tests_executed": false,
+  "model_loaded": false,
+  "base_source": {
+    "head": "f2d25a0ba30a697d08ad196916fc8b902f2211a9",
+    "tree": "2a161933d3af2969b12542c9f6be21d05909a521",
+    "status": ""
+  },
+  "restored_source": {
+    "head": "f2d25a0ba30a697d08ad196916fc8b902f2211a9",
+    "tree": "2a161933d3af2969b12542c9f6be21d05909a521",
+    "status": ""
+  },
+  "original": {
+    "path": "/home/husrcf/Code/hipfireQC/tmpOutput/pr1022-pr1023-review-20261111/conv-prefix-test-only-overlay-01/base-state.rs",
+    "bytes": 340204,
+    "sha256": "03a3bdc454bfe0e4c54b71190893da6978d7e4e9b361ee4cef515e13f65a8887",
+    "md5": "e692f118895aac98e0973227b20c0f4f"
+  },
+  "prepared": {
+    "path": "/home/husrcf/Code/hipfireQC/tmpOutput/pr1022-pr1023-review-20261111/conv-prefix-test-only-overlay-01/prepared-state.rs",
+    "bytes": 341536,
+    "sha256": "c0bfbde079a27eb83465dcd770cb98ff97a4ad46aa68caac7cd3a0c58e98acde",
+    "md5": "2dc496f6744f505f8d0ae271ec1c9e5e"
+  },
+  "patch": {
+    "path": "/home/husrcf/Code/hipfireQC/tmpOutput/pr1022-pr1023-review-20261111/conv-prefix-test-only-overlay-01/test-only.patch",
+    "bytes": 4560,
+    "sha256": "dea668508ff8de66e6fa940c7c47a02abf3b9284cd2d8f3ac2e4c242b690c8c0",
+    "md5": "1659983970af2ed7f1ae289bfdab2857"
+  },
+  "driver": {
+    "path": "/home/husrcf/Code/hipfireQC/tmpOutput/pr1022-pr1023-review-20261111/conv-prefix-test-only-overlay-01/build-conv-test-only.py",
+    "bytes": 5648,
+    "sha256": "5ee0e83eedf3150c8910a6e821689ff1431ec8e6481d7f62f35783f8b932e8c3",
+    "md5": "f7340de03c29b088e90a263fa30b40fe"
+  },
+  "helper": {
+    "path": "/home/husrcf/Code/hipfireQC/tmpOutput/pr1022-pr1023-review-20261111/run-pr1023-final-cpu.py",
+    "bytes": 31919,
+    "sha256": "6254457e6deafea2ccb6e60064d27c0e73df0a6beca764c276c7d5bceed3b72c",
+    "md5": "9294c3b73491c8543a2ae93d8b10f45f"
+  },
+  "pid": 1725131,
+  "started_unix": 1794410784.6350644,
+  "test_name": "state::tests::row_capture_64_prefix_abort_and_continuation_match_singletons",
+  "environment": {
+    "CARGO_TARGET_DIR": "/home/husrcf/wk/hipfire-psr/target",
+    "CARGO_BUILD_JOBS": "2",
+    "HIP_VISIBLE_DEVICES": "-1",
+    "ROCR_VISIBLE_DEVICES": "-1",
+    "HIPFIRE_HOME": "/home/husrcf/Code/hipfireQC/tmpOutput/pr1022-pr1023-review-20261111/conv-prefix-test-only-overlay-01/cpu-build-01/home"
+  },
+  "overlay_source": {
+    "head": "f2d25a0ba30a697d08ad196916fc8b902f2211a9",
+    "tree": "2a161933d3af2969b12542c9f6be21d05909a521",
+    "status": "M crates/hipfire-arch-qwen4/src/state.rs"
+  },
+  "result": {
+    "source_before": {
+      "head": "f2d25a0ba30a697d08ad196916fc8b902f2211a9",
+      "tree": "2a161933d3af2969b12542c9f6be21d05909a521",
+      "status": "M crates/hipfire-arch-qwen4/src/state.rs"
+    },
+    "mem_available_before_bytes": 129447444480,
+    "command": [
+      "/home/husrcf/.cargo/bin/cargo",
+      "test",
+      "--release",
+      "--locked",
+      "-p",
+      "hipfire-arch-qwen4",
+      "--lib",
+      "--no-run",
+      "--message-format=json-render-diagnostics",
+      "state::tests::row_capture_64_prefix_abort_and_continuation_match_singletons"
+    ],
+    "started_unix": 1794410784.727207,
+    "pid": 1725256,
+    "raw_exit_code": 0,
+    "cleanup": {
+      "actions": [],
+      "reaped": true,
+      "owned_session_live": []
+    },
+    "exit_code": 0,
+    "seconds": 157.30764599493705,
+    "finished_unix": 1794410942.0348551,
+    "log": {
+      "path": "/home/husrcf/Code/hipfireQC/tmpOutput/pr1022-pr1023-review-20261111/conv-prefix-test-only-overlay-01/cpu-build-01/raw.log",
+      "bytes": 261861,
+      "sha256": "a67a468f3fcdc27eedd973d67f48f759848a13a90adea2a1ed6ab69e2a1ff988",
+      "md5": "0dc57a1ab66c3f0a83f1270e6b82b81a"
+    },
+    "source_after": {
+      "head": "f2d25a0ba30a697d08ad196916fc8b902f2211a9",
+      "tree": "2a161933d3af2969b12542c9f6be21d05909a521",
+      "status": "M crates/hipfire-arch-qwen4/src/state.rs"
+    }
+  },
+  "cargo_summary": {
+    "path": "/home/husrcf/Code/hipfireQC/tmpOutput/pr1022-pr1023-review-20261111/conv-prefix-test-only-overlay-01/cpu-build-01/TEST-SUMMARY.json",
+    "bytes": 699,
+    "sha256": "ee1acb7c41b0eeffa7e4344741d491f05d2307682482f1b7bfb11ed51063f569",
+    "md5": "dca2ead9baeac5533eb24f5f5186f5d4"
+  },
+  "cargo_artifact": {
+    "path": "/home/husrcf/Code/hipfireQC/tmpOutput/pr1022-pr1023-review-20261111/conv-prefix-test-only-overlay-01/cpu-build-01/hipfire-arch-qwen4-test-artifact.json",
+    "bytes": 935,
+    "sha256": "8067555c39592b6ed717866c992e5a9a73c944a58569be0929d06de9edff4e13",
+    "md5": "ae7138238c28d8a2683e08966ac07f1e"
+  },
+  "cargo_artifact_jsonl": {
+    "path": "/home/husrcf/Code/hipfireQC/tmpOutput/pr1022-pr1023-review-20261111/conv-prefix-test-only-overlay-01/cpu-build-01/compiler-artifacts.jsonl",
+    "bytes": 166433,
+    "sha256": "0f89331aad9671cde3f3c58b2196e3671c262ab99b8941ec363a2ff295650847",
+    "md5": "1fa602c772fafca0294884503f3ba1ea"
+  },
+  "build_log": {
+    "path": "/home/husrcf/Code/hipfireQC/tmpOutput/pr1022-pr1023-review-20261111/conv-prefix-test-only-overlay-01/cpu-build-01/raw.log",
+    "bytes": 261861,
+    "sha256": "a67a468f3fcdc27eedd973d67f48f759848a13a90adea2a1ed6ab69e2a1ff988",
+    "md5": "0dc57a1ab66c3f0a83f1270e6b82b81a"
+  },
+  "binary": {
+    "path": "/home/husrcf/Code/hipfireQC/tmpOutput/pr1022-pr1023-review-20261111/conv-prefix-test-only-overlay-01/cpu-build-01/hipfire-arch-qwen4-conv-test-unfixed",
+    "bytes": 82697784,
+    "sha256": "043d6eb6a25072381ce6d1ea2937661db95b0005e2338c1108693bbd2dca7368",
+    "md5": "f95b300398abaa99f4ea47e6a0303698",
+    "cargo_executable": "/home/husrcf/wk/hipfire-psr/target/release/deps/hipfire_arch_qwen4-2f18df5f04b6aa67",
+    "cargo_identity": {
+      "path": "/home/husrcf/wk/hipfire-psr/target/release/deps/hipfire_arch_qwen4-2f18df5f04b6aa67",
+      "bytes": 82697784,
+      "sha256": "043d6eb6a25072381ce6d1ea2937661db95b0005e2338c1108693bbd2dca7368",
+      "md5": "f95b300398abaa99f4ea47e6a0303698"
+    }
+  },
+  "features": [],
+  "build_command": [
+    "/home/husrcf/.cargo/bin/cargo",
+    "test",
+    "--release",
+    "--locked",
+    "-p",
+    "hipfire-arch-qwen4",
+    "--lib",
+    "--no-run",
+    "--message-format=json-render-diagnostics",
+    "state::tests::row_capture_64_prefix_abort_and_continuation_match_singletons"
+  ],
+  "exit_code": 0,
+  "finished_unix": 1794410942.512851
+}
