@@ -1,0 +1,177 @@
+{
+  "schema": "hipfire-pr1023-forced-native-pair-evidence-v1",
+  "source_head": "dd58ad80733516d3a29ed138225a18bf26db59c9",
+  "source_tree": "438524b27d8a91976d0db6121221c760ad9afd46",
+  "status": "PASS",
+  "artifact_root_label": "pr1022-pr1023-review-20261111",
+  "scope": "Instrumented forced-native transactions and exact LRU correctness only; no served or performance qualification.",
+  "profile": {
+    "native_k": 3,
+    "head_reserve_k": 7,
+    "target_rows": [
+      1,
+      2,
+      4,
+      8
+    ],
+    "max_seq": 16384,
+    "hot_budget_mib": 18000,
+    "tokens_per_fixture": 512,
+    "arms": [
+      "cache-off",
+      "cache-on"
+    ],
+    "model_load_attempts_per_arm": 1,
+    "same_original_expert_pin_and_model_index": true,
+    "kv": "FP8 VMM",
+    "gdn": "plain Q8",
+    "ple": "q4"
+  },
+  "posthoc_root_revalidated": {
+    "status": "PASS",
+    "scope": "instrumented forced-native transactions, active target/head state, same-schedule physical ring evidence",
+    "performance_claim": false,
+    "async_overlap_claim": false,
+    "default_chooser_qualification": false,
+    "sampled_router_qualification": false,
+    "canonical_serve_qualification": false,
+    "physical_plan_sha256": {
+      "off": "450783628d760577887ea30291b1450d88397233c620c8e1172dc3d175b81083",
+      "on": "17e163496466bdd79bc701efe83459998f35431b470371407ef73c661a0f317d"
+    },
+    "source_identity": {
+      "artifact_bytes": 125288544792,
+      "artifact_index_sha256": "8703bb1626ff48b976a84d5f4f7d18b4aad8e9d1d9b780a52f963d73cb83c013",
+      "layers": 48,
+      "experts_per_layer": 512
+    },
+    "cases": 2
+  },
+  "cases": [
+    {
+      "fixture": "code",
+      "prompt_tokens": 84,
+      "ids": 512,
+      "native_windows": 135,
+      "acceptance": {
+        "zero": true,
+        "interior": true,
+        "full": true
+      },
+      "prefix_cases": 30,
+      "prefix_restore_cells": 2,
+      "completed_native_victim_turnover": 2637,
+      "native_interval_stats_delta": {
+        "selected": 258240,
+        "cache_hits": 129703,
+        "fills_completed": 8556,
+        "publish_calls": 12238,
+        "verify_batches": 135,
+        "prefill_restores": 0
+      }
+    },
+    {
+      "fixture": "fiction",
+      "prompt_tokens": 33,
+      "ids": 512,
+      "native_windows": 186,
+      "acceptance": {
+        "zero": true,
+        "interior": true,
+        "full": true
+      },
+      "prefix_cases": 30,
+      "prefix_restore_cells": 2,
+      "completed_native_victim_turnover": 3214,
+      "native_interval_stats_delta": {
+        "selected": 356160,
+        "cache_hits": 175758,
+        "fills_completed": 11904,
+        "publish_calls": 16594,
+        "verify_batches": 186,
+        "prefill_restores": 0
+      }
+    }
+  ],
+  "strict_proof_domains": [
+    "Both512-token generated ID sequences match independent AR and the paired cache arm.",
+    "Full-vocabulary reference backbone consumed positions1..9 and R1/2/4/8 target transactions; no full-vocabulary-at-all512-steps claim.",
+    "Actual native zero/interior/full acceptance; active target/head/session/boundary state and pending-hidden bits.",
+    "Same native call-schedule target physical ring evidence remains paired strictly.",
+    "Thirty generic/native retained-prefix cells per fixture, including complete S0 target selection ownership and all other AR state, then next AR full vocabulary and all220 canonical rows.",
+    "Two formal session-prefix restore branches per fixture with nonempty suffix prefill, actual native continuation, identical executor frame/output IDs and active target/head/pending state.",
+    "Cache victim turnover requires actual paired GU/DN slot addresses, newer published generations and native-only PendingFills identity. Counters or prior AR-warmup fills alone do not qualify."
+  ],
+  "native_interval_scope": "The reported fills/hits/publications/zero bulk-prefill restores are deltas between before-native and after-native snapshots in each cache-on case; they do not describe every stage of the whole process.",
+  "selection_contract": {
+    "name": "target_prefix_s0_selection_v1",
+    "why": "Production rollback_rows_retain restores the complete pre-verify S0 target selected_indices allocation. Trunk FullAttention recomputes its selection before the next read; the MTP head has a separate persistent ReuseSelection owner.",
+    "partial_prefix": "All12 target selection owners compare complete logical buffer bytes against S0; all208 other canonical rows compare literally against AR at keep.",
+    "full_acceptance": "All220 canonical rows compare literally against AR at keep.",
+    "continuation": "Actual next AR full-vocabulary logits and all220 canonical rows compare literally against AR at keep+1.",
+    "prior_failure": "The original48-row discrepancy remains preserved:36GDN conv rows and12QSA selection rows. The independent seven-line convolution repair remains required; this owner contract does not excuse convolution differences."
+  },
+  "cpu_scope": {
+    "strict_all_workspace_pass": false,
+    "current_workspace_status": "FAIL_RETAINED",
+    "current_workspace_exit_code": 101,
+    "classified_failures": [
+      "kt48"
+    ],
+    "hfq": "actual PASS"
+  },
+  "not_qualified": [
+    "Asynchronous DMA overlap or speedup: intrusive canonical/head hashing synchronizes HIP and can drain DMA.",
+    "Adaptive/default MTP chooser or economics: actual native windows are forced K3.",
+    "Canonical sampled/greedy HTTP service, SSE terminal behavior or quality.",
+    "Sampled native MTP, ngram copy, native batched PM4 replay, live Q8Ef.",
+    "Manual joint-checkpoint zero-fill native resume."
+  ],
+  "references": [
+    {
+      "artifact": "P5-NATIVE-STATE-REPAIR-SUMMARY.json",
+      "bytes": 2074,
+      "sha256": "60355e2459002e879d7a0c6913fe12df5f147ec31dea3ea96aa1f5d3a8a35c78"
+    },
+    {
+      "artifact": "pr1023-native-state-repair-01/RUN.json",
+      "bytes": 47470,
+      "sha256": "3bc477db80d901032687ae0062a5aae678e19026d0e2a31bb611337db52f428b"
+    },
+    {
+      "artifact": "pr1023-native-state-repair-01/off/oracle.json",
+      "bytes": 18074677,
+      "sha256": "3381511826ba3246c52e0e27e812ca7847477b9859a4c9aff35a721fbdbfca82"
+    },
+    {
+      "artifact": "pr1023-native-state-repair-01/on/oracle.json",
+      "bytes": 49966443,
+      "sha256": "722be7f589fd678e29afeefac59bcccabd6b832381eb6ebfa20b3007f70834dc"
+    },
+    {
+      "artifact": "pr1023-native-state-repair-01/collector/oracle.json",
+      "bytes": 260684,
+      "sha256": "ca666ed05397214245fae2e2fae7a5c5ba8f9b101def883b7d26e50be23d7ceb"
+    },
+    {
+      "artifact": "state-repair-posthoc-v3/verify-native-pair.py",
+      "bytes": 26211,
+      "sha256": "530a47c0b1c568696ba83bf9a53f30832edb3e29998a2c0e9d2aca5aab03b57d"
+    },
+    {
+      "artifact": "state-repair-posthoc-v3/test-verify-native-pair.py",
+      "bytes": 19140,
+      "sha256": "8c7a1c17cb8d80374fe32e5475b2c19f4e022b701750c34c32542463f3ed62de"
+    },
+    {
+      "artifact": "cpu-pr1023-state-repair-final-01/06-four-labs-build/MANIFEST.json",
+      "bytes": 5273,
+      "sha256": "5128daaf337955f1b5a12747500a83a9678319e3dd2121c85ba3d9a2f3fe5819"
+    },
+    {
+      "artifact": "P5-PREFIX-FIRST-MISMATCH.json",
+      "bytes": 102656,
+      "sha256": "883b528165da628c0baa5d46cc653bf8337bd4b30bd2335d7a27c1d33f1cd546"
+    }
+  ]
+}

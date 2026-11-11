@@ -5,12 +5,17 @@
     "tree": "438524b27d8a91976d0db6121221c760ad9afd46",
     "status": ""
   },
-  "scope": "Documentation only; current CPU and standalone convolution GPU evidence, no model qualification.",
+  "scope": "Documentation only: current CPU, standalone convolution GPU and paired forced-K3 native transaction correctness; no canonical serving, async-overlap or performance qualification.",
   "files": [
     {
       "path": "README.md",
-      "bytes": 3661,
-      "sha256": "7cb3189f651d33fd4696d4b9a90bb557c669aeda2191d7b954091b4df9dd74d6"
+      "bytes": 6744,
+      "sha256": "f54e44c298917484c17633a7871537509353775677ec99026cab4e4c55661f53"
+    },
+    {
+      "path": "native-pair.json",
+      "bytes": 7321,
+      "sha256": "ca6a08ae9e6ad97cfd400e60ee4ef6e07bc948867bb4a517f2d3aa05cc556854"
     },
     {
       "path": "receipts.json",
