@@ -5,17 +5,22 @@
     "tree": "438524b27d8a91976d0db6121221c760ad9afd46",
     "status": ""
   },
-  "scope": "Documentation only: CPU, standalone convolution GPU, forced-K3 native pair, canonical same-server service and single-row AR Redline; no native PM4, direct sampled producer, generated-code execution, QC35 or performance claim.",
+  "scope": "Documentation only: previous CPU/tiny/forced-native/service/AR packets plus retained partial QC35 failure and parser CPU diagnosis. No full35, native PM4, direct sampled producer, code execution or performance qualification.",
   "files": [
     {
       "path": "README.md",
-      "bytes": 9868,
-      "sha256": "e68806afb0344ec7225423451d863bbf6eded7f937a6292427c864753cfd805d"
+      "bytes": 12304,
+      "sha256": "f36ca288b42822056ebc612728440718124a49ab31038cbd17c8a6f621575f4d"
     },
     {
       "path": "native-pair.json",
       "bytes": 7321,
       "sha256": "ca6a08ae9e6ad97cfd400e60ee4ef6e07bc948867bb4a517f2d3aa05cc556854"
+    },
+    {
+      "path": "qc35-partial-failure.json",
+      "bytes": 8298,
+      "sha256": "7244602dcf7cb0351630ab2596bcb1b420a2f71d1baf501245ec58184efad5a6"
     },
     {
       "path": "receipts.json",

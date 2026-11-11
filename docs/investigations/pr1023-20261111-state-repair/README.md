@@ -61,6 +61,45 @@ The loader explicitly reported AR cache verify capacity 1, FP8 VMM and plain Q8.
 
 [service-ar.json](service-ar.json) seals both completed runs and the independent service review. The earlier CPU/tiny and forced-native packets remain byte-identical; their narrower exclusions describe their own snapshots. QC35 and any active long-context run are outside this extension and have not been inspected here. Current CPU still retains its sole classified KT48 failure.
 
+## QC35 partial failure and parser diagnosis
+
+The first native 65K QC35 attempt remains **FAIL**, stopped by the external
+wrapper at `malformed actual native window`. It had formally compared warmup1
+plus17 LongBench responses. The eighteenth LongBench response had been saved
+before parser rejection, so it has no original formal/protocol comparison.
+Independent review found all18 saved answer byte strings equal to the incumbent
+AR responses, with12 natural stops and6 length caps. This is partial decoded
+agreement, not a completed35-question or absolute-quality PASS; LongDecode was
+not reached and output token IDs remain UNOBSERVED.
+
+The rejected last event is a product-specified remaining-budget-one case:
+`source=mtp`, interleaved, k=accepted=0, one verified row, no drafts and one
+committed bonus. The prompt has25176 tokens, cap=gen=512, and the final window
+starts at25686. Prefill emits the seed without advancing position, so before a
+window `position=N+generated-1`; this gives generated-before511 and remaining1.
+The original parser's universal k>0 assumption was false. No product or binary
+change is involved in this diagnosis.
+
+The independently reviewed external successor requires this narrow final
+full-cap length/budget/position/geometry proof and calls it
+ZERO_DRAFT_BUDGET_TAIL. It contributes **zero** positive draft, batch or width
+coverage and no AR producer claim. The actual125 source=mtp traces contain124
+positive draft windows,123 batched windows and one such tail. Raw native/ngram
+counters and source-typed traces remain separate; the126 native cycle counter
+must not be equated with all observed traces or positive drafts.
+
+The successor passed17 service and8 QC CPU controls, compile/PLAN, and31 actual
+receipt replays (service12, formal QC18, plus saved LB18). Adversarial tests retain
+invalid-tail rejection, mixed ngram/native counts, missing native phase failure,
+natural EOS behavior and owned one-load cleanup on parser failure. All old
+positive route proofs remain unchanged. These CPU replays cannot amend the
+failed original RUN. A fresh full35 attempt is required separately; this snapshot
+includes no successor GPU/model execution or whole35 regression result.
+
+[qc35-partial-failure.json](qc35-partial-failure.json) seals the original failure,
+independent diagnosis, exact source contract and external successor CPU evidence.
+The previous three evidence packets remain byte-identical.
+
 ## Scope and provenance
 
 The matching-head hosted-CI observation at `2026-11-11T16:13:09.524729+00:00` found zero runs, check runs or check suites and a pending combined status: **CURRENT_CI_UNOBSERVED_PENDING**. No hosted result is inferred from the local checks.

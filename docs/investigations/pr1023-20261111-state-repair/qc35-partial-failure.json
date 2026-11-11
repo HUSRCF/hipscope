@@ -1,0 +1,220 @@
+{
+  "schema": "hipfire-pr1023-QC35-partial-failure-documentary-v1",
+  "base_source": {
+    "head": "dd58ad80733516d3a29ed138225a18bf26db59c9",
+    "tree": "438524b27d8a91976d0db6121221c760ad9afd46",
+    "status": ""
+  },
+  "scope": "Preserve incomplete original QC35 failure and verified external parser diagnosis; no full35 or new model result.",
+  "status": "PARTIAL_QC35_FAIL_RETAINED",
+  "original_run": {
+    "path": "qc35-pr1023-native-cacheon-65k-01/RUN.json",
+    "sha256": "655941cc900bd184ab1270ba7fc9f6f62240db2165c29fd387e0a778af7afc99",
+    "bytes": 1510824,
+    "status": "FAIL",
+    "primary_error": "RuntimeError('malformed actual native window')",
+    "formal_comparison_inventory": {
+      "warmup": 1,
+      "longbench": 17,
+      "total": 18,
+      "longdecode": 0
+    }
+  },
+  "saved_scored_responses": {
+    "longbench": 18,
+    "longdecode": 0,
+    "finish_stop": 12,
+    "finish_length": 6,
+    "independent_decoded_answer_bytes_equal_to_incumbent": 18,
+    "protocol_or_formal_comparison_for_LB18": "NOT_CREATED_IN_ORIGINAL_RUN",
+    "full35_regression": "UNQUALIFIED",
+    "complete_output_token_ids": "UNOBSERVED",
+    "absolute_quality": "Six length-capped scored responses remain incomplete; matching bytes do not erase this limitation."
+  },
+  "failed_request": {
+    "request_id": "chatcmpl-1884819-19",
+    "request": {
+      "path": "qc35-pr1023-native-cacheon-65k-01/requests/longbench/17-66f14c70821e116aacb271ee/request.json",
+      "sha256": "c61bfccc54fd781c388d493b9187aa7d17c5300ca655ccc03ec66170ad92d277",
+      "bytes": 90231
+    },
+    "result": {
+      "path": "qc35-pr1023-native-cacheon-65k-01/requests/longbench/17-66f14c70821e116aacb271ee/result.json",
+      "sha256": "04dcab2c14845f251ca53764cc64f4a914962323cce09ec7071e375110072368",
+      "bytes": 5178
+    },
+    "response_sse": {
+      "path": "qc35-pr1023-native-cacheon-65k-01/requests/longbench/17-66f14c70821e116aacb271ee/response.sse",
+      "sha256": "d0c9f24fe49145569b47fb61d156ce8ca0f8c9ded4dd07fc0cebbefe557758ec",
+      "bytes": 118369
+    },
+    "answer": {
+      "path": "qc35-pr1023-native-cacheon-65k-01/requests/longbench/17-66f14c70821e116aacb271ee/answer.md",
+      "sha256": "00975b57594e39996ac58fcbe4db69e97881aba57a9b73cb007273a9207b29c2",
+      "bytes": 1998
+    },
+    "cap": 512,
+    "generated": 512,
+    "prompt_tokens": 25176,
+    "finish": "length",
+    "tail": {
+      "source": "mtp",
+      "verify_route": "interleaved",
+      "accept_route": "host",
+      "position": 25686,
+      "k": 0,
+      "accepted": 0,
+      "verify_rows": 1,
+      "row_limit": 8,
+      "rows": [],
+      "committed": [
+        2641
+      ]
+    },
+    "budget_proof": "position=N+generated_before-1; generated_before=511 and remaining=512-511=1. Prefill emitted seed does not advance position.",
+    "positive_trace_windows": 124,
+    "positive_batched_windows": 123,
+    "seed_only_budget_tail_windows": 1,
+    "observed_source_mtp_trace_windows": 125,
+    "reported_mtp_windows": 126,
+    "counter_scope": "Native and ngram counters and source-typed trace counts are recorded independently; no count equality or unseen producer inference."
+  },
+  "diagnosis": {
+    "classification": "PROVEN_EXTERNAL_PARSER_FALSE_REJECTION",
+    "receipt": {
+      "path": "qc35-pr1023-native-cacheon-65k-01-ZERO-DRAFT-DIAGNOSIS.json",
+      "sha256": "fd28920f7f3f64b821bd879501ad8347dbefef7aada5e86c37df60e617b11da6",
+      "bytes": 16007
+    },
+    "product_source_refs": [
+      {
+        "path": "crates/hipfire-runtime/src/spec.rs",
+        "blob": "8c7285b33b2f15a888d3258160fbdc955e85a918",
+        "sha256": "4de840ef50915466f9bc95fd64d3d0af7a23e0a174431fb73c8dd184be8860ba",
+        "line_ranges": [
+          [
+            1573,
+            1577
+          ],
+          [
+            1616,
+            1649
+          ]
+        ]
+      },
+      {
+        "path": "crates/hipfire-generate/src/qwen.rs",
+        "blob": "087a656687d25c25acb47d98e554be3020f79d7a",
+        "sha256": "06f78ced0043d2229029929726441fc07f9a35f73fc264057fe7ec97f6af9aa1",
+        "line_ranges": [
+          [
+            4894,
+            4901
+          ],
+          [
+            5016,
+            5038
+          ],
+          [
+            5393,
+            5416
+          ],
+          [
+            5507,
+            5518
+          ],
+          [
+            5554,
+            5567
+          ],
+          [
+            8090,
+            8104
+          ]
+        ]
+      },
+      {
+        "path": "crates/hipfire-arch-qwen4/src/mtp_spec.rs",
+        "blob": "11a5a47b772444b55ef1e9b27e080bac6bf59ad1",
+        "sha256": "32b48c11c949d0d562d767a42d36a2bbb22b164581a93507b9ad8f55ee78f223",
+        "line_ranges": [
+          [
+            5838,
+            5857
+          ],
+          [
+            5939,
+            5956
+          ],
+          [
+            8495,
+            8496
+          ],
+          [
+            8768,
+            8804
+          ],
+          [
+            8906,
+            8910
+          ]
+        ]
+      }
+    ],
+    "contract": "Runtime max_emit=1 deliberately sets k=0, verifies seed only and commits one bonus. The original external parser incorrectly required every source=mtp event to have k>0.",
+    "product_or_binary_change": false
+  },
+  "successor_parser_CPU_only": {
+    "service": {
+      "path": "qc35-seed-terminal-parser-fix-01/run-pr1023-service-v3.py",
+      "sha256": "40f16bdd7935bd36974386cac32c5ae47e11a6bc37d5fd7b821849c02940d14c",
+      "bytes": 68766
+    },
+    "QC35": {
+      "path": "qc35-seed-terminal-parser-fix-01/run-pr1023-qc35-native-v2.py",
+      "sha256": "9527a4ac03aa41779d0e99f626acdfae0893a4ed07291f87f128550986bd371e",
+      "bytes": 32457
+    },
+    "manifest": {
+      "path": "qc35-seed-terminal-parser-fix-01/MANIFEST.json",
+      "sha256": "d3efbc3c4c09a2e69abfe36136d83336e17fd09fe39e971ac5e5a821f4fdbf41",
+      "bytes": 4988
+    },
+    "readiness": {
+      "path": "qc35-seed-terminal-parser-fix-01/READINESS.json",
+      "sha256": "3ec0e3c403560aaa67ba4d9b3bcae7f4dac89dc2d47a07f2bab3ea596aae8a1e",
+      "bytes": 1792
+    },
+    "controls": {
+      "path": "qc35-seed-terminal-parser-fix-01/CPU.json",
+      "sha256": "a186ba6d399b1984c82f4a63c2c9710328f4abc86694dd37d2d4b1784d055ad8",
+      "bytes": 1875
+    },
+    "replay": {
+      "path": "qc35-seed-terminal-parser-fix-01/REAL-REPLAY.json",
+      "sha256": "b6bfb50fa39ace1508c21555570dee75967f29dc14f37f3ccff5bfc0615d1fb4",
+      "bytes": 21328
+    },
+    "service_control_count": 17,
+    "QC_control_count": 8,
+    "real_receipts_replayed": 31,
+    "admitted_scope": "Only last ALL-source window at actual full-cap finish=length with cap/gen/prompt position proof, host/interleaved verify1 row_limit8 k=accepted=0 rows=[] and one u32 committed token.",
+    "positive_coverage": "Seed-only adds zero native-draft/batch/max-width positives and no AR producer proof. Existing EOS rules, faults/refusals and canonical quality checks remain.",
+    "controls_include": [
+      "Actual immutable failing raw trace and old-parser failure reproduced",
+      "Malformed counts/routes/rows/positions/u32 IDs, missing or wrong budget, non-final window refusal",
+      "Seed-only alone cannot qualify native or missing scored phase",
+      "Mixed positive native + ngram takeover + seed-only permits ALL traces > raw native counter without inflated positives",
+      "Whole-campaign route failure retains response/SSE/partial results, uses one load and one owned cleanup",
+      "Original signal and blocked HTTP cleanup controls retained"
+    ],
+    "GPU_or_model_executed_by_successor_at_this_checkpoint": false,
+    "requires_next": "A separately reviewed fresh full35 in one process, same frozen source/profile/wires/capsule and no automatic retry. No result of that prospective attempt is included."
+  },
+  "limits": [
+    "Original raw RUN remains FAIL and its exact comparison inventory is not rewritten.",
+    "Independent equality of all18 answer bytes is not full-protocol or full35 qualification.",
+    "Six length-capped outputs retain incomplete absolute quality; source=mtp k0 is not a positive draft window.",
+    "No new product repair, output-token identity, direct sampled AR producer, native batched PM4, chooser speed, performance or isolated cache/MTP benefit claim."
+  ]
+}
