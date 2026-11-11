@@ -5,17 +5,22 @@
     "tree": "438524b27d8a91976d0db6121221c760ad9afd46",
     "status": ""
   },
-  "scope": "Documentation only: previous CPU/tiny/forced-native/service/AR packets plus retained partial QC35 failure and parser CPU diagnosis. No full35, native PM4, direct sampled producer, code execution or performance qualification.",
+  "scope": "Documentation only: CPU/tiny/forced-native/service/AR and completed QC35 decoded/protocol relative regression with retained absolute quality limitations. Earlier partial QC35 FAIL preserved; no output-token IDs, generated-code execution, native batched PM4, isolated cache/MTP benefit or performance qualification.",
   "files": [
     {
       "path": "README.md",
-      "bytes": 12304,
-      "sha256": "f36ca288b42822056ebc612728440718124a49ab31038cbd17c8a6f621575f4d"
+      "bytes": 16662,
+      "sha256": "498bee335d2b5c52f196f2770f5eb29c0e4b6bf75354eead4471b0c336f1152b"
     },
     {
       "path": "native-pair.json",
       "bytes": 7321,
       "sha256": "ca6a08ae9e6ad97cfd400e60ee4ef6e07bc948867bb4a517f2d3aa05cc556854"
+    },
+    {
+      "path": "qc35-final.json",
+      "bytes": 16892,
+      "sha256": "828655a81224188271f6d4e9c404110a3cd3844b28e0caf243c5a6b530966241"
     },
     {
       "path": "qc35-partial-failure.json",

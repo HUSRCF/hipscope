@@ -1,6 +1,6 @@
 # PR #1023 state-repair evidence — 2026-11-11
 
-This documentary checkpoint is based on `dd58ad80733516d3a29ed138225a18bf26db59c9` (tree `438524b27d8a91976d0db6121221c760ad9afd46`). It records completed **CPU checks, a standalone convolution GPU regression, paired forced-K3 native MTP/cache correctness, a canonical same-server service regression, and AR Redline parity**. Each result retains its own scope. Direct sampled producer telemetry, generated-code execution, native batched PM4, asynchronous overlap and performance remain unqualified.
+This documentary checkpoint is based on `dd58ad80733516d3a29ed138225a18bf26db59c9` (tree `438524b27d8a91976d0db6121221c760ad9afd46`). It records completed **CPU checks, a standalone convolution GPU regression, paired forced-K3 native MTP/cache correctness, a canonical same-server service regression, AR Redline parity and a separate QC35 relative regression with absolute quality limitations**. Each result retains its own scope. Direct sampled producer telemetry, generated-code execution, native batched PM4, asynchronous overlap and performance remain unqualified.
 
 Production commit `acd7f994` adds seven lines to preserve BF16-rounded convolution history during accepted-prefix repair. The final test commit adds the actual-producer regression and a typed QSA selection contract: partial repair checks complete S0 selection buffers, all other target state against AR, then the next AR full-vocabulary logits and complete active state. These are explicit state checks; no state field is silently discarded.
 
@@ -100,8 +100,68 @@ includes no successor GPU/model execution or whole35 regression result.
 independent diagnosis, exact source contract and external successor CPU evidence.
 The previous three evidence packets remain byte-identical.
 
+## Completed QC35 relative regression with absolute limitations
+
+A separate fresh run on the same clean dd58 source and normal products completed
+**all35 scored requests plus one protocol warmup in one service process**. It
+retains `COMPLETE_WITH_ABSOLUTE_LIMITATIONS` and `absolute_semantic_pass=false`.
+All35 original HTTP request bodies, decoded answers and independently folded
+content/reasoning/usage/finish fields match the completed beta cache-off AR
+control. Raw SSE identifiers, timestamps, chunking and timings differ. Complete
+generated token IDs remain **UNOBSERVED**. This compares the whole new native
+MTP/cache-on path against incumbent AR, not isolated cache/MTP benefit or speed.
+
+| Completed phase | Reported output tokens | Positive native windows | Batched multirow windows | Seed-only tails excluded | Ngram windows | Max actual rows |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| LongBench30 | 9159 | 2518 | 2516 | 3 | 14 | 8 |
+| LongDecode5 | 38268 | 9172 | 9172 | 0 | 7 | 8 |
+
+These are actual execution traces, with no forced chooser. Capacity8 alone is
+not evidence. The three legal k0 budget tails contribute no positive native,
+batch or width coverage; native/ngram counters remain source-typed. Standard
+service confirms the actual cache owner and placement, but does not expose the
+per-fill/generation census independently established by the earlier lab oracle.
+
+LongBench absolute quality remains **11 correct,6 complete wrong and13 capped
+without final answers**, including4 canonical attractor flags, all within capped
+outputs. All60 candidate/control SSE streams were independently folded. This is
+a frozen conservative hard30 evaluation, not an upstream official score or
+30/30 quality PASS. Its canonical harness exit1 is preserved. Measured prompt
+contexts were20,405–30,250 tokens with512-token output caps.
+
+All five LongDecode outputs stopped naturally, with zero stream errors, caps or
+canonical attractor flags and at least2342 output tokens of cap headroom. Their
+10 complete SSE streams were independently folded and match the control. Actual
+prompt contexts were65–90 tokens, with output cap16384; configured context65536
+is a capacity setting, not an observed65K input. Reported output lengths were
+13,743/14,042/2673/4364/3446 tokens. The story has1960 words and an observed ending,
+without semantic gold or a general literary-quality claim.
+
+Decoded equality does **not** make the games/tutorials semantically correct.
+Both complete game inline scripts passed Node v24.21.0 `--check`; generated code,
+browser interaction and gameplay were not executed. Static game limitations
+remain. The KV tutorial gives the correct memory formula but halves all three
+worked examples, and its toy allocator puts a newly leased block back on the
+free list. The Radix tutorial wrongly shares edited A1′ with old A1 and omits
+partial-block/COW handling at arbitrary token splits. These defects are identical
+in the control. The sealed independent review records their exact scope.
+
+All274 artifact SHA seals were independently rechecked. The final RUN reports
+one spawn and owned cleanup; a separate post-run observation confirms the
+driver, CLI and daemon absent and both GPU locks reacquired and released. Its
+1432.545-second campaign wall duration is not a performance comparison. CPU
+still retains its sole proven KT48 failure and strict workspace PASS is false.
+
+[qc35-final.json](qc35-final.json) binds the final RUN, root integrity/cleanup
+checks, both independent quality reviews and normal-source/runtime identities.
+The earlier four packets remain byte-identical, including the first partial QC35
+FAIL and narrow parser correction. That failed snapshot was not rewritten; this
+fresh completion is a separate result. Native batched PM4, direct sampled AR
+producer telemetry, isolated optimization effects and async speed remain outside
+this result.
+
 ## Scope and provenance
 
-The matching-head hosted-CI observation at `2026-11-11T16:13:09.524729+00:00` found zero runs, check runs or check suites and a pending combined status: **CURRENT_CI_UNOBSERVED_PENDING**. No hosted result is inferred from the local checks.
+The matching-head hosted-CI observation at `2026-11-11T16:13:09.524729+00:00` found zero runs, check runs or check suites and a pending combined status: **CURRENT_CI_UNOBSERVED_PENDING**. The later sealed remote snapshot at `2026-11-11T17:10:49.045553+00:00` likewise observed zero dd58 runs/check runs/check suites and pending combined status. No hosted result is inferred from the local checks; these are historical observations, not a new live query.
 
-[receipts.json](receipts.json) contains relative external artifact paths and SHA-256 identities for the root-issued CPU capsule, original command results, current lab/product manifests, unit executable provenance, tiny raw logs and CI observation. Raw logs and binaries remain outside Git. The earlier failure/diagnosis checkpoint is preserved unchanged. The forced-native paired result is recorded separately in native-pair.json. The service and AR-only extension is recorded separately in service-ar.json; direct sampled producer, code execution, native batched PM4 and long-context/QC35 remain outside its qualification scope.
+[receipts.json](receipts.json) contains relative external artifact paths and SHA-256 identities for the root-issued CPU capsule, original command results, current lab/product manifests, unit executable provenance, tiny raw logs and CI observation. Raw logs and binaries remain outside Git. The earlier failure/diagnosis checkpoint is preserved unchanged. The forced-native paired result is recorded separately in native-pair.json. The service and AR-only extension is recorded separately in service-ar.json; its narrower exclusions remain its own snapshot. The later qc35-final.json supplies only the completed decoded/protocol regression and explicit quality limits described above. Direct sampled producer, generated-code execution, native batched PM4 and performance remain outside these results.

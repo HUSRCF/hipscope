@@ -1,0 +1,452 @@
+{
+  "schema": "hipfire-pr1023-QC35-final-documentary-v1",
+  "status": "COMPLETE_RELATIVE_REGRESSION_WITH_ABSOLUTE_QUALITY_LIMITATIONS",
+  "source": {
+    "head": "dd58ad80733516d3a29ed138225a18bf26db59c9",
+    "tree": "438524b27d8a91976d0db6121221c760ad9afd46",
+    "status": ""
+  },
+  "comparison": {
+    "scope": "Whole new dd58 native MTP/cache-on path relative to completed beta cache-off AR",
+    "candidate_run": {
+      "path": "qc35-pr1023-native-cacheon-65k-02/RUN.json",
+      "sha256": "bc2b8aedba87f84163a95ce196206e3aa46da8f6dfe63721ff95f9dfb7c5fdb9",
+      "bytes": 14862549
+    },
+    "candidate_run_status": "COMPLETE_WITH_ABSOLUTE_LIMITATIONS",
+    "incumbent_AR_run": {
+      "path": "qc35-beta-cacheoff-65k-01/RUN.json",
+      "sha256": "74bccebb60f588dfabda841b1d878a9c8bfb859419586b07a5928461728d961e",
+      "bytes": 81005
+    },
+    "root_independent_final_check": {
+      "path": "P5-QC35-02-ROOT-FINAL-CHECK.json",
+      "sha256": "0f5cb15f688b7ca4a4e5840ef154d37b360bbdf9880747c309f0492855f2c4a4",
+      "bytes": 19794
+    },
+    "artifact_seals_verified": 274,
+    "scored_questions": 35,
+    "warmup_protocol_only": 1,
+    "formal_comparisons": 36,
+    "relative_request_decoded_and_folded_protocol_equal": true,
+    "raw_SSE_bytes_equal": false,
+    "raw_SSE_difference": "Identifiers, timestamps, chunking and timings differ; independently folded content/reasoning/usage/finish are equal.",
+    "actual_output_token_ids": "UNOBSERVED",
+    "isolated_cache_or_MTP_benefit": false,
+    "performance_claim": false,
+    "complete_output_token_ID_claim": false,
+    "independent_SSE_fold_scope": "All60 LB and10 LD complete SSE streams; warmup protocol is separate."
+  },
+  "profile": {
+    "configured_context_capacity": 65536,
+    "actual_LB_context_range": [
+      20405,
+      30250
+    ],
+    "actual_LD_prompt_context_range": [
+      65,
+      90
+    ],
+    "LB_generation_cap": 512,
+    "LD_generation_cap": 16384,
+    "hot_budget_mib": 18000,
+    "actual_KV": "FP8/VMM",
+    "actual_GDN": "plain Q8",
+    "PLE": "q4",
+    "prefill_chunk_rows": 4096,
+    "offload": "PCIe",
+    "D2": false,
+    "decode_share": "off",
+    "HSA_USERPTR_FOR_PAGED_MEM": "1",
+    "sampling_temperature": 0.0,
+    "seed": 123,
+    "native_MTP": "auto with actually attached K7 head",
+    "chooser_forced": false,
+    "sampled_env_optout": false,
+    "default_native_ngram_copy_lane": "on (actual loaded log)",
+    "capacity_is_not_execution_evidence": true
+  },
+  "actual_execution_by_phase": {
+    "warmup": {
+      "requests": 1,
+      "tokens": 16,
+      "positive_native_windows": 7,
+      "multirow_windows": 7,
+      "seed_only_tails_excluded": 0,
+      "ngram_windows": 0,
+      "max_actual_verify_rows": 3
+    },
+    "longbench": {
+      "requests": 30,
+      "tokens": 9159,
+      "positive_native_windows": 2518,
+      "multirow_windows": 2516,
+      "seed_only_tails_excluded": 3,
+      "ngram_windows": 14,
+      "max_actual_verify_rows": 8
+    },
+    "longdecode": {
+      "requests": 5,
+      "tokens": 38268,
+      "positive_native_windows": 9172,
+      "multirow_windows": 9172,
+      "seed_only_tails_excluded": 0,
+      "ngram_windows": 7,
+      "max_actual_verify_rows": 8
+    }
+  },
+  "native_scope": {
+    "multirow_native_windows_by_phase": {
+      "warmup": 7,
+      "longbench": 2516,
+      "longdecode": 9172
+    },
+    "overall_native_path_observed": true,
+    "long_context_native_qualified": true,
+    "longdecode_native_qualified": true,
+    "missing_scored_native_phases": [],
+    "scope_complete": true,
+    "AR_fallback_is_native_PASS": false,
+    "chooser_forced": false
+  },
+  "cache_runtime_census": "Standard service confirms actual owner admission, but does not expose per-fill/generation census. The separately sealed native lab oracle supplies that different proof; no census is inferred here.",
+  "LB_absolute_quality": {
+    "independent_review": {
+      "path": "QC02-LONGBENCH-QUALITY-SCOPE.json",
+      "sha256": "cddb58f2166ebec4f9b37e6a388ef0e720f8f003b3165388079bb5ae17fa92c8",
+      "bytes": 53008
+    },
+    "questions": 30,
+    "complete_correct": 11,
+    "complete_wrong": 6,
+    "length_capped_without_final_answer": 13,
+    "canonical_attractor_flags": 4,
+    "all_attractor_flags_within_capped": true,
+    "empty": 0,
+    "atem_leak": 0,
+    "evaluator": "Frozen hard30 conservative final-letter extraction, not upstream official evaluation.",
+    "quality_claim": "11/30 complete correct; equal incumbent outputs do not turn wrong or incomplete responses into PASS.",
+    "complete_phase": {
+      "path": "qc35-pr1023-native-cacheon-65k-02/longbench.json",
+      "sha256": "44701efd24b667d441bdda6153fc1b60d6c01b86e3bd432daf775b1edc156f7d",
+      "bytes": 107704
+    },
+    "baseline_phase": {
+      "path": "qc35-beta-cacheoff-65k-01/longbench.json",
+      "sha256": "4b0ecd3724a6b42e3b6b7ebd0b5eeea36df2581d0c53eff3b8ff6c7432291aa9",
+      "bytes": 108128
+    }
+  },
+  "LD_independent_quality": {
+    "receipt": {
+      "path": "QC02-LONGDECODE-QUALITY-SCOPE.json",
+      "sha256": "a899209254b4eac83792e73b1d00ce0a3af89a7d092e878471d65e1ee6bcc33f",
+      "bytes": 22105
+    },
+    "complete_phase": {
+      "path": "qc35-pr1023-native-cacheon-65k-02/longdecode.json",
+      "sha256": "ec089756b7b0560ba16ba4ee3e8b6b2d7d89ef67091df2844112c3bd9b0ab6f4",
+      "bytes": 259693
+    },
+    "baseline_phase": {
+      "path": "qc35-beta-cacheoff-65k-01/longdecode.json",
+      "sha256": "99c71f916c8d6dd743885ba8676ca8111e87add1f52ce625333652b1af88d1a4",
+      "bytes": 259748
+    },
+    "fixture": {
+      "path": "qc35-tools/longdecode-questions.json",
+      "sha256": "f4780fe77c168c7a373bd6789d53495aeb2a0f4eae860235897ac6326c19708a",
+      "bytes": 1940
+    },
+    "summary": {
+      "questions": 5,
+      "relative_exact_full_decoded_request_protocol": 5,
+      "natural_stop": 5,
+      "capped": 0,
+      "stream_errors": 0,
+      "canonical_attractor_flags": 0,
+      "empty": 0,
+      "total_generated_tokens": 38268,
+      "minimum_cap_headroom": 2342,
+      "ctx_range": [
+        65,
+        90
+      ],
+      "positive_native_windows": 9172,
+      "multirow_native_windows": 9172,
+      "ngram_windows": 7,
+      "zero_draft_windows": 0,
+      "max_verify_rows": 8,
+      "game_JS_syntax_pass": 2,
+      "game_functional_executions": 0,
+      "story_words": 1960
+    },
+    "cases": [
+      {
+        "id": "code-snake",
+        "ctx": 65,
+        "generated": 13743,
+        "cap": 16384,
+        "headroom": 2641,
+        "finish": "stop",
+        "positive_native_windows": 2905,
+        "multirow_native_windows": 2905,
+        "max_verify_rows": 8,
+        "ngram_windows": 2
+      },
+      {
+        "id": "code-tetris",
+        "ctx": 74,
+        "generated": 14042,
+        "cap": 16384,
+        "headroom": 2342,
+        "finish": "stop",
+        "positive_native_windows": 2837,
+        "multirow_native_windows": 2837,
+        "max_verify_rows": 8,
+        "ngram_windows": 3
+      },
+      {
+        "id": "story",
+        "ctx": 90,
+        "generated": 2673,
+        "cap": 16384,
+        "headroom": 13711,
+        "finish": "stop",
+        "positive_native_windows": 1148,
+        "multirow_native_windows": 1148,
+        "max_verify_rows": 7,
+        "ngram_windows": 1
+      },
+      {
+        "id": "kv-cache",
+        "ctx": 81,
+        "generated": 4364,
+        "cap": 16384,
+        "headroom": 12020,
+        "finish": "stop",
+        "positive_native_windows": 1203,
+        "multirow_native_windows": 1203,
+        "max_verify_rows": 8,
+        "ngram_windows": 1
+      },
+      {
+        "id": "radix-attention",
+        "ctx": 78,
+        "generated": 3446,
+        "cap": 16384,
+        "headroom": 12938,
+        "finish": "stop",
+        "positive_native_windows": 1079,
+        "multirow_native_windows": 1079,
+        "max_verify_rows": 8,
+        "ngram_windows": 0
+      }
+    ],
+    "game_syntax_only": {
+      "receipt": {
+        "path": "QC02-LONGDECODE-STATIC-SYNTAX.json",
+        "sha256": "0270f512ac1322ddd43d68cfa099e7cee833c593ec63d94e388fb15415fd8c6d",
+        "bytes": 1866
+      },
+      "node_version": "v24.21.0",
+      "full_inline_scripts_checked": 2,
+      "exit_code_each": 0,
+      "generated_code_functional_executions": 0,
+      "browser_or_gameplay_execution": false
+    },
+    "content_scope": {
+      "snake": "Complete HTML and inline JS; required keyboard/scoring/collision/pause/game-over-restart paths statically present; complete JS node--check PASS, browser/gameplay UNQUALIFIED.",
+      "tetris": "Complete HTML and inline JS; seven tetrominoes/rotation/collision/line-clear/scoring/game-over/restart paths statically present; complete JS node--check PASS, browser/gameplay UNQUALIFIED.",
+      "optional_fonts": "Both HTMLs reference GoogleFonts stylesheet; no external game JS. Cosmetic font links alone not core-game failure.",
+      "story": "1960 words >=1500; concrete scenes, dialogue and explicit ending observed in full text. No semantic gold or broad literary-quality PASS.",
+      "tutorials": "Requested topics covered, but concrete arithmetic/example/ownership gaps below; no semantic gold or claim all tutorial content is correct.",
+      "same_baseline_limitations": true
+    },
+    "static_findings": [
+      {
+        "id": "kv-numerical-examples",
+        "kind": "DEFINITE_STATIC_ARITHMETIC_ERROR",
+        "evidence": "Correct formula2*B*L*Hkv*Dh*S*D, but all three worked results are half-size. Expected bytes below; output gives1073741824/268435456/about134MB.",
+        "expected_bytes": {
+          "MHA_FP16": 2147483648,
+          "GQA_FP16": 536870912,
+          "GQA_INT8": 268435456
+        },
+        "answer": "03-kv-cache/answer.md"
+      },
+      {
+        "id": "kv-pseudocode-ownership",
+        "kind": "DEFINITE_STATIC_PSEUDOCODE_ERROR",
+        "evidence": "allocate_block appends new ID to free_blocks while returning it in use, so next allocation reuses same ID; per-layer prefill IDs are merged into one list; current_len=len(block_indices)*block_size is always block-aligned. No generated code executed.",
+        "answer": "03-kv-cache/answer.md"
+      },
+      {
+        "id": "radix-divergent-history",
+        "kind": "DEFINITE_STATIC_EXAMPLE_ERROR",
+        "evidence": "Edited[Sys,Q1,A1′,...] shares only[Sys,Q1] with original, but example explicitly says both paths share[Sys,Q1,A1].",
+        "answer": "04-radix-attention/answer.md"
+      },
+      {
+        "id": "radix-partial-page",
+        "kind": "PSEUDOCODE_CORRECTNESS_GAP",
+        "evidence": "Arbitrary token split slices KV-block arrays at match_len//BLOCK_SIZE without partial-page span/COW handling; request release/refcount decrement is not implemented. Conceptual sketch is not a correct production implementation.",
+        "answer": "04-radix-attention/answer.md"
+      },
+      {
+        "id": "snake-static-limitations",
+        "kind": "STATIC_GAME_BEHAVIOR_LIMITATION",
+        "evidence": "start() returns while playing and resumes without resetting paused state, despite Restart/R wiring to start(); gold branch does not pop tail despite claiming no growth. Game-over restart path exists.",
+        "inline_JS_lines": [
+          [
+            133,
+            141
+          ],
+          [
+            260,
+            268
+          ],
+          [
+            650,
+            650
+          ]
+        ]
+      },
+      {
+        "id": "tetris-static-extra-limitation",
+        "kind": "STATIC_OPTIONAL_FEATURE_LIMITATION",
+        "evidence": "canHold=false after hold is reset only by resetGame(), not spawnPiece(), so optional hold is once per game rather than once per piece.",
+        "inline_JS_lines": [
+          [
+            185,
+            192
+          ],
+          [
+            210,
+            218
+          ],
+          [
+            265,
+            272
+          ]
+        ]
+      }
+    ],
+    "absolute_semantic_correctness": "UNQUALIFIED_WITH_CONCRETE_STATIC_LIMITATIONS; exact baseline has identical defects."
+  },
+  "canonical_harness_exits": {
+    "warmup": 0,
+    "longbench": 1,
+    "longdecode": 0
+  },
+  "lifecycle": {
+    "actual_model_spawns": 1,
+    "same_instance_across_all_three_phases": true,
+    "reported_retries": 0,
+    "cleanup_status": "CLEANED_OWN_GROUP",
+    "owned_process_cleanup": {
+      "path": "P5-QC35-02-OWNED-CLEANUP.json",
+      "sha256": "ba074a60520061367551b948232e23d079402e5775baa18657a200d91bde0f97",
+      "bytes": 493
+    },
+    "driver_CLI_daemon_processes_confirmed_absent": [
+      1945000,
+      1945389,
+      1945392
+    ],
+    "both_GPU_locks_reacquired_and_released": true,
+    "signal_stop_requested": false,
+    "elapsed_campaign_wall_seconds_not_performance_measure": 1432.545
+  },
+  "source_and_admission": {
+    "CPU_capsule": {
+      "path": "P5-STATE-REPAIR-QUALIFICATION.json",
+      "sha256": "034d88b6f8b8b04a0b1d3b7174c82edf669c5a9f4743a4e58dad3b2b8aa6b236",
+      "bytes": 13708
+    },
+    "CPU_full_RUN": {
+      "path": "cpu-pr1023-state-repair-final-01/RUN.json",
+      "sha256": "b530cabe44272df30f4707ae82ce04f400be9337dd7d9b410f52d390fce98962",
+      "bytes": 25342
+    },
+    "strict_all_workspace_pass": false,
+    "CPU_full_RUN_status": "FAIL_RETAINED",
+    "workspace_exit_code": 101,
+    "workspace61_totals": {
+      "passed": 12145,
+      "failed": 1,
+      "ignored": 120,
+      "filtered": 0
+    },
+    "remaining_failure": "Previously proven unchanged KT48 assembler parity; HFQ passed in the current run.",
+    "normal_runtime_manifest": {
+      "path": "cpu-pr1023-state-repair-final-01/09-plain-default-product/MANIFEST.json",
+      "sha256": "c2646d9eb86feeade1c774f301a0691a6a3c814507ef37c3ed87b759f2330b09",
+      "bytes": 7725
+    },
+    "external_QC_driver": {
+      "path": "qc35-seed-terminal-parser-fix-01/run-pr1023-qc35-native-v2.py",
+      "sha256": "9527a4ac03aa41779d0e99f626acdfae0893a4ed07291f87f128550986bd371e",
+      "bytes": 32457
+    },
+    "external_service_parser": {
+      "path": "qc35-seed-terminal-parser-fix-01/run-pr1023-service-v3.py",
+      "sha256": "40f16bdd7935bd36974386cac32c5ae47e11a6bc37d5fd7b821849c02940d14c",
+      "bytes": 68766
+    },
+    "final_source_or_normal_binary_changed_for_parser": false
+  },
+  "retained_first_attempt": {
+    "original_partial_RUN": {
+      "path": "qc35-pr1023-native-cacheon-65k-01/RUN.json",
+      "sha256": "655941cc900bd184ab1270ba7fc9f6f62240db2165c29fd387e0a778af7afc99",
+      "bytes": 1510824
+    },
+    "status": "FAIL",
+    "formal_comparisons": "warmup1 plus17LB; LB18 response existed before parser rejection",
+    "diagnosis": {
+      "path": "qc35-pr1023-native-cacheon-65k-01-ZERO-DRAFT-DIAGNOSIS.json",
+      "sha256": "fd28920f7f3f64b821bd879501ad8347dbefef7aada5e86c37df60e617b11da6",
+      "bytes": 16007
+    },
+    "successor_scope": "Only last full-cap length k0 with actual cap/gen/prompt position and exact seed-only geometry; excluded from native-draft/batch/width positive counts. Native/ngram raw counters stay separate from source-typed traces.",
+    "original_raw_and_packet_unchanged": true
+  },
+  "hosted_CI_snapshot": {
+    "observation": {
+      "path": "FINAL-REMOTE-SNAPSHOT-20261111/OBSERVATION.json",
+      "sha256": "c08f0cdb3d944182b82e7cd38fce77838c023f307afd3c946a4b786d9426354c",
+      "bytes": 12448
+    },
+    "observed_utc": "2026-11-11T17:10:49.045553+00:00",
+    "classification": "CURRENT_DD58_CI_UNOBSERVED_PENDING",
+    "same_head_runs_check_runs_check_suites_observed": 0,
+    "not_a_live_recheck": true
+  },
+  "limits": [
+    "Whole-path regression versus incumbent AR, not an isolated cache or MTP benefit or speed measurement.",
+    "Decoded/folded protocol parity does not observe complete generated token IDs or raw-SSE byte equality.",
+    "LB wrong/truncated outputs and canonical quality failures remain retained; runtime completion is not broad semantic quality PASS.",
+    "Native batched PM4, direct sampled AR producer, all65K prompt contexts and async-overlap/performance remain outside this QC result.",
+    "First failed attempt and all earlier documentary packets remain immutable snapshots.",
+    "Both full generated game scripts passed syntax-only node --check; gameplay and generated-code functional behavior were not executed. Tutorial arithmetic/pseudocode and static game behavior limitations are retained."
+  ],
+  "documentary_siblings_preserved": [
+    {
+      "path": "receipts.json",
+      "sha256": "769f3cadf34643e9e704361d131011aea987b6ac9e580d8f278f799c7565367c"
+    },
+    {
+      "path": "native-pair.json",
+      "sha256": "ca6a08ae9e6ad97cfd400e60ee4ef6e07bc948867bb4a517f2d3aa05cc556854"
+    },
+    {
+      "path": "service-ar.json",
+      "sha256": "79bbf5dac5c65cee9e807867b473a3bb9c484a85696c957f5e2522caa1f5e81e"
+    },
+    {
+      "path": "qc35-partial-failure.json",
+      "sha256": "7244602dcf7cb0351630ab2596bcb1b420a2f71d1baf501245ec58184efad5a6"
+    }
+  ]
+}
