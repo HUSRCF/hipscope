@@ -1,0 +1,246 @@
+{
+  "schema": "hipfire-pr1023-state-repair-documentary-checkpoint-v1",
+  "scope": "CURRENT_CPU_AND_STANDALONE_CONV_GPU_ONLY",
+  "source": {
+    "head": "dd58ad80733516d3a29ed138225a18bf26db59c9",
+    "tree": "438524b27d8a91976d0db6121221c760ad9afd46",
+    "status": ""
+  },
+  "artifact_root_label": "pr1022-pr1023-review-20261111",
+  "artifact_paths": "All artifact fields are relative to the original external QC root. Raw logs and binaries remain external; this document contains only SHA references.",
+  "previous_failure_checkpoint": {
+    "branch": "checkpoint/flash-next-lru-mtp-diagnosis-20261111",
+    "tip_preserved": "67a2ff9ba80bf889f3c18ecd91bb7966323891cb",
+    "initial_documentary_commit": "a4f546cfc7b63ae36918ee457fd688a133995f45"
+  },
+  "production_change": {
+    "production_commit": "acd7f994983fb9f0b75c475822d59e6b43d9e883",
+    "production_scope": "Seven-line BF16 convolution-history repair in state.rs using an existing registered primitive",
+    "validation_commit": "dd58ad80733516d3a29ed138225a18bf26db59c9",
+    "validation_scope": "Permanent actual-producer convolution regression and typed full-S0 QSA prefix-selection oracle contract. No field is silently removed from target state checks."
+  },
+  "cpu": {
+    "qualification_classification": "SCOPED_GATES_PASS_WITH_PROVEN_BASE_FAILURES",
+    "strict_all_workspace_pass": false,
+    "raw_status": "FAIL_RETAINED",
+    "workspace_exit_code": 101,
+    "commands_completed": 9,
+    "commands_passed": 8,
+    "commands_failed": 1,
+    "steps": [
+      {
+        "id": "01-precommit",
+        "status": "PASS",
+        "raw_exit_code": 0
+      },
+      {
+        "id": "02-railgun-cert",
+        "status": "PASS",
+        "raw_exit_code": 0
+      },
+      {
+        "id": "03-workspace-lib",
+        "status": "FAIL",
+        "raw_exit_code": 101
+      },
+      {
+        "id": "04-native-oracle-unit",
+        "status": "PASS",
+        "raw_exit_code": 0
+      },
+      {
+        "id": "05-native-routing",
+        "status": "PASS",
+        "raw_exit_code": 0
+      },
+      {
+        "id": "06-four-labs-build",
+        "status": "PASS",
+        "raw_exit_code": 0
+      },
+      {
+        "id": "07-oracle-cpu-controls",
+        "status": "PASS",
+        "raw_exit_code": 0
+      },
+      {
+        "id": "08-posthoc-controls",
+        "status": "PASS",
+        "raw_exit_code": 0
+      },
+      {
+        "id": "09-plain-default-product",
+        "status": "PASS",
+        "raw_exit_code": 0
+      }
+    ],
+    "workspace": {
+      "library_binaries": 61,
+      "unfiltered": true,
+      "totals": {
+        "passed": 12145,
+        "failed": 1,
+        "ignored": 120,
+        "measured": 0,
+        "filtered": 0
+      },
+      "actual_classified_failure_count": 1
+    },
+    "hfq_direct_ranges_mixed_residency": "ACTUAL_PASS_IN_CURRENT_FULL_RUN; no HFQ exception classified",
+    "only_failed_test": "text::print::tests::t9_assembler_parity_where_syntax_is_lossless",
+    "kt48_normalized_diagnostic_sha256": "a4ef61e769f1cef26d1107f0a03e29f55acbafb1a43b7205d9f30e6ce403c27c",
+    "kt48_scope": "Only source-identical, independently reproduced inherited KT48 assembler failure is classified; raw FAIL_RETAINED/101 remains."
+  },
+  "default_product": {
+    "source_head": "dd58ad80733516d3a29ed138225a18bf26db59c9",
+    "actual_five_package_feature_vectors": {
+      "hipfire-arch-qwen4": [],
+      "rdna-compute": [
+        "deltanet"
+      ],
+      "hipfire-dispatch": [
+        "default",
+        "deltanet",
+        "from-hip-error"
+      ],
+      "hipfire-cli": [],
+      "hipfire-daemon": [
+        "default",
+        "deltanet",
+        "vcn-jpeg"
+      ]
+    },
+    "lab_or_timing_feature_leak_observed": false,
+    "scope": "Five actual Cargo artifacts and current normal CLI/daemon copies are sealed in the current default manifest; laboratory tools use their separate four-example manifest."
+  },
+  "tiny_gpu": {
+    "source": {
+      "head": "dd58ad80733516d3a29ed138225a18bf26db59c9",
+      "tree": "438524b27d8a91976d0db6121221c760ad9afd46",
+      "status": ""
+    },
+    "status": "PASS",
+    "actual_gpu_observed": true,
+    "actual_gpu": "gfx1201",
+    "marker": "GDN prefix repair test: actual GPU gfx1201",
+    "permanent_test": "state::tests::row_capture_64_prefix_abort_and_continuation_match_singletons",
+    "raw_exit_code": 0,
+    "result": {
+      "passed": 1,
+      "failed": 0,
+      "ignored": 0,
+      "measured": 0,
+      "filtered": 2412
+    },
+    "libtest_wall_seconds": 4.57,
+    "binary": {
+      "artifact": "cpu-pr1023-state-repair-final-01/qwen4-unit-freeze/hipfire-arch-qwen4-final-state-unit",
+      "sha256": "07917b0e57cd29bc0002ad20b1a43864f8e2318ebf92e037363c145cf977bd7e",
+      "bytes": 83057792
+    },
+    "unit_features": [
+      "lab"
+    ],
+    "scope": "Standalone no-model fixture only: all 64 retained-prefix lengths, F32/Q8, both capture halves, abort and continuation against actual singleton producer. 2412 other tests were intentionally filtered in this single-test GPU invocation.",
+    "original_metadata_note": {
+      "raw_top_level_GPU_touched": false,
+      "interpretation": "The false top-level value is inherited PLAN metadata, retained unmodified. Actual executable invocation, stderr device marker, validation and successful raw result establish GPU execution."
+    }
+  },
+  "ci": {
+    "status": "CURRENT_CI_UNOBSERVED_PENDING",
+    "observed_utc": "2026-11-11T16:13:09.524729+00:00",
+    "source_head": "dd58ad80733516d3a29ed138225a18bf26db59c9",
+    "matching_runs": 0,
+    "matching_check_runs": 0,
+    "matching_check_suites": 0,
+    "combined_state": "pending",
+    "combined_total_count": 0,
+    "scope": "Snapshot observation only. Local CPU and tiny GPU results are not hosted CI results; no matching-head hosted success or failure is inferred."
+  },
+  "limits": [
+    "This checkpoint records no native cache-off/on model result or paired correctness qualification. Native model, cache victim/publication, terminal/prefix continuation, canonical service/Redline and QC35 receipts belong to separate gates.",
+    "Full current CPU command remains FAIL_RETAINED/101; strict_all_workspace_pass=false with only the observed, source-identical KT48 failure classified.",
+    "Canonical ABI/no-GPU scan is attributed to historical parent818 with an exact unchanged-input Git proof, not a repeated dd58 execution.",
+    "The standalone GPU command intentionally filters2412 other tests. It is not the full GPU or model suite.",
+    "The raw tiny RUN top-level GPU_touched=false inherited its PLAN value. Device stderr, actual executable invocation and validation establish real gfx1201 execution; the raw field is retained unchanged.",
+    "No speed, asynchronous overlap, adaptive chooser or served quality claim."
+  ],
+  "references": [
+    {
+      "artifact": "P5-STATE-REPAIR-QUALIFICATION.json",
+      "bytes": 13708,
+      "sha256": "034d88b6f8b8b04a0b1d3b7174c82edf669c5a9f4743a4e58dad3b2b8aa6b236"
+    },
+    {
+      "artifact": "cpu-pr1023-state-repair-final-01/RUN.json",
+      "bytes": 25342,
+      "sha256": "b530cabe44272df30f4707ae82ce04f400be9337dd7d9b410f52d390fce98962"
+    },
+    {
+      "artifact": "cpu-pr1023-state-repair-final-01/03-workspace-lib/raw.log",
+      "bytes": 1559589,
+      "sha256": "ba3b900b38874fead86c850f3f1cfd2bb84add4c8c2daa1d99c65873b85834e5"
+    },
+    {
+      "artifact": "cpu-pr1023-state-repair-final-01/06-four-labs-build/MANIFEST.json",
+      "bytes": 5273,
+      "sha256": "5128daaf337955f1b5a12747500a83a9678319e3dd2121c85ba3d9a2f3fe5819"
+    },
+    {
+      "artifact": "cpu-pr1023-state-repair-final-01/09-plain-default-product/MANIFEST.json",
+      "bytes": 7725,
+      "sha256": "c2646d9eb86feeade1c774f301a0691a6a3c814507ef37c3ed87b759f2330b09"
+    },
+    {
+      "artifact": "cpu-pr1023-state-repair-final-01/qwen4-unit-freeze/UNIT.json",
+      "bytes": 5023,
+      "sha256": "5ce7094bca9e07a3862a2ace0cdd89f6338dff88aa2c8e5300c2cd183bb86d8b"
+    },
+    {
+      "artifact": "conv-regression-final-dd58-01/RUN.json",
+      "bytes": 5231,
+      "sha256": "cee627d37285807526396b3a5351b296fe4de564f0d291f9716e147464d2ec68"
+    },
+    {
+      "artifact": "conv-regression-final-dd58-01/test/stdout.log",
+      "bytes": 203,
+      "sha256": "9b5ac0ecb1f1de2c5f1bab398f41a685a16f256d8be03c0cdd18e5ea0813495b"
+    },
+    {
+      "artifact": "conv-regression-final-dd58-01/test/stderr.log",
+      "bytes": 298,
+      "sha256": "fefff45cbc99150bfd9efd4e623622ee76214243f5f5d6aeb7f56450d757b9fe"
+    },
+    {
+      "artifact": "P5-STATE-REPAIR-CPU-TINY-SUMMARY.json",
+      "bytes": 9306,
+      "sha256": "2d7ed56677c24cc33e351f3b341d4e703871477fe71a5dbe6f865772d082815f"
+    },
+    {
+      "artifact": "CI-dd58/retrieval-final-once-20261111T161304Z/OBSERVATION.json",
+      "bytes": 2052,
+      "sha256": "3346028d40b3c9d36d4d32ff950de41433b54a40921eb5060ddedd93be361ea0"
+    },
+    {
+      "artifact": "CI-dd58/retrieval-final-once-20261111T161304Z/runs-by-head.json",
+      "bytes": 36,
+      "sha256": "a2790a384d7d281e7395679000c35d27768d89dbd7052f725b8f4688beb59915"
+    },
+    {
+      "artifact": "CI-dd58/retrieval-final-once-20261111T161304Z/check-runs.json",
+      "bytes": 33,
+      "sha256": "e83cfac35507982a40cfeb776ce85aa0367e7646f81fe857df4a6c841ea8a170"
+    },
+    {
+      "artifact": "CI-dd58/retrieval-final-once-20261111T161304Z/check-suites.json",
+      "bytes": 35,
+      "sha256": "5eab0fc75af2063c338a2776c933c41fc944239dfd2f21247b24e2189ea6f9bd"
+    },
+    {
+      "artifact": "CI-dd58/retrieval-final-once-20261111T161304Z/combined-status.json",
+      "bytes": 4438,
+      "sha256": "1deaa3b7217c1227a1885ba1db8570f2c99dbfeba78645e61c9fbca0a9389b5e"
+    }
+  ]
+}

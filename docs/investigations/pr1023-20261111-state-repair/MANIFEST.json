@@ -1,0 +1,21 @@
+{
+  "schema": "hipfire-pr1023-state-repair-documentary-files-v1",
+  "base_source": {
+    "head": "dd58ad80733516d3a29ed138225a18bf26db59c9",
+    "tree": "438524b27d8a91976d0db6121221c760ad9afd46",
+    "status": ""
+  },
+  "scope": "Documentation only; current CPU and standalone convolution GPU evidence, no model qualification.",
+  "files": [
+    {
+      "path": "README.md",
+      "bytes": 3661,
+      "sha256": "7cb3189f651d33fd4696d4b9a90bb557c669aeda2191d7b954091b4df9dd74d6"
+    },
+    {
+      "path": "receipts.json",
+      "bytes": 9688,
+      "sha256": "769f3cadf34643e9e704361d131011aea987b6ac9e580d8f278f799c7565367c"
+    }
+  ]
+}
