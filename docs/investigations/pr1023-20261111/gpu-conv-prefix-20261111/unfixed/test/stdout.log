@@ -1,0 +1,11 @@
+
+running 1 test
+test state::tests::row_capture_64_prefix_abort_and_continuation_match_singletons ... FAILED
+
+failures:
+
+failures:
+    state::tests::row_capture_64_prefix_abort_and_continuation_match_singletons
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 2393 filtered out; finished in 0.61s
+

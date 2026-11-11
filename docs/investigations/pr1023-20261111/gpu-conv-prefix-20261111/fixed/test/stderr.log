@@ -1,0 +1,4 @@
+[hip-bridge] GPU_PINNED_MIN_XFER_SIZE=100000: pageable weight copies staged out of reclaim
+GPU dev 0: gfx1201 (34.2 GB VRAM, HIP 7.14)
+  pre-compiled kernels: /home/husrcf/Code/hipfireQC/tmpOutput/pr1022-pr1023-review-20261111/shared-kernel-cache/gfx1201
+conv-prefix diagnostic: actual GPU gfx1201

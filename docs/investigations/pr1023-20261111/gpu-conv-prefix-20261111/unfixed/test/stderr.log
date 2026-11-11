@@ -1,0 +1,10 @@
+[hip-bridge] GPU_PINNED_MIN_XFER_SIZE=100000: pageable weight copies staged out of reclaim
+GPU dev 0: gfx1201 (34.2 GB VRAM, HIP 7.14)
+  pre-compiled kernels: /home/husrcf/Code/hipfireQC/tmpOutput/pr1022-pr1023-review-20261111/shared-kernel-cache/gfx1201
+conv-prefix diagnostic: actual GPU gfx1201
+
+thread 'state::tests::row_capture_64_prefix_abort_and_continuation_match_singletons' (1727812) panicked at crates/hipfire-arch-qwen4/src/state.rs:7693:21:
+assertion `left == right` failed: F32 base=0 keep=1
+  left: [("layer[L0].position", "38"), ("ple_history.previous", "[3, 10]"), ("ple_history.eos", "3"), ("gdn[L0].recurrent", "8528624941f8ae06ce0f04e9fcb0495efe1e8ebca7b7175f7d89f6189c7606d5 bytes=131072"), ("gdn[L0].conv", "3e146c1f71cf1fed1d3f873a828f56442ccdb95f3f0246bdd23c1215c48e3314 bytes=6144"), ("hyper_feedback", "38723a2e5e8a17aa7950dc008209944e898f69a7bd10a23c839d341e935fd5ca bytes=128")]
+ right: [("layer[L0].position", "38"), ("ple_history.previous", "[3, 10]"), ("ple_history.eos", "3"), ("gdn[L0].recurrent", "8528624941f8ae06ce0f04e9fcb0495efe1e8ebca7b7175f7d89f6189c7606d5 bytes=131072"), ("gdn[L0].conv", "13170f51ebe74a8b111e53f5cca526d477633861a0a7bc90a2d98adc359b8b49 bytes=6144"), ("hyper_feedback", "38723a2e5e8a17aa7950dc008209944e898f69a7bd10a23c839d341e935fd5ca bytes=128")]
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
