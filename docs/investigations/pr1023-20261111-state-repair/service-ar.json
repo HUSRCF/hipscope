@@ -1,0 +1,265 @@
+{
+  "schema": "hipfire-pr1023-service-ar-evidence-v1",
+  "source": {
+    "head": "dd58ad80733516d3a29ed138225a18bf26db59c9",
+    "tree": "438524b27d8a91976d0db6121221c760ad9afd46",
+    "status": ""
+  },
+  "artifact_root_label": "pr1022-pr1023-review-20261111",
+  "scope": "Completed canonical same-server service regression plus single-row AR retained HIP/PM4 correctness. Independent scopes; no long-context or performance result.",
+  "service": {
+    "status": "PASS_WITH_EXPLICIT_PRODUCER_TELEMETRY_LIMIT",
+    "independent_review_status": "REVIEWED_SERVICE_SUCCESS_WITH_EXPLICIT_SCOPE",
+    "same_instance": {
+      "single_startup_attempt": true,
+      "single_model_load": true,
+      "health_pid_start_and_end": 1841863,
+      "daemon_worker_pid": 1841894,
+      "instance_token_equal": true,
+      "retry_attempts_start_and_end": 0,
+      "cleanup_recorded_status": "CLEANED_OWN_GROUP"
+    },
+    "profile": {
+      "max_seq": 16384,
+      "hot_budget_mib": 18000,
+      "kv_mode": "fp8",
+      "kv_backend": "vmm",
+      "gdn": "plain Q8",
+      "ple": "q4",
+      "exact_cache_enabled": true,
+      "native_cache_verify_capacity": 8,
+      "sampled_native_policy": "ORDINARY_DEFAULT_ON; no env/config opt-out"
+    },
+    "request_total": 12,
+    "phase_order": [
+      "warmup1",
+      "greedy_before5",
+      "sampled_temperature0.3_once",
+      "greedy_after5"
+    ],
+    "protocol": {
+      "HTTP200": 12,
+      "one_stop_and_one_DONE": 12,
+      "post_terminal_payloads": 0,
+      "stream_errors": 0,
+      "decoded_SSE_matches_response": 12,
+      "request_hash_and_prompt_hash_verified": 12,
+      "natural_stops": 12,
+      "length_capped": 0,
+      "observed_GPU_or_cache_refusal_errors": 0,
+      "warmup_protocol_only": 1
+    },
+    "phase_totals": {
+      "warmup": {
+        "requests": 1,
+        "generated_tokens": 2,
+        "native_windows_observed": 0,
+        "batched_multirow_windows_observed": 0,
+        "max_verify_rows_observed": 0
+      },
+      "greedy_before": {
+        "requests": 5,
+        "generated_tokens": 679,
+        "native_windows_observed": 191,
+        "batched_multirow_windows_observed": 189,
+        "max_verify_rows_observed": 8
+      },
+      "sampled_03": {
+        "requests": 1,
+        "generated_tokens": 75,
+        "native_windows_observed": 0,
+        "batched_multirow_windows_observed": 0,
+        "max_verify_rows_observed": 0
+      },
+      "greedy_after": {
+        "requests": 5,
+        "generated_tokens": 679,
+        "native_windows_observed": 183,
+        "batched_multirow_windows_observed": 180,
+        "max_verify_rows_observed": 8
+      }
+    },
+    "greedy_pairs": [
+      {
+        "genre": "code",
+        "before_request_id": "chatcmpl-1841863-2",
+        "after_request_id": "chatcmpl-1841863-8",
+        "same_request_bytes": true,
+        "full_decoded_utf8_exact": true,
+        "protocol_fields_exact": true,
+        "content_sha256": "fbc2c0908004ae6acd384d2a9b538b3cf461e4596056641d753bbaf1fe71ce44"
+      },
+      {
+        "genre": "reason",
+        "before_request_id": "chatcmpl-1841863-3",
+        "after_request_id": "chatcmpl-1841863-9",
+        "same_request_bytes": true,
+        "full_decoded_utf8_exact": true,
+        "protocol_fields_exact": true,
+        "content_sha256": "b1c19119e88a0ee65fddb60e4110148649890330c6ddd2bbb5b1e5ca16a14f0f"
+      },
+      {
+        "genre": "factual",
+        "before_request_id": "chatcmpl-1841863-4",
+        "after_request_id": "chatcmpl-1841863-10",
+        "same_request_bytes": true,
+        "full_decoded_utf8_exact": true,
+        "protocol_fields_exact": true,
+        "content_sha256": "8a1dbd7b6a84a9308cdd919dfc67afe67f2c04654d008dd640a652bb133c757c"
+      },
+      {
+        "genre": "prose",
+        "before_request_id": "chatcmpl-1841863-5",
+        "after_request_id": "chatcmpl-1841863-11",
+        "same_request_bytes": true,
+        "full_decoded_utf8_exact": true,
+        "protocol_fields_exact": true,
+        "content_sha256": "5853c41eeecb868ac09b5d92742f459d9a6d30cb1dad6b55b0fde1a1db309a7f"
+      },
+      {
+        "genre": "instruct",
+        "before_request_id": "chatcmpl-1841863-6",
+        "after_request_id": "chatcmpl-1841863-12",
+        "same_request_bytes": true,
+        "full_decoded_utf8_exact": true,
+        "protocol_fields_exact": true,
+        "content_sha256": "f18e0a77c518fa95f12fc3f28fced4f3726ec2ff6b27c94c2388464d6e1b9932"
+      }
+    ],
+    "sampled_scope": {
+      "temperature": 0.3,
+      "default_sampled_policy": "ORDINARY_DEFAULT_ON; no env/config opt-out",
+      "actual_native_windows": 0,
+      "HTTP_and_surface_content_success": true,
+      "direct_runtime_AR_producer": "UNOBSERVED",
+      "evidence_boundary": "Same-HEAD real builder/router CPU controls plus successful actual request with no native executor events/refusal. Absence alone is not a direct producer label. Sampled native MTP is not qualified."
+    },
+    "quality_scope": {
+      "task_requests": 11,
+      "distinct_task_prompts": 6,
+      "observed_wrong_answers": [],
+      "observed_truncation": [],
+      "generated_code_syntax_parsed": true,
+      "generated_code_manually_read": true,
+      "generated_code_executed": false,
+      "functional_code_correctness": "UNQUALIFIED"
+    },
+    "observability_limits": [
+      "Direct sampled runtime AR producer is UNOBSERVED. Same-HEAD real builder/router CPU proof and successful exact0.3 request without native/refusal events support the product path; absence alone is not a direct producer label.",
+      "Five greedy pairs compare complete decoded UTF8 and protocol fields; complete served output token IDs, raw-SSE byte equality and identical physical native schedules are not claimed.",
+      "Native windows are actually observed before and after sampling; counts differ under the unforced product chooser. This is not a speed or general chooser-policy claim."
+    ]
+  },
+  "ar_redline": {
+    "status": "PASS",
+    "profile": {
+      "mtp": "off",
+      "route": "AR single input row",
+      "actual_cache_verify_capacity": 1,
+      "max_seq": 16384,
+      "hot_budget_mib": 18000,
+      "kv_mode": "fp8",
+      "kv_backend": "vmm",
+      "gdn": "plain Q8",
+      "ple": "q4"
+    },
+    "stable_captures": 3,
+    "actual_contract_inventory": {
+      "kernel_count": 31,
+      "kernel_names_sha256": "b8592630b57ac28dad829073d8a55a848fd1ac6761e7b3958cb99520dd9eaf0d",
+      "authority": "frozen ReplayController probes actual recorded code objects via HSA loader; complete detailed capture membership and every explicit/padded ABI checked",
+      "historical31_is_not_a_gate": true
+    },
+    "distinct_positions": [
+      513,
+      514,
+      515,
+      516,
+      517,
+      518,
+      519,
+      520,
+      521,
+      522,
+      523,
+      524,
+      525,
+      526,
+      527,
+      528
+    ],
+    "backends": [
+      "ordinary HIP",
+      "recorded HIP",
+      "retained PM4"
+    ],
+    "raw_logits_and_canonical_state_bitexact": true,
+    "failure_probe_scope": "prepared-position pre-submit refusal and clean-HIP recovery; no injected kernel/Unknown-fault qualification",
+    "native_batched_PM4_qualified": false,
+    "live_error_feedback_qualified": false,
+    "unknown_kernel_fault_gpu_qualified": false
+  },
+  "retained_cpu_scope": {
+    "full_command_status": "FAIL_RETAINED",
+    "workspace_exit_code": 101,
+    "strict_all_workspace_pass": false,
+    "only_classified_failure": "KT48",
+    "current_HFQ": "PASS"
+  },
+  "not_claimed": [
+    "Complete generated-code semantics or broad quality benchmark",
+    "Direct sampled runtime producer label",
+    "Sampled native MTP correctness or distribution",
+    "Native batched PM4 or unknown-quiescence fault injection",
+    "Asynchronous overlap, speed, latency or throughput gains",
+    "QC35 or any active long-context run result"
+  ],
+  "qc35": "Outside this packet; no QC35 progress or output inspected.",
+  "references": [
+    {
+      "artifact": "service-pr1023-state-repair-01-QUALITY-SCOPE.json",
+      "bytes": 16331,
+      "sha256": "c698d8d7fe02de43d16cb67b577de0e238224cf985b9d44be0f6757368c8d2da"
+    },
+    {
+      "artifact": "service-pr1023-state-repair-01/RUN.json",
+      "bytes": 514046,
+      "sha256": "744142ac0315d26e13334f294aa2f12811da5bbaaa600a44017993920884f763"
+    },
+    {
+      "artifact": "pr1023-ar-state-repair-01/RUN.json",
+      "bytes": 39530,
+      "sha256": "1ab869f76660104a66eaceeb4600e6df45ed3df138174222400ffa1559ac627c"
+    },
+    {
+      "artifact": "pr1023-ar-state-repair-01/report.json",
+      "bytes": 3848603,
+      "sha256": "915f08eb44ddbbe278fe376bd3f75a6c0fec2f9b240f34b068bb59e43b015e65"
+    },
+    {
+      "artifact": "pr1023-ar-state-repair-01/daemon.log",
+      "bytes": 31966,
+      "sha256": "a1a2b3ac57ce9c68b2c04376400bb5657491748cdf8da82022561917f4408e54"
+    },
+    {
+      "artifact": "pr1023-ar-state-repair-01/transcript.jsonl",
+      "bytes": 2621614,
+      "sha256": "44573be4ea79802725a2641d484001b43b9aea632cd77dbae17e7b8543efd48d"
+    },
+    {
+      "artifact": "cpu-pr1023-state-repair-final-01/09-plain-default-product/MANIFEST.json",
+      "bytes": 7725,
+      "sha256": "c2646d9eb86feeade1c774f301a0691a6a3c814507ef37c3ed87b759f2330b09"
+    },
+    {
+      "artifact": "state-repair-driver-amendments/run-pr1023-service-v2.py",
+      "bytes": 57868,
+      "sha256": "5ba4fcce767128bc76918548f39261dfded0f84880aaf09391aafb6c735aed0d"
+    },
+    {
+      "artifact": "state-repair-driver-amendments/run-pr1023-ar-redline.py",
+      "bytes": 29653,
+      "sha256": "6141e9b135b5c93bb61b188f3fb65a52b2d372e781276e8d820f5461aa50573c"
+    }
+  ]
+}

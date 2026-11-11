@@ -5,12 +5,12 @@
     "tree": "438524b27d8a91976d0db6121221c760ad9afd46",
     "status": ""
   },
-  "scope": "Documentation only: current CPU, standalone convolution GPU and paired forced-K3 native transaction correctness; no canonical serving, async-overlap or performance qualification.",
+  "scope": "Documentation only: CPU, standalone convolution GPU, forced-K3 native pair, canonical same-server service and single-row AR Redline; no native PM4, direct sampled producer, generated-code execution, QC35 or performance claim.",
   "files": [
     {
       "path": "README.md",
-      "bytes": 6744,
-      "sha256": "f54e44c298917484c17633a7871537509353775677ec99026cab4e4c55661f53"
+      "bytes": 9868,
+      "sha256": "e68806afb0344ec7225423451d863bbf6eded7f937a6292427c864753cfd805d"
     },
     {
       "path": "native-pair.json",
@@ -21,6 +21,11 @@
       "path": "receipts.json",
       "bytes": 9688,
       "sha256": "769f3cadf34643e9e704361d131011aea987b6ac9e580d8f278f799c7565367c"
+    },
+    {
+      "path": "service-ar.json",
+      "bytes": 9604,
+      "sha256": "79bbf5dac5c65cee9e807867b473a3bb9c484a85696c957f5e2522caa1f5e81e"
     }
   ]
 }
