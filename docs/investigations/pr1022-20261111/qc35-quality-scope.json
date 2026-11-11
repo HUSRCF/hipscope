@@ -1,0 +1,339 @@
+{
+  "schema": "hipfire-pr1022-qc35-quality-scope-v2",
+  "status": "COMPLETE_WITH_ABSOLUTE_LIMITATIONS",
+  "source_head": "fe6b29f60ab9d26b4cef875d384fbe5708fe0630",
+  "source_tree": "4a0eae200e9b173a6e989caef01a1ac42d639ae8",
+  "base_source": "f453d10da0346d1935f7cc6488ef4aea958b7022",
+  "scored_questions": 35,
+  "warmup_questions": 1,
+  "all35_decoded_and_request_terminal_fields_equal": true,
+  "all36_exact_request_bodies_equal": true,
+  "compared_fields": [
+    "request_md5",
+    "prompt_md5",
+    "assistant_content",
+    "content",
+    "reasoning_content",
+    "tool_calls",
+    "gen",
+    "ctx",
+    "finish",
+    "attractor",
+    "empty",
+    "runaway",
+    "atem_leak",
+    "terminal_count",
+    "terminal_reasons",
+    "post_terminal_bytes",
+    "saw_done",
+    "stream_error"
+  ],
+  "actual_output_token_ids": "UNOBSERVED: HTTP SSE does not expose them; legacy driver relative_byte_and_id_equal refers only to listed JSON fields",
+  "longbench": {
+    "strict_correct": 11,
+    "total": 30,
+    "wrong_letters": 6,
+    "truncated_unparsed": 13,
+    "attractor_flags": 4,
+    "canonical_failure_retained": true,
+    "same_as_base": true
+  },
+  "longdecode": {
+    "natural_stops": 5,
+    "tokens": 38268,
+    "same_as_base": true,
+    "semantic_correctness": "UNQUALIFIED: no gold; generated code not executed",
+    "story_minimum_1500_words_met": true
+  },
+  "rows": [
+    {
+      "phase": "warmup",
+      "index": 0,
+      "decoded_and_request_terminal_fields_equal": true,
+      "gen": 16,
+      "finish": "length"
+    },
+    {
+      "phase": "longbench",
+      "index": 0,
+      "decoded_and_request_terminal_fields_equal": true,
+      "gen": 8,
+      "finish": "stop"
+    },
+    {
+      "phase": "longbench",
+      "index": 1,
+      "decoded_and_request_terminal_fields_equal": true,
+      "gen": 8,
+      "finish": "stop"
+    },
+    {
+      "phase": "longbench",
+      "index": 2,
+      "decoded_and_request_terminal_fields_equal": true,
+      "gen": 8,
+      "finish": "stop"
+    },
+    {
+      "phase": "longbench",
+      "index": 3,
+      "decoded_and_request_terminal_fields_equal": true,
+      "gen": 8,
+      "finish": "stop"
+    },
+    {
+      "phase": "longbench",
+      "index": 4,
+      "decoded_and_request_terminal_fields_equal": true,
+      "gen": 8,
+      "finish": "stop"
+    },
+    {
+      "phase": "longbench",
+      "index": 5,
+      "decoded_and_request_terminal_fields_equal": true,
+      "gen": 512,
+      "finish": "length"
+    },
+    {
+      "phase": "longbench",
+      "index": 6,
+      "decoded_and_request_terminal_fields_equal": true,
+      "gen": 291,
+      "finish": "stop"
+    },
+    {
+      "phase": "longbench",
+      "index": 7,
+      "decoded_and_request_terminal_fields_equal": true,
+      "gen": 512,
+      "finish": "length"
+    },
+    {
+      "phase": "longbench",
+      "index": 8,
+      "decoded_and_request_terminal_fields_equal": true,
+      "gen": 8,
+      "finish": "stop"
+    },
+    {
+      "phase": "longbench",
+      "index": 9,
+      "decoded_and_request_terminal_fields_equal": true,
+      "gen": 402,
+      "finish": "stop"
+    },
+    {
+      "phase": "longbench",
+      "index": 10,
+      "decoded_and_request_terminal_fields_equal": true,
+      "gen": 8,
+      "finish": "stop"
+    },
+    {
+      "phase": "longbench",
+      "index": 11,
+      "decoded_and_request_terminal_fields_equal": true,
+      "gen": 188,
+      "finish": "stop"
+    },
+    {
+      "phase": "longbench",
+      "index": 12,
+      "decoded_and_request_terminal_fields_equal": true,
+      "gen": 8,
+      "finish": "stop"
+    },
+    {
+      "phase": "longbench",
+      "index": 13,
+      "decoded_and_request_terminal_fields_equal": true,
+      "gen": 512,
+      "finish": "length"
+    },
+    {
+      "phase": "longbench",
+      "index": 14,
+      "decoded_and_request_terminal_fields_equal": true,
+      "gen": 473,
+      "finish": "stop"
+    },
+    {
+      "phase": "longbench",
+      "index": 15,
+      "decoded_and_request_terminal_fields_equal": true,
+      "gen": 512,
+      "finish": "length"
+    },
+    {
+      "phase": "longbench",
+      "index": 16,
+      "decoded_and_request_terminal_fields_equal": true,
+      "gen": 512,
+      "finish": "length"
+    },
+    {
+      "phase": "longbench",
+      "index": 17,
+      "decoded_and_request_terminal_fields_equal": true,
+      "gen": 512,
+      "finish": "length"
+    },
+    {
+      "phase": "longbench",
+      "index": 18,
+      "decoded_and_request_terminal_fields_equal": true,
+      "gen": 8,
+      "finish": "stop"
+    },
+    {
+      "phase": "longbench",
+      "index": 19,
+      "decoded_and_request_terminal_fields_equal": true,
+      "gen": 512,
+      "finish": "length"
+    },
+    {
+      "phase": "longbench",
+      "index": 20,
+      "decoded_and_request_terminal_fields_equal": true,
+      "gen": 512,
+      "finish": "length"
+    },
+    {
+      "phase": "longbench",
+      "index": 21,
+      "decoded_and_request_terminal_fields_equal": true,
+      "gen": 8,
+      "finish": "stop"
+    },
+    {
+      "phase": "longbench",
+      "index": 22,
+      "decoded_and_request_terminal_fields_equal": true,
+      "gen": 512,
+      "finish": "length"
+    },
+    {
+      "phase": "longbench",
+      "index": 23,
+      "decoded_and_request_terminal_fields_equal": true,
+      "gen": 512,
+      "finish": "length"
+    },
+    {
+      "phase": "longbench",
+      "index": 24,
+      "decoded_and_request_terminal_fields_equal": true,
+      "gen": 512,
+      "finish": "length"
+    },
+    {
+      "phase": "longbench",
+      "index": 25,
+      "decoded_and_request_terminal_fields_equal": true,
+      "gen": 512,
+      "finish": "length"
+    },
+    {
+      "phase": "longbench",
+      "index": 26,
+      "decoded_and_request_terminal_fields_equal": true,
+      "gen": 512,
+      "finish": "length"
+    },
+    {
+      "phase": "longbench",
+      "index": 27,
+      "decoded_and_request_terminal_fields_equal": true,
+      "gen": 453,
+      "finish": "stop"
+    },
+    {
+      "phase": "longbench",
+      "index": 28,
+      "decoded_and_request_terminal_fields_equal": true,
+      "gen": 372,
+      "finish": "stop"
+    },
+    {
+      "phase": "longbench",
+      "index": 29,
+      "decoded_and_request_terminal_fields_equal": true,
+      "gen": 244,
+      "finish": "stop"
+    },
+    {
+      "phase": "longdecode",
+      "index": 0,
+      "decoded_and_request_terminal_fields_equal": true,
+      "gen": 13743,
+      "finish": "stop"
+    },
+    {
+      "phase": "longdecode",
+      "index": 1,
+      "decoded_and_request_terminal_fields_equal": true,
+      "gen": 14042,
+      "finish": "stop"
+    },
+    {
+      "phase": "longdecode",
+      "index": 2,
+      "decoded_and_request_terminal_fields_equal": true,
+      "gen": 2673,
+      "finish": "stop"
+    },
+    {
+      "phase": "longdecode",
+      "index": 3,
+      "decoded_and_request_terminal_fields_equal": true,
+      "gen": 4364,
+      "finish": "stop"
+    },
+    {
+      "phase": "longdecode",
+      "index": 4,
+      "decoded_and_request_terminal_fields_equal": true,
+      "gen": 3446,
+      "finish": "stop"
+    }
+  ],
+  "sealed_artifacts_verified": 202,
+  "raw_receipt": {
+    "sha256": "2891aa08f770a6ab6120ca56f78207c86e9e0223713ed323850e196538f27e95"
+  },
+  "cleanup": {
+    "kfd_pids": [],
+    "owned_driver_and_serve_gone": true,
+    "both_gpu_locks_free": true,
+    "vram_used_bytes": 59912192,
+    "driver_cleanup": {
+      "status": "CLEANED_OWN_GROUP",
+      "pid": 1222276,
+      "pgid": 1222276,
+      "signals": [
+        "SIGINT",
+        "SIGKILL if still alive after 4 seconds"
+      ],
+      "before": [
+        {
+          "pid": 1222276,
+          "state": "S",
+          "pgid": 1222276,
+          "sid": 1222276,
+          "start_ticks": 137077806
+        },
+        {
+          "pid": 1222278,
+          "state": "S",
+          "pgid": 1222276,
+          "sid": 1222276,
+          "start_ticks": 137077859
+        }
+      ]
+    }
+  },
+  "performance_claim": false,
+  "unix": 1794403590.5851219
+}

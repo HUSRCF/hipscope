@@ -1,0 +1,55 @@
+{
+  "schema": "hipfire-pr1022-compact-numerical-proof-v1",
+  "status": "PASS_INTRUSIVE_NUMERICAL_SCOPE",
+  "source_head": "fe6b29f60ab9d26b4cef875d384fbe5708fe0630",
+  "source_tree": "4a0eae200e9b173a6e989caef01a1ac42d639ae8",
+  "reports": {
+    "off": {
+      "path": "/home/husrcf/Code/hipfireQC/tmpOutput/pr1022-pr1023-review-20261111/pr1022-gates-02/off/numerical.json",
+      "sha256": "395c591fca7d0b6ed302e4832e051470704a7eac21676d219fbfc5fa81248224"
+    },
+    "on": {
+      "path": "/home/husrcf/Code/hipfireQC/tmpOutput/pr1022-pr1023-review-20261111/pr1022-gates-02/on/numerical.json",
+      "sha256": "760c014722352be486a13e40023554c1516108f8cbc48fb25454bea2256b10fa"
+    }
+  },
+  "points_per_arm": 582,
+  "entire_point_records_equal": true,
+  "actual_cache_off": false,
+  "actual_cache_on": true,
+  "same_hotset": true,
+  "same_semantic_original_partition": true,
+  "physical_plan_differs": true,
+  "kv_backend": "vmm",
+  "state_format": "Qwen4StateFormat { qsa: Fp8, gdn: Q8, qsa_f16_arena: false, qsa_pooled_bf16: false }",
+  "prefill_cases": [
+    {
+      "case": "code",
+      "mapped_short_calls": 1,
+      "mapped_short_rows": 128,
+      "short_restore_count": 0,
+      "long_restore_count": 1,
+      "long_restore_bytes": 10486579200
+    },
+    {
+      "case": "fiction",
+      "mapped_short_calls": 1,
+      "mapped_short_rows": 128,
+      "short_restore_count": 0,
+      "long_restore_count": 1,
+      "long_restore_bytes": 10486579200
+    }
+  ],
+  "known_cancel": {
+    "injected": true,
+    "successful_prefix_launches": 0,
+    "cache_idle_state_entry_recovered": true,
+    "canonical_initial_state_and_full_logits_exact": true,
+    "scope": "known no-independent-submit eager-prefix cancellation only; not HIP wait/readback/table-upload/PM4 timeout injection"
+  },
+  "async_overlap_claim": false,
+  "performance_claim": false,
+  "strict_all_workspace_pass": false,
+  "full_cpu_source": "d06d93ed6214975222b330a765a4be3473a714b1",
+  "unix": 1794401519.2500706
+}

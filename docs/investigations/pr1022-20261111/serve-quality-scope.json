@@ -1,0 +1,113 @@
+{
+  "schema": "hipfire-pr1022-served-quality-scope-v1",
+  "source_head": "fe6b29f60ab9d26b4cef875d384fbe5708fe0630",
+  "base_source": "f453d10da0346d1935f7cc6488ef4aea958b7022",
+  "execution_status": "PASS",
+  "all26_relative_decoded_and_terminal_fields_exact": true,
+  "compared_fields": [
+    "ctx",
+    "cached",
+    "gen",
+    "finish",
+    "content",
+    "assistant_content",
+    "reasoning_content",
+    "tool_calls",
+    "request_md5",
+    "prompt_md5",
+    "terminal_count",
+    "terminal_reasons",
+    "post_terminal_bytes",
+    "saw_done",
+    "stream_error",
+    "attractor",
+    "empty",
+    "runaway",
+    "retrieval_missing"
+  ],
+  "phases": [
+    {
+      "phase": "warmup",
+      "rows": 5,
+      "relative_decoded_content_and_terminal_fields_exact": true,
+      "natural_stops": 0,
+      "length_finishes": 5,
+      "empty": 0,
+      "attractor": 0,
+      "reported_runaway": 5,
+      "base_sha256": "40e368aadb72a221f9305b607218ba0a85feb163e2a9c5e68b1e5cb64b3335f4",
+      "candidate_sha256": "8a14022ad8e6a814fce67795ff324ae4a8928cd1245d631efdc197f9996c97a1"
+    },
+    {
+      "phase": "battery",
+      "rows": 5,
+      "relative_decoded_content_and_terminal_fields_exact": true,
+      "natural_stops": 5,
+      "length_finishes": 0,
+      "empty": 0,
+      "attractor": 0,
+      "reported_runaway": 0,
+      "base_sha256": "342b7803311afcf7f2c3b597df3873133a9d0508f92db7f81cf7a6db53b08f8e",
+      "candidate_sha256": "0c00975cc933ff8b48a0bcf45aac91d458cb14278febd5c5638bd1872f623057"
+    },
+    {
+      "phase": "chain",
+      "rows": 5,
+      "relative_decoded_content_and_terminal_fields_exact": true,
+      "natural_stops": 5,
+      "length_finishes": 0,
+      "empty": 0,
+      "attractor": 0,
+      "reported_runaway": 0,
+      "base_sha256": "6b9584fdb286d26852a5e6a8d320828f3f8dfb3592fd6dc22a63575d19552ea5",
+      "candidate_sha256": "472a3de89baea5718e5d06e1d6184cafa3d0913164e8dd5f936a52da10a6bdb1"
+    },
+    {
+      "phase": "session",
+      "rows": 8,
+      "relative_decoded_content_and_terminal_fields_exact": true,
+      "natural_stops": 2,
+      "length_finishes": 6,
+      "empty": 0,
+      "attractor": 0,
+      "reported_runaway": 6,
+      "base_sha256": "abcaf7cfbeed6c9ca1f225d48a45fa9c222b77ad0b64f557ecf3767eac626c43",
+      "candidate_sha256": "4a0a3c7c5f753dae8fb0f4735cb79ca253e5abfaf8fdc9eda7b831b3a9a23ef8"
+    },
+    {
+      "phase": "staged",
+      "rows": 2,
+      "relative_decoded_content_and_terminal_fields_exact": true,
+      "natural_stops": 1,
+      "length_finishes": 1,
+      "empty": 0,
+      "attractor": 0,
+      "reported_runaway": 1,
+      "base_sha256": "3811f785f8c2ae09739346932bb724d8730dcc89833d879f3a97c1c3059fee31",
+      "candidate_sha256": "8da3455fd3ed1327caf14d12b698b4895ff0340a8c76d705346fa6616a0585b6"
+    },
+    {
+      "phase": "longdecode",
+      "rows": 1,
+      "relative_decoded_content_and_terminal_fields_exact": true,
+      "natural_stops": 0,
+      "length_finishes": 1,
+      "empty": 0,
+      "attractor": 0,
+      "reported_runaway": 1,
+      "base_sha256": "75576236c5162069960471e621c37b0950033512130e61da032692ac1c8d7685",
+      "candidate_sha256": "295f202a4c985ba0b44b22c349d6d739ac5f553b082b2adbd7626496d7d5f688"
+    }
+  ],
+  "decoded_review": [
+    "Battery5/5 and chain5/5 natural-stop outputs read: sorted-list merge code is structurally complete, train distance210mi is correct, seasons explanation and short fiction/coherence are appropriate. Generated code was not executed.",
+    "Session6/8 reaches512tokens. Natural-stop session turn3 still ends inside an unfinished Rust compare_exchange_weak call. These are byte-identical to beta and are not a full session-quality pass.",
+    "Staged short-fiction128-token probe truncates intentionally; 5103-token retrieval probe returns the Helix description correctly. Both match beta.",
+    "Longdecode1024-token Rust answer remains an unfinished, repetitive error enum; cap/quality limitations match beta."
+  ],
+  "kv_backend_fields": "Generic harness fields are null/UNOBSERVED; actual startup and loadedACK prove FP8/VMM+plainQ8/cache attachment separately.",
+  "absolute_all_correct": false,
+  "actual_token_id_equality_claim": false,
+  "performance_claim": false,
+  "unix": 1794401960.0600374
+}

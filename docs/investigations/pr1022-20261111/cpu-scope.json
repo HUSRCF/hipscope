@@ -1,0 +1,110 @@
+{
+  "schema": "hipfire-pr1022-public-cpu-scope-v1",
+  "source_head": "fe6b29f60ab9d26b4cef875d384fbe5708fe0630",
+  "source_tree": "4a0eae200e9b173a6e989caef01a1ac42d639ae8",
+  "parent_full_cpu_source": "d06d93ed6214975222b330a765a4be3473a714b1",
+  "qualification_sha256": "023e2c1649231c959644bb1863009e953e14502530441699e9c25bc206f952e4",
+  "qualification": {
+    "schema": "hipfire-pr1022-fixture-followup-qualification-v1",
+    "status": "SCOPED_GATES_PASS_WITH_PROVEN_BASE_FAILURE",
+    "source_head": "fe6b29f60ab9d26b4cef875d384fbe5708fe0630",
+    "source_tree": "4a0eae200e9b173a6e989caef01a1ac42d639ae8",
+    "parent_test_source": "d06d93ed6214975222b330a765a4be3473a714b1",
+    "strict_all_workspace_pass": false,
+    "parent_qualification": {
+      "path": "/home/husrcf/Code/hipfireQC/tmpOutput/pr1022-pr1023-review-20261111/CPU-QUALIFICATION-v2.json",
+      "sha256": "677d26c079e28d50f14dd4ea702a6193b28a853912eb28593f424c07f277f019"
+    },
+    "fixture_change": {
+      "path": "/home/husrcf/Code/hipfireQC/tmpOutput/pr1022-pr1023-review-20261111/P4-FIXTURE-FOLLOWUP.json",
+      "sha256": "079f2e83808f4f98e5d33563aef063a8e9319116e5d428cf304ef2bde3ff8215"
+    },
+    "delta_cpu": {
+      "path": "/home/husrcf/Code/hipfireQC/tmpOutput/pr1022-pr1023-review-20261111/cpu-fixture-followup/RUN.json",
+      "sha256": "428bec1e61a7f0736f0ae860ac955e08fdac9fe3cfc54345cca0d1738aa77894"
+    },
+    "default_product_build": {
+      "path": "/home/husrcf/Code/hipfireQC/tmpOutput/pr1022-pr1023-review-20261111/runtime-pr1022-fixture-default/BUILD.json",
+      "sha256": "ba7d1f674456fb09b5a7b8390358e6db0619d117ae0732a2e54b62194f5b2fc6"
+    },
+    "lab_manifest": {
+      "path": "/home/husrcf/Code/hipfireQC/tmpOutput/pr1022-pr1023-review-20261111/lab-pr1022-fixture/MANIFEST.json",
+      "sha256": "7f8a906942b7f1b4b7bd9d74056523e4f5d1e4311d3679fb44190f6c68069504"
+    }
+  },
+  "base_failure_comparison": {
+    "schema": "hipfire-clean-base-lift-repro-v1",
+    "base_commit": "f453d10da0346d1935f7cc6488ef4aea958b7022",
+    "base_exit_code": 101,
+    "candidate_commit": "d06d93ed6214975222b330a765a4be3473a714b1",
+    "candidate_context": "full CPU v3 stage7: peacemaker-lift 92passed/1failed/1ignored",
+    "test": "text::print::tests::t9_assembler_parity_where_syntax_is_lossless",
+    "outputs": {
+      "candidate": {
+        "path": "/home/husrcf/Code/hipfireQC/tmpOutput/pr1022-pr1023-review-20261111/cpu-final-v3-20261111T105300Z/07.log",
+        "raw_sha256": "dfe76e12249732f2eb226d4cd7601347776f40741892d5e8a704372dc4333595",
+        "assembler_summary": "llvm-mc failed (4401 of 4780 lines assembled)",
+        "src0_bank_diagnostics": 133,
+        "src1_bank_diagnostics": 246,
+        "normalized_error_sha256": "a4ef61e769f1cef26d1107f0a03e29f55acbafb1a43b7205d9f30e6ce403c27c",
+        "first_instruction": "v_dual_mul_f32 v136, v136, v6 :: v_dual_mul_f32 v135, v135, v6"
+      },
+      "base": {
+        "path": "/home/husrcf/Code/hipfireQC/tmpOutput/pr1022-pr1023-review-20261111/CPU-lift-base/stdout.log",
+        "raw_sha256": "339de3bd1798d1add0e7e5c7f35d412b7d126f587bd917f42e319bf0428591ec",
+        "assembler_summary": "llvm-mc failed (4401 of 4780 lines assembled)",
+        "src0_bank_diagnostics": 133,
+        "src1_bank_diagnostics": 246,
+        "normalized_error_sha256": "a4ef61e769f1cef26d1107f0a03e29f55acbafb1a43b7205d9f30e6ce403c27c",
+        "first_instruction": "v_dual_mul_f32 v136, v136, v6 :: v_dual_mul_f32 v135, v135, v6"
+      }
+    },
+    "normalized_assembler_failure_identical": true,
+    "normalization": "Only ephemeral /tmp/pm-c3b-mc-PID-counter.s paths replaced with <MC_INPUT>; instruction text/line numbers/errors unchanged",
+    "source_comparison": [
+      {
+        "path": "crates/peacemaker-lift/src/text/print_tests.rs",
+        "base_sha256": "c4c21402cdf1a155187b33235099187dccbc5c8c057632266a1d1c76ccc38871",
+        "candidate_sha256": "c4c21402cdf1a155187b33235099187dccbc5c8c057632266a1d1c76ccc38871",
+        "byte_equal": true
+      },
+      {
+        "path": "crates/peacemaker-lift/src/text/mod.rs",
+        "base_sha256": "d2bb87005fe80338b75712156cbc750b592a4133ddd06b805be2fbed7da7c3a4",
+        "candidate_sha256": "d2bb87005fe80338b75712156cbc750b592a4133ddd06b805be2fbed7da7c3a4",
+        "byte_equal": true
+      },
+      {
+        "path": "crates/peacemaker-lift/tests/fixtures/kt48/hipcc.co",
+        "base_sha256": "f876e2ce520ba8d97358b34c903a48dafc5cff2e4cc552d7ffc775361cbcb6bc",
+        "candidate_sha256": "f876e2ce520ba8d97358b34c903a48dafc5cff2e4cc552d7ffc775361cbcb6bc",
+        "byte_equal": true
+      },
+      {
+        "path": "crates/peacemaker-lift/tests/fixtures/kt48/provenance.json",
+        "base_sha256": "cd4da81743131b01716f7d836915b6b6ffd461345b926a1f7939712c9d5f162c",
+        "candidate_sha256": "cd4da81743131b01716f7d836915b6b6ffd461345b926a1f7939712c9d5f162c",
+        "byte_equal": true
+      },
+      {
+        "path": "crates/peacemaker-ir/isa/gfx12.tbl",
+        "base_sha256": "7733ab14b55e7d2d8ca08b153880c6e3c7ff8034645ebf66e48663e4dc3536ac",
+        "candidate_sha256": "964bfb2217391e17a6b88fe3b0d1f27b38ba3a9bf0e23c678f12a71c51496e45",
+        "byte_equal": false
+      }
+    ],
+    "classification": "PROVEN_SAME_PINNED_MC_KT48_FAILURE_ON_CLEAN_BASE_NOT_CAUSED_BY_SAMPLE_METADATA_FIX",
+    "source_edits": "NONE",
+    "gpu": "NOT_RUN",
+    "cargo_scope": "ONLY_EXACT_AUTHORIZED_FOCUSED_BASE_TEST",
+    "remaining_cpu": "Root owns completion of other unrun CPU groups; no all-CPU-green claim",
+    "entire_lift_crate_tree": {
+      "base": "a4c755f95570b34fe1b24a88cc9a6ced5a23f04b",
+      "candidate": "a4c755f95570b34fe1b24a88cc9a6ced5a23f04b",
+      "identical": true
+    }
+  },
+  "base_failure_comparison_sha256": "2c3ef3941773dab7730d186af46126c852b3c14c97224b1dc5b379ee8befafa9",
+  "strict_all_workspace_pass": false,
+  "scope": "All61 library binaries and canonical no-GPU CI executed on d06; only two fixture files change at fe6. fe6 scoped checks separately bound; do not relabel d06 execution as full fe6 rerun."
+}

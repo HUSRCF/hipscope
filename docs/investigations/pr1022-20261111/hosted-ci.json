@@ -1,0 +1,101 @@
+{
+  "schema": "hipfire-pr1022-ci-fe6-triage-v1",
+  "created_unix": 1794402778.3898575,
+  "candidate_commit": "fe6b29f60ab9d26b4cef875d384fbe5708fe0630",
+  "base_commit": "f453d10da0346d1935f7cc6488ef4aea958b7022",
+  "parent_commit": "d06d93ed6214975222b330a765a4be3473a714b1",
+  "candidate_run": "https://github.com/warpfront/hipfire/actions/runs/43022073613",
+  "base_run": "https://github.com/warpfront/hipfire/actions/runs/42975701618",
+  "run_attempt": 1,
+  "full_ci_status": "FAILURE_NOT_GREEN",
+  "observed_jobs": {
+    "total": 19,
+    "success": 16,
+    "failure": 3
+  },
+  "checked_out_source": {
+    "commit": "eaf908b652dbb3558c1461ee97d23f38d821ec04",
+    "tree": "4a0eae200e9b173a6e989caef01a1ac42d639ae8",
+    "same_tree_as_exact_fe6": true,
+    "parents": [
+      "f453d10da0346d1935f7cc6488ef4aea958b7022",
+      "fe6b29f60ab9d26b4cef875d384fbe5708fe0630"
+    ],
+    "raw_merge_commit": {
+      "path": "/home/husrcf/Code/hipfireQC/tmpOutput/pr1022-pr1023-review-20261111/CI-fe6/checked-out-merge-commit.json",
+      "bytes": 2632,
+      "sha256": "b7c414b44ceda5497e6d0bc5260093fe8ffd2782a0880542256982a55aacbbfe"
+    }
+  },
+  "previous_triage": {
+    "path": "/home/husrcf/Code/hipfireQC/tmpOutput/pr1022-pr1023-review-20261111/CI-d06/SCOPE.json",
+    "bytes": 7064,
+    "sha256": "5316832e372790a8c742fc54d351145d18ed9a881bbbcfb65a8ea7bde4ef57a0"
+  },
+  "source_identity": {
+    "path": "/home/husrcf/Code/hipfireQC/tmpOutput/pr1022-pr1023-review-20261111/CI-fe6/source-identity.json",
+    "bytes": 4963,
+    "sha256": "69f847301c0cdafd8dab273f9c940b8b52b5120ba6f00ac7d6d72397bc221031"
+  },
+  "safe_PR_body_conclusion": "Latest fe6 CI: 16/19 jobs pass, including lib-rest/direct_ranges_mixed_residency, Linux release/all-targets/build aggregate, and RDNA ABI. CI remains red: Windows clock_gettime linkage and int-rest missing-ROCm-oracle failures match clean f453/d06; unit+integration is the downstream test-shard aggregate, not a third Rust/KT48 failure. The separately disclosed local KT48 base failure remains unchanged.",
+  "limitations": [
+    "Inherited classification is limited to the observed matching failure causes and source identity; CI is not green.",
+    "Latest lib-rest success does not prove why the previous same-source run failed.",
+    "No job rerun, repo edit, PR comment, Cargo or GPU was performed."
+  ],
+  "findings": [
+    {
+      "job": "Windows MSVC (no GPU)",
+      "candidate_job": 130527461474,
+      "base_job": 130374163189,
+      "classification": "PROVEN_INHERITED_BASE_CI_FAILURE",
+      "cause": "Two clock_gettime LNK2019 references from UnitTailRank::note_call, for daemon.exe and hipfire.exe; same observed base/d06 cause and identical source."
+    },
+    {
+      "job": "test shard (int-rest)",
+      "candidate_job": 130527461475,
+      "base_job": 130374163140,
+      "classification": "PROVEN_INHERITED_BASE_CI_FAILURE",
+      "cause": "p0_expand_live cannot find required ROCm llvm-mc CPU oracle; first panic poisons LazyLock. Same twelve failed test IDs and 2-pass/12-fail result on fe6/d06/base."
+    },
+    {
+      "job": "unit + integration tests (no GPU)",
+      "candidate_job": 130536825095,
+      "base_job": 130378939884,
+      "classification": "AGGREGATE_PROPAGATION_OF_FAILED_TEST_SHARD",
+      "cause": "Only Every test shard passed step: echo test-shards: failure, then test failure = success exits1. No Cargo test process or individual Rust test runs in this job. Same aggregate behavior on base.",
+      "is_KT48_379_diagnostics_reproduction": false
+    },
+    {
+      "job": "test shard (lib-rest)",
+      "candidate_job": 130527461708,
+      "base_job": null,
+      "classification": "LATEST_RUN_PASS_PREVIOUS_FAILURE_RETAINED",
+      "direct_ranges_mixed_residency": "PASS observed in actual log; previous d06 failure remains historical evidence, not causally explained by the two-file fixture fix.",
+      "KT48_CI_test_result": "t9 assembler parity reports ok; actual ROCm assembler branch/tool availability is UNOBSERVED, so not evidence that the separately documented local379-diagnostic failure was repaired."
+    }
+  ],
+  "separate_local_KT48_failure": {
+    "classification": "KEEP_SEPARATE_FROM_THIS_CI_AGGREGATE_FAILURE",
+    "proof": {
+      "path": "/home/husrcf/Code/hipfireQC/tmpOutput/pr1022-pr1023-review-20261111/CPU-lift-base/comparison.json",
+      "bytes": 3651,
+      "sha256": "2c3ef3941773dab7730d186af46126c852b3c14c97224b1dc5b379ee8befafa9"
+    },
+    "note": "Local pinned-tool full-workspace failure/base reproduction is separate evidence. This CI run does not emit its 379 assembler diagnostics."
+  },
+  "evidence": {
+    "raw-seal.json": {
+      "path": "/home/husrcf/Code/hipfireQC/tmpOutput/pr1022-pr1023-review-20261111/CI-fe6/raw-seal.json",
+      "sha256": "991a03dad41a30e4772eced4ec25c580012c97ba9b61317cc93d076e57876671"
+    },
+    "jobs-comparison.json": {
+      "path": "/home/husrcf/Code/hipfireQC/tmpOutput/pr1022-pr1023-review-20261111/CI-fe6/jobs-comparison.json",
+      "sha256": "3859de05f6a6db4130fcf30622e9eb8dcdffe56c899f33b792f5600840561e94"
+    },
+    "DETAILS.json": {
+      "path": "/home/husrcf/Code/hipfireQC/tmpOutput/pr1022-pr1023-review-20261111/CI-fe6/DETAILS.json",
+      "sha256": "d605b0a3700d1a4829693fe4a33a3241a7d3d71d9e59eab2fdf92cb0e9856e17"
+    }
+  }
+}

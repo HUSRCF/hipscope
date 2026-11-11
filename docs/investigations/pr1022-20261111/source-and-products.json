@@ -1,0 +1,211 @@
+{
+  "schema": "hipfire-pr1022-public-source-v1",
+  "source_head": "fe6b29f60ab9d26b4cef875d384fbe5708fe0630",
+  "source_tree": "4a0eae200e9b173a6e989caef01a1ac42d639ae8",
+  "pinned_beta": "f453d10da0346d1935f7cc6488ef4aea958b7022",
+  "products": {
+    "source_head": "fe6b29f60ab9d26b4cef875d384fbe5708fe0630",
+    "source_tree": "4a0eae200e9b173a6e989caef01a1ac42d639ae8",
+    "clean_build": true,
+    "source_status": "clean before and after plain default product build",
+    "binaries": {
+      "hipfire": {
+        "path": "/home/husrcf/Code/hipfireQC/tmpOutput/pr1022-pr1023-review-20261111/runtime-pr1022-fixture-default/hipfire",
+        "sha256": "aca12da7f9d0e73ac00698d5c8215640042b55cfc451f99ce08ff41049884d70",
+        "md5": "69905a15621dbca7e5cc1924041838c6",
+        "bytes": 118993432,
+        "cargo_executable": "/home/husrcf/wk/hipfire-psr/target/release/hipfire"
+      },
+      "daemon": {
+        "path": "/home/husrcf/Code/hipfireQC/tmpOutput/pr1022-pr1023-review-20261111/runtime-pr1022-fixture-default/daemon",
+        "sha256": "94f440f3922a657c99f096672d8880874cf96f5f01603f09f861358128208e5b",
+        "md5": "565419c59b4d66df8c213cf06d647a90",
+        "bytes": 130517088,
+        "cargo_executable": "/home/husrcf/wk/hipfire-psr/target/release/daemon"
+      }
+    },
+    "build_receipt": {
+      "path": "/home/husrcf/Code/hipfireQC/tmpOutput/pr1022-pr1023-review-20261111/runtime-pr1022-fixture-default/BUILD.json",
+      "sha256": "ba7d1f674456fb09b5a7b8390358e6db0619d117ae0732a2e54b62194f5b2fc6"
+    }
+  },
+  "manifest_sha256": "21a764d0f1dbe08c42e7130ba64e35a778c5427761668edf9af43e5825b1f2bb",
+  "actual_build_receipt": {
+    "schema": "hipfire-default-product-build-v1",
+    "status": "PASS",
+    "source_head": "fe6b29f60ab9d26b4cef875d384fbe5708fe0630",
+    "source_tree": "4a0eae200e9b173a6e989caef01a1ac42d639ae8",
+    "command": [
+      "cargo",
+      "build",
+      "--release",
+      "--locked",
+      "-p",
+      "hipfire-cli",
+      "-p",
+      "hipfire-daemon",
+      "--message-format=json-render-diagnostics"
+    ],
+    "cwd": "/home/husrcf/Code/hipfire-pr1022-20261111",
+    "started_unix": 1794400717.122118,
+    "cpu_qualification_at_build_start": "COMPLETE_WITH_PROVEN_INHERITED_FAILURE",
+    "scope": "Plain release product build only; all CPU and GPU gates remain independently required. Canonical concurrent noGPUCI commands use debug profile.",
+    "exit_code": 0,
+    "finished_unix": 1794400732.0443566,
+    "log": {
+      "path": "/home/husrcf/Code/hipfireQC/tmpOutput/pr1022-pr1023-review-20261111/runtime-pr1022-fixture-default/cargo-artifacts.jsonl",
+      "sha256": "444a9ff0f60670755cfef788805b9c355afaac92d93eebf86fba3683a27eb12f"
+    },
+    "stderr": {
+      "path": "/home/husrcf/Code/hipfireQC/tmpOutput/pr1022-pr1023-review-20261111/runtime-pr1022-fixture-default/cargo-stderr.log",
+      "sha256": "ae5924c8a6c658dfd1f9ff78890880a4c9a2cc0bc2c163837103aad8cfc45754"
+    },
+    "feature_fingerprints": {
+      "hipfire-arch-qwen4": {
+        "path": "/home/husrcf/Code/hipfireQC/tmpOutput/pr1022-pr1023-review-20261111/runtime-pr1022-fixture-default/hipfire-arch-qwen4-artifact.json",
+        "sha256": "9eadaf66aa881202ca710373705fb5dc55f94a9e7545611ea025a4aa17446404",
+        "features": [],
+        "package_id": "path+file:///home/husrcf/Code/hipfire-pr1022-20261111/crates/hipfire-arch-qwen4#0.4.5",
+        "target": {
+          "kind": [
+            "lib"
+          ],
+          "crate_types": [
+            "lib"
+          ],
+          "name": "hipfire_arch_qwen4",
+          "src_path": "/home/husrcf/Code/hipfire-pr1022-20261111/crates/hipfire-arch-qwen4/src/lib.rs",
+          "edition": "2021",
+          "doc": true,
+          "doctest": true,
+          "test": true
+        }
+      },
+      "rdna-compute": {
+        "path": "/home/husrcf/Code/hipfireQC/tmpOutput/pr1022-pr1023-review-20261111/runtime-pr1022-fixture-default/rdna-compute-artifact.json",
+        "sha256": "3f84e9bc7480d432ef4c3399a44e35926cd5022d442267cddccfeb2c8c0b0ccc",
+        "features": [
+          "deltanet"
+        ],
+        "package_id": "path+file:///home/husrcf/Code/hipfire-pr1022-20261111/crates/rdna-compute#0.4.5",
+        "target": {
+          "kind": [
+            "lib"
+          ],
+          "crate_types": [
+            "lib"
+          ],
+          "name": "rdna_compute",
+          "src_path": "/home/husrcf/Code/hipfire-pr1022-20261111/crates/rdna-compute/src/lib.rs",
+          "edition": "2021",
+          "doc": true,
+          "doctest": true,
+          "test": true
+        }
+      },
+      "hipfire-dispatch": {
+        "path": "/home/husrcf/Code/hipfireQC/tmpOutput/pr1022-pr1023-review-20261111/runtime-pr1022-fixture-default/hipfire-dispatch-artifact.json",
+        "sha256": "41427969d7a074d9f13d17dc367824c77622d68374eb91dca538a05195c8cbb6",
+        "features": [
+          "default",
+          "deltanet",
+          "from-hip-error"
+        ],
+        "package_id": "path+file:///home/husrcf/Code/hipfire-pr1022-20261111/crates/hipfire-dispatch#0.4.5",
+        "target": {
+          "kind": [
+            "lib"
+          ],
+          "crate_types": [
+            "lib"
+          ],
+          "name": "hipfire_dispatch",
+          "src_path": "/home/husrcf/Code/hipfire-pr1022-20261111/crates/hipfire-dispatch/src/lib.rs",
+          "edition": "2021",
+          "doc": true,
+          "doctest": true,
+          "test": true
+        }
+      },
+      "hipfire-cli": {
+        "path": "/home/husrcf/Code/hipfireQC/tmpOutput/pr1022-pr1023-review-20261111/runtime-pr1022-fixture-default/hipfire-cli-artifact.json",
+        "sha256": "2713bb0a442b05538850c4a932d0a73dbef09cd8cf6687b587995c726c167264",
+        "features": [],
+        "package_id": "path+file:///home/husrcf/Code/hipfire-pr1022-20261111/crates/hipfire-cli#0.4.5",
+        "target": {
+          "kind": [
+            "bin"
+          ],
+          "crate_types": [
+            "bin"
+          ],
+          "name": "hipfire",
+          "src_path": "/home/husrcf/Code/hipfire-pr1022-20261111/crates/hipfire-cli/src/main.rs",
+          "edition": "2021",
+          "doc": true,
+          "doctest": false,
+          "test": true
+        }
+      },
+      "hipfire-daemon": {
+        "path": "/home/husrcf/Code/hipfireQC/tmpOutput/pr1022-pr1023-review-20261111/runtime-pr1022-fixture-default/hipfire-daemon-artifact.json",
+        "sha256": "0f6d8d44d29ffac31fa65b347573b594708d115601c898ef17df442494430bd3",
+        "features": [
+          "default",
+          "deltanet",
+          "vcn-jpeg"
+        ],
+        "package_id": "path+file:///home/husrcf/Code/hipfire-pr1022-20261111/crates/hipfire-daemon#0.4.5",
+        "target": {
+          "kind": [
+            "bin"
+          ],
+          "crate_types": [
+            "bin"
+          ],
+          "name": "daemon",
+          "src_path": "/home/husrcf/Code/hipfire-pr1022-20261111/crates/hipfire-daemon/src/main.rs",
+          "edition": "2021",
+          "doc": true,
+          "doctest": false,
+          "test": true
+        }
+      }
+    },
+    "binaries": {
+      "hipfire": {
+        "path": "/home/husrcf/Code/hipfireQC/tmpOutput/pr1022-pr1023-review-20261111/runtime-pr1022-fixture-default/hipfire",
+        "sha256": "aca12da7f9d0e73ac00698d5c8215640042b55cfc451f99ce08ff41049884d70",
+        "md5": "69905a15621dbca7e5cc1924041838c6",
+        "bytes": 118993432,
+        "cargo_executable": "/home/husrcf/wk/hipfire-psr/target/release/hipfire"
+      },
+      "daemon": {
+        "path": "/home/husrcf/Code/hipfireQC/tmpOutput/pr1022-pr1023-review-20261111/runtime-pr1022-fixture-default/daemon",
+        "sha256": "94f440f3922a657c99f096672d8880874cf96f5f01603f09f861358128208e5b",
+        "md5": "565419c59b4d66df8c213cf06d647a90",
+        "bytes": 130517088,
+        "cargo_executable": "/home/husrcf/wk/hipfire-psr/target/release/daemon"
+      }
+    },
+    "source_clean_at_finish": true
+  },
+  "build_receipt_sha256": "ba7d1f674456fb09b5a7b8390358e6db0619d117ae0732a2e54b62194f5b2fc6",
+  "fixture_followup": {
+    "source_head": "fe6b29f60ab9d26b4cef875d384fbe5708fe0630",
+    "source_tree": "4a0eae200e9b173a6e989caef01a1ac42d639ae8",
+    "parent": "d06d93ed6214975222b330a765a4be3473a714b1",
+    "changed_files": {
+      "crates/rdna-compute/examples/support/fn_expert_fixture.rs": {
+        "sha256": "b7d2c5666b466fd2a5f3a81040a17c75a8283018767a3eed4b936c08ce78c8e6"
+      },
+      "crates/rdna-compute/examples/fn_expert_table_indirection.rs": {
+        "sha256": "ef74cb25844e2e74e288218eafd6a341940985815cf93f5912467c169982b441"
+      }
+    },
+    "production_changes": false,
+    "all_checks_pending_for_followup": true,
+    "patch_sha256": "701e745c1819db9ec95ff35be3c43142f6fccc92e5171081bddfd1943c182627"
+  },
+  "performance_claim": false
+}

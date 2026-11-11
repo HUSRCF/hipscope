@@ -1,0 +1,11 @@
+{
+  "battery.json": "0c00975cc933ff8b48a0bcf45aac91d458cb14278febd5c5638bd1872f623057",
+  "qc35-quality-scope.json": "b634c9a837e880bd9553645cddef56bc4113a39112ecfc5d7b7041368d32c0b9",
+  "hosted-ci.json": "a19d44710ee67d6dcd5f4a5cec53ed0bf437f944bfdab05b84b9e7a300786aba",
+  "numerical.json": "3fba807a40676417fa40227178c10487eb20f46e9f232c9c5f19043901f1e6f1",
+  "README.md": "ca084a0df4d79888412362926d90a19155c43b2316f26d8c439be0fb01eaa928",
+  "source-and-products.json": "a15f45cdb7a2e5218254f0c84b9c486d22342d867db3618639f28eca73df5c5e",
+  "cpu-scope.json": "8cb25eaa607d5091a0695eec2f952506cf97400c8affab00eb72bdcf5785976d",
+  "serve-quality-scope.json": "3e827e08796202967e6832f33384f8e11f9fdca8866e575c93c076f6e1584775",
+  "replay.json": "87163cb26aab9c77ba19df4f607d07d6bcbf6ff4292215f99e909eed880d2ae8"
+}
